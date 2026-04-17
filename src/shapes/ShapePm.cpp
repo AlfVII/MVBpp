@@ -1,0 +1,94 @@
+#include "mvb/shapes/ShapePm.h"
+#include "mvb/Utils.h"
+#include <BRepBuilderAPI_MakePolygon.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
+#include <BRepPrimAPI_MakePrism.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepAlgoAPI_Fuse.hxx>
+#include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
+#include <gp_Trsf.hxx>
+#include <gp_Ax1.hxx>
+#include <cmath>
+
+namespace mvb {
+namespace shapes {
+
+// Mirrors MVB.js PMShape.getShapeExtras(): cuts two wedge openings on
+// ±Y, fuses the central F-radius column, optionally cuts the central H
+// hole, then translates so the bottom is at Z = -B (matching ShapeP).
+TopoDS_Shape ShapePm::applyExtras(const std::map<std::string, double>& dims,
+                                  const TopoDS_Shape& piece) const {
+    double a = 0.0, b = 0.0, c = 0.0, f = 0.0, h = 0.0, alpha = 0.0;
+    auto it = dims.find("A"); if (it != dims.end()) a = it->second / 2.0;
+    it = dims.find("B"); if (it != dims.end()) b = it->second;
+    it = dims.find("C"); if (it != dims.end()) c = it->second / 2.0;
+    it = dims.find("F"); if (it != dims.end()) f = it->second / 2.0;
+    it = dims.find("H"); if (it != dims.end()) h = it->second / 2.0;
+    it = dims.find("alpha"); if (it != dims.end()) alpha = it->second;
+    if (alpha <= 0.0) alpha = (familySubtype_ == "1") ? 120.0 : 90.0;
+
+    double halfAlphaRad = (alpha / 2.0) * M_PI / 180.0;
+    double wedgeLength = a * 1.5;
+    double wedgeHalfWidth = wedgeLength * std::tan(halfAlphaRad);
+
+    // Build wedge profile in XY, extrude by B in +Z.
+    auto makeWedge = [&]() {
+        BRepBuilderAPI_MakePolygon poly;
+        if (familySubtype_ == "1") {
+            poly.Add(gp_Pnt(0.0, 0.0, 0.0));
+            poly.Add(gp_Pnt(wedgeHalfWidth, wedgeLength, 0.0));
+            poly.Add(gp_Pnt(-wedgeHalfWidth, wedgeLength, 0.0));
+        } else {
+            poly.Add(gp_Pnt(-f, 0.0, 0.0));
+            poly.Add(gp_Pnt(f, 0.0, 0.0));
+            poly.Add(gp_Pnt(wedgeHalfWidth, wedgeLength, 0.0));
+            poly.Add(gp_Pnt(-wedgeHalfWidth, wedgeLength, 0.0));
+        }
+        poly.Close();
+        BRepBuilderAPI_MakeFace face(poly.Wire());
+        return BRepPrimAPI_MakePrism(face.Face(), gp_Vec(0, 0, b)).Shape();
+    };
+
+    TopoDS_Shape topWedge = translate_shape(makeWedge(), 0.0, c, 0.0);
+    TopoDS_Shape result = piece;
+    {
+        BRepAlgoAPI_Cut cut(result, topWedge);
+        if (cut.IsDone()) result = cut.Shape();
+    }
+
+    // Bottom wedge: rotate 180° around Z then translate to -c
+    TopoDS_Shape bottomWedge = makeWedge();
+    {
+        gp_Trsf rot;
+        rot.SetRotation(gp_Ax1(gp_Pnt(0,0,0), gp_Dir(0,0,1)), M_PI);
+        bottomWedge = BRepBuilderAPI_Transform(bottomWedge, rot).Shape();
+    }
+    bottomWedge = translate_shape(bottomWedge, 0.0, -c, 0.0);
+    {
+        BRepAlgoAPI_Cut cut(result, bottomWedge);
+        if (cut.IsDone()) result = cut.Shape();
+    }
+
+    // Add central column at full height B
+    if (f > 0.0) {
+        TopoDS_Shape column = BRepPrimAPI_MakeCylinder(f, b).Shape();
+        BRepAlgoAPI_Fuse fuser(result, column);
+        if (fuser.IsDone()) result = fuser.Shape();
+    }
+
+    // Optional central hole H
+    if (h > 0.0) {
+        TopoDS_Shape hole = BRepPrimAPI_MakeCylinder(h, b).Shape();
+        BRepAlgoAPI_Cut cut(result, hole);
+        if (cut.IsDone()) result = cut.Shape();
+    }
+
+    return translate_shape(result, 0.0, 0.0, -b);
+}
+
+} // namespace shapes
+} // namespace mvb

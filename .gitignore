@@ -1,0 +1,31 @@
+# Build outputs
+build/
+Testing/
+
+# Tool/editor caches
+.cache/
+.claude/
+
+# Generated artifacts
+mas_example_steps/
+mas_example_steps_py/
+bobbin_comparison/
+*.step
+*.stl
+*.svg
+*.png
+# ...but keep the test reference fixtures
+!tests/reference_steps/
+!tests/reference_steps/*
+
+# Local broken dir from an accidental `mkdir --help`
+--help/
+
+# External symlink (MVB's testData)
+/testData
+
+# Misc
+gmon.out
+
+__pycache__/
+*.pyc
