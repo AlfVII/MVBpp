@@ -52,23 +52,27 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
         
         // Generate STEP
         mvb::MagneticBuilder builder;
-        mvb::DrawConfig config;
-        config.includeBobbin = true;
-        config.scale = 1000.0;  // Scale to mm like Python MVB
-        
+        const std::string format       = "step";
+        const bool includeBobbin       = true;
+        const double scale             = 1000.0;  // mm, like Python MVB
+        const int symmetryPlanes       = 0;
+
         std::string result;
         if (useMkf) {
             try {
                 // Use MVB++'s safe MKF wrapper to avoid Coil::wind() crashes on raw MAS files
                 auto enriched = mvb::magnetic_autocomplete_safe(magnetic);
-                result = builder.drawMagnetic(enriched, outputPath.parent_path().string(), config);
+                result = builder.drawMagnetic(enriched, outputPath.parent_path().string(),
+                                               format, includeBobbin, scale, symmetryPlanes);
             } catch (const std::exception& e) {
                 std::cerr << "MKF enrichment failed: " << e.what() << "\n";
                 std::cerr << "Falling back to raw magnetic...\n";
-                result = builder.drawMagnetic(magnetic, outputPath.parent_path().string(), config);
+                result = builder.drawMagnetic(magnetic, outputPath.parent_path().string(),
+                                               format, includeBobbin, scale, symmetryPlanes);
             }
         } else {
-            result = builder.drawMagnetic(magnetic, outputPath.parent_path().string(), config);
+            result = builder.drawMagnetic(magnetic, outputPath.parent_path().string(),
+                                           format, includeBobbin, scale, symmetryPlanes);
         }
         
         if (!result.empty()) {

@@ -50,6 +50,7 @@ TopoDS_Shape ShapeBuilder::applyMachining(const TopoDS_Shape& piece,
     if (coords.size() < 2) return piece;
 
     double gapLength = machining.get_length();
+    if (std::abs(gapLength) < 1e-12) return piece; // zero-gap is a no-op
     double xCoord = coords[0];
     double yCoord = coords[1];
 

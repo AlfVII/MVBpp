@@ -19,7 +19,10 @@
 namespace mvb {
 namespace shapes {
 
-std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family, const std::string& subtype) {
+std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
+                                                  const std::string& subtype,
+                                                  int corePolygonSegments) {
+    std::unique_ptr<ShapeBuilder> builder;
     switch (family) {
         case MAS::CoreShapeFamily::E:
         case MAS::CoreShapeFamily::EFD:
@@ -28,43 +31,44 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family, co
         case MAS::CoreShapeFamily::ELP:
         case MAS::CoreShapeFamily::PLANAR_E:
         case MAS::CoreShapeFamily::PLANAR_EL:
-            return std::make_unique<ShapeE>();
+            builder = std::make_unique<ShapeE>(); break;
         case MAS::CoreShapeFamily::ER:
         case MAS::CoreShapeFamily::ETD:
         case MAS::CoreShapeFamily::EQ:
         case MAS::CoreShapeFamily::PLANAR_ER:
-            return std::make_unique<ShapeEr>();
+            builder = std::make_unique<ShapeEr>(); break;
         case MAS::CoreShapeFamily::T:
-            return std::make_unique<ShapeT>();
+            builder = std::make_unique<ShapeT>(); break;
         case MAS::CoreShapeFamily::U:
-        
-            return std::make_unique<ShapeU>();
+            builder = std::make_unique<ShapeU>(); break;
         case MAS::CoreShapeFamily::UR:
-            return std::make_unique<ShapeUr>();
+            builder = std::make_unique<ShapeUr>(); break;
         case MAS::CoreShapeFamily::UT:
-            return std::make_unique<ShapeUt>();
+            builder = std::make_unique<ShapeUt>(); break;
         case MAS::CoreShapeFamily::C:
-            return std::make_unique<ShapeC>();
+            builder = std::make_unique<ShapeC>(); break;
         case MAS::CoreShapeFamily::P:
-            return std::make_unique<ShapeP>();
+            builder = std::make_unique<ShapeP>(); break;
         case MAS::CoreShapeFamily::PM:
-            return std::make_unique<ShapePm>(subtype);
+            builder = std::make_unique<ShapePm>(subtype); break;
         case MAS::CoreShapeFamily::EP:
-            return std::make_unique<ShapeEp>();
+            builder = std::make_unique<ShapeEp>(); break;
         case MAS::CoreShapeFamily::EPX:
-            return std::make_unique<ShapeEpx>();
+            builder = std::make_unique<ShapeEpx>(); break;
         case MAS::CoreShapeFamily::LP:
-            return std::make_unique<ShapeLp>();
+            builder = std::make_unique<ShapeLp>(); break;
         case MAS::CoreShapeFamily::EC:
-            return std::make_unique<ShapeEc>();
+            builder = std::make_unique<ShapeEc>(); break;
         case MAS::CoreShapeFamily::PQ:
         case MAS::CoreShapeFamily::PQI:
-            return std::make_unique<ShapePQ>();
+            builder = std::make_unique<ShapePQ>(); break;
         case MAS::CoreShapeFamily::RM:
-            return std::make_unique<ShapeRM>();
+            builder = std::make_unique<ShapeRM>(); break;
         default:
             return nullptr;
     }
+    if (builder) builder->setCorePolygonSegments(corePolygonSegments);
+    return builder;
 }
 
 } // namespace shapes

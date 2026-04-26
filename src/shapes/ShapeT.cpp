@@ -14,8 +14,9 @@ TopoDS_Face ShapeT::buildProfile(const std::map<std::string, double>& dims) cons
     if (itA != dims.end()) a = itA->second / 2.0;
     if (itB != dims.end()) b = itB->second / 2.0;
 
-    TopoDS_Wire outer = build_polygon_circle(a, DEFAULT_CORE_POLYGON_SEGMENTS);
-    TopoDS_Wire inner = build_polygon_circle(b, DEFAULT_CORE_POLYGON_SEGMENTS);
+    TopoDS_Wire outer = build_polygon_circle(a, m_corePolygonSegments);
+    TopoDS_Wire inner = build_polygon_circle(b, m_corePolygonSegments);
+    inner.Reverse(); // inner hole must wind opposite to outer for correct face orientation
 
     BRepBuilderAPI_MakeFace face(outer);
     face.Add(inner);

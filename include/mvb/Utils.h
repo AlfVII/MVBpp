@@ -16,14 +16,21 @@
 #include <map>
 #include <string>
 #include <cmath>
+#include <numbers>
 
 // Forward declaration for MKF Magnetic
 namespace OpenMagnetics { class Magnetic; }
 
 namespace mvb {
 
-constexpr int DEFAULT_CORE_POLYGON_SEGMENTS = 0;
-constexpr int DEFAULT_WIRE_POLYGON_SEGMENTS = 8;
+constexpr int DEFAULT_CORE_POLYGON_SEGMENTS = 16;
+constexpr int DEFAULT_WIRE_POLYGON_SEGMENTS = 16;
+// Azimuthal segmentation of revolved wire turns. Even with a polygonal
+// cross-section, MakeRevol produces analytic surfaces of revolution that
+// STEP serialises as CYLINDRICAL/TOROIDAL_SURFACE. Setting this > 0 replaces
+// the revolve with a ThruSections loft over N angular slices → fully planar.
+// Set to 0 for the legacy MakeRevol behaviour.
+constexpr int DEFAULT_WIRE_REVOLUTION_SEGMENTS = 12;
 
 // Extract nominal double from MAS Dimension variant
 double flatten_dimension(const MAS::Dimension& dim);
@@ -39,6 +46,16 @@ TopoDS_Wire build_polygon_circle(double radius, int segments);
 // segments = 0 yields exact revolved circle
 TopoDS_Shape build_polygon_cylinder(double height, double radius, int segments);
 
+// Build a ring (torus approximation) as a solid by lofting a polygonal
+// circular cross-section (cross_segments sides) at `revolution_segments`
+// azimuthal stations around the Y axis. Produces only PLANAR faces — STEP
+// export contains no CYLINDRICAL / TOROIDAL / SURFACE_OF_REVOLUTION.
+// turn_radius = major radius, wire_radius = minor, y = ring plane height.
+// revolution_segments <= 0 falls back to a classical MakeRevol (analytic).
+TopoDS_Shape build_polygon_ring(double turn_radius, double wire_radius,
+                                 double y, int cross_segments,
+                                 int revolution_segments);
+
 // Apply a 3D rotation (radians) to a shape about X, Y, Z axes in order
 TopoDS_Shape rotate_shape(const TopoDS_Shape& shape, double rx, double ry, double rz);
 
@@ -48,6 +65,10 @@ TopoDS_Shape translate_shape(const TopoDS_Shape& shape, double x, double y, doub
 
 // Get family string from enum
 std::string core_shape_family_to_string(MAS::CoreShapeFamily family);
+
+// Enumerate every core shape family that has a builder registered in the
+// factory (mirrors MVB.js getSupportedFamilies()).
+std::vector<std::string> get_supported_families();
 
 // Preprocess JSON to add missing "nominal" fields to dimension objects
 // (MVB test data often has only min/max)

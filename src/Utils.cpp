@@ -2,17 +2,26 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakeRevol.hxx>
+#include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopoDS_Compound.hxx>
+#include <TopoDS.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRep_Builder.hxx>
 #include <GProp_GProps.hxx>
 #include <BRepGProp.hxx>
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
+#include <gp_Pnt.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Ax3.hxx>
+#include <gp_Dir.hxx>
+#include <gp_Trsf.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 #include <gp_Dir.hxx>
@@ -81,6 +90,64 @@ TopoDS_Shape build_polygon_cylinder(double height, double radius, int segments) 
     BRepBuilderAPI_MakeFace face(wire);
     gp_Vec vec(0, 0, height);
     return BRepPrimAPI_MakePrism(face.Face(), vec).Shape();
+}
+
+TopoDS_Shape build_polygon_ring(double turn_radius, double wire_radius,
+                                 double y, int cross_segments,
+                                 int revolution_segments) {
+    // Fallback: analytic torus via MakeRevol of a polygonal cross-section.
+    // Produces CYLINDRICAL/TOROIDAL_SURFACE in STEP; useful if you need the
+    // old behaviour.
+    if (revolution_segments <= 0) {
+        gp_Ax2 profile_plane(gp_Pnt(turn_radius, y, 0.0),
+                             gp_Dir(0, 0, 1), gp_Dir(1, 0, 0));
+        TopoDS_Wire prof_wire = build_polygon_circle(wire_radius, cross_segments);
+        BRepBuilderAPI_Transform xform(
+            prof_wire,
+            gp_Trsf()  // identity — then rotate + translate
+        );
+        // Place the polygon face in `profile_plane`:
+        gp_Trsf t;
+        gp_Ax3 from(gp_Pnt(0,0,0), gp_Dir(0,0,1), gp_Dir(1,0,0));
+        gp_Ax3 to(profile_plane);
+        t.SetDisplacement(from, to);
+        BRepBuilderAPI_Transform placer(prof_wire, t);
+        TopoDS_Wire placed_wire = TopoDS::Wire(placer.Shape());
+        BRepBuilderAPI_MakeFace face(placed_wire);
+        gp_Ax1 rev_axis(gp_Pnt(0.0, y, 0.0), gp_Dir(0, 1, 0));
+        return BRepPrimAPI_MakeRevol(face.Face(), rev_axis,
+                                      2.0 * M_PI - 1e-6).Shape();
+    }
+
+    // ThruSections: place `revolution_segments` copies of the polygonal
+    // cross-section around the Y axis at angles 0, 2π/N, ..., 2π — the
+    // loft between consecutive sections uses RULED (planar) faces.
+    BRepOffsetAPI_ThruSections gen(/*IsSolid*/ Standard_True, /*IsRuled*/ Standard_True);
+    gen.SetSmoothing(Standard_False);
+
+    TopoDS_Wire base = build_polygon_circle(wire_radius, cross_segments);
+    // Place base at (turn_radius, y, 0), with the face's local Z along the
+    // azimuthal (φ̂) direction at that angle — so rotating around Y sweeps
+    // the polygon's plane through the ring.
+    for (int i = 0; i <= revolution_segments; ++i) {
+        double angle = 2.0 * M_PI * static_cast<double>(i)
+                       / static_cast<double>(revolution_segments);
+        double cx = turn_radius * std::cos(angle);
+        double cz = turn_radius * std::sin(angle);
+        // Plane at this station: normal = tangent (azimuthal), X axis = radial
+        gp_Dir tangent(-std::sin(angle), 0.0, std::cos(angle));
+        gp_Dir radial(std::cos(angle), 0.0, std::sin(angle));
+        gp_Ax3 from(gp_Pnt(0,0,0), gp_Dir(0,0,1), gp_Dir(1,0,0));
+        gp_Ax3 to(gp_Pnt(cx, y, cz), tangent, radial);
+        gp_Trsf t;
+        t.SetDisplacement(from, to);
+        BRepBuilderAPI_Transform placer(base, t);
+        TopoDS_Wire placed = TopoDS::Wire(placer.Shape());
+        gen.AddWire(placed);
+    }
+    gen.Build();
+    if (!gen.IsDone()) return TopoDS_Shape();
+    return gen.Shape();
 }
 
 TopoDS_Shape rotate_shape(const TopoDS_Shape& shape, double rx, double ry, double rz) {
@@ -168,17 +235,32 @@ std::string core_shape_family_to_string(MAS::CoreShapeFamily family) {
     return "unknown";
 }
 
+std::vector<std::string> get_supported_families() {
+    // Mirror the case list in shapes::createShapeBuilder — anything that
+    // returns a non-null builder belongs in this list.
+    return {
+        "c",   "e",   "ec",  "efd", "ei",  "el",  "elp", "ep",
+        "epx", "eq",  "er",  "etd", "lp",  "p",   "planar e", "planar el",
+        "planar er", "pm",  "pq",  "pqi", "rm",  "t",   "u",   "ur",  "ut",
+    };
+}
+
 OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneticJson) {
     using json = nlohmann::json;
 
     json coreJson = magneticJson.contains("core") ? magneticJson.at("core") : json::object();
-    json coilJson = magneticJson.contains("coil") ? magneticJson.at("coil") : json::object();
 
     // Construct OpenMagnetics::Core and Coil directly from JSON.
     // The key fix: pass false to Coil constructor to skip wind(),
     // which crashes for raw MAS files with "Basic" bobbins.
+    // Also: if the "coil" key is missing or empty, use a default Coil —
+    // Coil(empty_json, false) throws "key 'bobbin' not found".
     OpenMagnetics::Core core(coreJson);
-    OpenMagnetics::Coil coil(coilJson, false);
+    OpenMagnetics::Coil coil;
+    if (magneticJson.contains("coil") && !magneticJson.at("coil").is_null()
+        && !magneticJson.at("coil").empty()) {
+        coil = OpenMagnetics::Coil(magneticJson.at("coil"), false);
+    }
 
     OpenMagnetics::Magnetic om;
     om.set_core(core);
@@ -192,6 +274,54 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
     }
     if (magneticJson.contains("rotation")) {
         om.set_rotation(magneticJson.at("rotation").get<std::optional<std::vector<double>>>());
+    }
+
+    // If the coil has no windings (core-only visualizer), calling the full
+    // OpenMagnetics::magnetic_autocomplete crashes because it calls get_wire(0)
+    // on an empty functional_description vector. Enrich the core directly instead.
+    if (om.get_coil().get_functional_description().empty()) {
+        auto& mutCore = om.get_mutable_core();
+
+        // Guarantee required fields that MKF unconditionally dereferences.
+        if (!mutCore.get_functional_description().get_number_stacks()) {
+            mutCore.get_mutable_functional_description().set_number_stacks(int64_t(1));
+        }
+
+        try { mutCore.resolve_shape(); }
+        catch (...) { return om; }
+
+        try {
+            auto shapeFamily = mutCore.get_shape_family();
+            if (shapeFamily == MAS::CoreShapeFamily::T) {
+                mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TOROIDAL);
+            } else {
+                mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TWO_PIECE_SET);
+            }
+        } catch (...) {
+            mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TWO_PIECE_SET);
+        }
+
+        try {
+            mutCore.resolve_material();
+        } catch (...) {
+            mutCore.get_mutable_functional_description().set_material(
+                MAS::CoreMaterialDataOrNameUnion{std::string("Dummy")});
+            try { mutCore.resolve_material(); } catch (...) {}
+        }
+
+        if (!mutCore.get_processed_description()) {
+            try { mutCore.process_data(); } catch (...) {}
+            try { mutCore.process_gap(); } catch (...) {}
+        }
+
+        // Always create_geometrical_description so buildCore gets a full CoreShape variant
+        // (resolve_shape may store a name-only reference that buildCore can't use).
+        try {
+            auto geoDesc = mutCore.create_geometrical_description();
+            mutCore.set_geometrical_description(geoDesc);
+        } catch (...) {}
+
+        return om;
     }
 
     return OpenMagnetics::magnetic_autocomplete(om, json{});

@@ -4,6 +4,7 @@ project(MVB++ VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -22,7 +23,8 @@ ExternalProject_Add(
     URL https://github.com/Open-Cascade-SAS/OCCT/archive/refs/tags/V7_9_3.tar.gz
     CMAKE_ARGS
         -DCMAKE_BUILD_TYPE=Release
-        -DBUILD_LIBRARY_TYPE=Shared
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+        -DBUILD_LIBRARY_TYPE=Static
         -DBUILD_MODULE_Draw=OFF
         -DBUILD_MODULE_DETools=OFF
         -DBUILD_DOC_Overview=OFF
@@ -40,7 +42,7 @@ ExternalProject_Add(
         -DINSTALL_DIR_LIB=lib
         -DINSTALL_DIR_INCLUDE=include/opencascade
     BUILD_BYPRODUCTS
-        ${OCCT_PREFIX}/lib/libTKernel.so
+        ${OCCT_PREFIX}/lib/libTKernel.a
     USES_TERMINAL_BUILD TRUE
 )
 
@@ -79,17 +81,72 @@ FetchContent_MakeAvailable(Catch2)
 
 # ============================================================================
 # MKF — brings MAS.hpp (via quicktype) and physics/autocomplete logic
+# Fetched from GitHub so the build is self-contained.
 # ============================================================================
 set(MAS_DIRECTORY "${CMAKE_BINARY_DIR}/MAS" CACHE PATH "" FORCE)
-set(MAS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../MAS" CACHE PATH "" FORCE)
-
-# Tell MKF not to build its tests or Python interface
 set(INCLUDE_MKF_TESTS OFF CACHE BOOL "" FORCE)
-set(INCLUDE_PYMKF OFF CACHE BOOL "" FORCE)
-set(ENABLE_MATPLOTPP OFF CACHE BOOL "" FORCE)
-set(ENABLE_NGSPICE OFF CACHE BOOL "" FORCE)
+set(INCLUDE_PYMKF     OFF CACHE BOOL "" FORCE)
+set(ENABLE_MATPLOTPP  OFF CACHE BOOL "" FORCE)
+set(ENABLE_NGSPICE    OFF CACHE BOOL "" FORCE)
 
-add_subdirectory(../MKF ${CMAKE_BINARY_DIR}/MKF)
+# MKF main on GitHub depends on a MAS commit that is local-only (not yet pushed).
+# Use file:// clones from the local repos so FetchContent pulls the exact working
+# versions.  Switch both to https://github.com/OpenMagnetics/{MAS,MKF}.git once
+# the pending MAS commit is pushed.
+set(_MAS_LOCAL "https://github.com/OpenMagnetics/MAS.git")
+# Pin to the last MKF commit compatible with the public MAS schema.
+# Bump to main once MKF commits that reference BobbinFamily::T and
+# get_inner_phase_shift3 are matched by a pushed MAS schema update.
+set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
+
+FetchContent_Declare(
+    MAS
+    GIT_REPOSITORY "${_MAS_LOCAL}"
+    # Pinned to the commit BEFORE 7e89745 "Rename phaseShift to innerPhaseShift3"
+    # — the pinned MKF @ 8df6b8b still calls DabOperatingPoint::get_phase_shift(),
+    # which was generated from that older MAS schema. Fresh pipx/pip wheel
+    # builds otherwise fail in MKF/src/converter_models/Dab.cpp.
+    GIT_TAG        81634c20b07673db68c05c36b8f4e24414554211
+    GIT_SHALLOW    FALSE
+)
+FetchContent_MakeAvailable(MAS)
+set(MAS_DIR "${mas_SOURCE_DIR}" CACHE PATH "" FORCE)
+
+# MKF hard-codes MAS/data/ relative to its own source dir. We must plant the
+# MAS symlink BEFORE add_subdirectory runs. FetchContent always places sources
+# at _deps/<lowercase_name>-src, so we can use that convention directly.
+set(_MAS_SRC "${CMAKE_BINARY_DIR}/_deps/mas-src")
+set(_MKF_SRC "${CMAKE_BINARY_DIR}/_deps/mkf-src")
+set(_MKF_BIN "${CMAKE_BINARY_DIR}/_deps/mkf-build")
+
+FetchContent_Declare(
+    MKF
+    GIT_REPOSITORY "${_MKF_LOCAL}"
+    GIT_TAG        8df6b8b740b291a3c48f27aee36ad4e2f6459032
+    GIT_SHALLOW    FALSE
+    GIT_SUBMODULES ""
+)
+FetchContent_GetProperties(MKF)
+if(NOT mkf_POPULATED)
+    FetchContent_Populate(MKF)
+endif()
+# git creates an empty MAS/ placeholder for the uninitialized submodule;
+# remove it so we can plant a symlink to the separately-fetched MAS.
+if(IS_DIRECTORY "${_MKF_SRC}/MAS" AND NOT IS_SYMLINK "${_MKF_SRC}/MAS")
+    file(REMOVE_RECURSE "${_MKF_SRC}/MAS")
+endif()
+if(NOT EXISTS "${_MKF_SRC}/MAS")
+    file(CREATE_LINK "${_MAS_SRC}" "${_MKF_SRC}/MAS" SYMBOLIC)
+endif()
+if(NOT TARGET MKF)
+    # MKF hardcodes add_library(MKF SHARED ...) — patch it to STATIC so the
+    # Python wheel and WASM module are fully self-contained.
+    file(READ "${_MKF_SRC}/CMakeLists.txt" _mkf_cmake)
+    string(REPLACE "add_library(MKF SHARED" "add_library(MKF STATIC" _mkf_cmake "${_mkf_cmake}")
+    file(WRITE "${_MKF_SRC}/CMakeLists.txt" "${_mkf_cmake}")
+    include_directories("${CMAKE_BINARY_DIR}/_deps/json-src/include/nlohmann")
+    add_subdirectory("${_MKF_SRC}" "${_MKF_BIN}" EXCLUDE_FROM_ALL)
+endif()
 
 # ============================================================================
 # MVB++ library
@@ -98,7 +155,11 @@ add_library(mvb++ STATIC
     src/MagneticBuilder.cpp
     src/SectionBuilder.cpp
     src/SectionDrawing.cpp
+    src/ProjectionDrawing.cpp
+    src/SpacerBuilder.cpp
+    src/FR4Builder.cpp
     src/StepExporter.cpp
+    src/Symmetry.cpp
     src/Utils.cpp
     src/TurnBuilder.cpp
     src/BobbinBuilder.cpp
@@ -149,10 +210,12 @@ add_executable(mvb_tests
     tests/test_step_comparison.cpp
     tests/test_integration.cpp
     tests/test_json_integration.cpp
+    tests/test_symmetry.cpp
 )
 
 target_compile_definitions(mvb_tests PRIVATE
     REFERENCE_STEPS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/reference_steps"
+    MAS_EXAMPLES_DIR="${CMAKE_BINARY_DIR}/_deps/mas-src/examples"
 )
 
 target_link_libraries(mvb_tests PRIVATE mvb++ Catch2::Catch2WithMain)
@@ -170,6 +233,45 @@ add_executable(mvbpp_generate_bobbins tools/generate_mvbpp_bobbins.cpp)
 target_link_libraries(mvbpp_generate_bobbins PRIVATE occt)
 
 add_test(NAME mvb_tests COMMAND mvb_tests)
+
+# ============================================================================
+# Python bindings (optional — cmake -DBUILD_PYTHON_BINDINGS=ON)
+# ============================================================================
+option(BUILD_PYTHON_BINDINGS "Build the pybind11 Python module (mvbpp)" OFF)
+if(BUILD_PYTHON_BINDINGS)
+    FetchContent_Declare(
+        pybind11
+        GIT_REPOSITORY https://github.com/pybind/pybind11.git
+        GIT_TAG        v2.13.6
+    )
+    FetchContent_MakeAvailable(pybind11)
+    pybind11_add_module(mvbpp bindings/python/mvbpp_python.cpp)
+    install(TARGETS mvbpp
+            LIBRARY DESTINATION .
+            COMPONENT PythonModule
+            EXCLUDE_FROM_ALL)
+
+    # Static OCCT requires --whole-archive when linked into a shared object
+    # to pull in all vtable/typeinfo symbols the linker would otherwise drop.
+    set(_occt_static_libs)
+    foreach(_lib ${OCCT_ESSENTIAL_LIBS})
+        list(APPEND _occt_static_libs "${OCCT_PREFIX}/lib/lib${_lib}.a")
+    endforeach()
+    target_link_options(mvbpp PRIVATE
+        "LINKER:--whole-archive"
+        ${_occt_static_libs}
+        "LINKER:--no-whole-archive"
+    )
+
+    target_include_directories(mvbpp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${MAS_DIRECTORY}
+        ${json_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR}/_deps/spline-src/src
+        ${CMAKE_BINARY_DIR}/_deps/magic-enum-src/include/magic_enum
+    )
+    target_link_libraries(mvbpp PRIVATE mvb++)
+endif()
 
 # Symlink MVB testData into our build tree for runtime access
 add_custom_command(TARGET mvb_tests POST_BUILD

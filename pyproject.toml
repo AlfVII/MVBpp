@@ -1,0 +1,23 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name            = "mvbpp"
+version         = "0.1.0"
+description     = "MVB++ Python bindings — OpenMagnetics 3-D geometry builder"
+requires-python = ">=3.9"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+cmake.source-dir = "."
+cmake.args       = ["-GNinja"]
+build.targets         = ["mvbpp"]
+install.components    = ["PythonModule"]
+
+[tool.scikit-build.cmake.define]
+BUILD_PYTHON_BINDINGS = "ON"
+INCLUDE_MKF_TESTS     = "OFF"
+INCLUDE_PYMKF         = "OFF"
+ENABLE_MATPLOTPP      = "OFF"
+ENABLE_NGSPICE        = "OFF"

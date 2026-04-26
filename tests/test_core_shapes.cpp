@@ -112,6 +112,71 @@ static MAS::Magnetic make_simple_t_magnetic() {
     return magnetic;
 }
 
+static MAS::Magnetic make_simple_pq_magnetic() {
+    MAS::Magnetic magnetic;
+
+    MAS::CoreShape shape;
+    shape.set_family(MAS::CoreShapeFamily::PQ);
+    shape.set_type(MAS::FunctionalDescriptionType::STANDARD);
+    std::map<std::string, MAS::Dimension> dims;
+    // PQ 32/12 — note e*cos_g > c, exercises the self-intersection fix
+    dims["A"] = make_dim(0.033);
+    dims["B"] = make_dim(0.00594);
+    dims["C"] = make_dim(0.022);
+    dims["D"] = make_dim(0.0034);
+    dims["E"] = make_dim(0.027);
+    dims["F"] = make_dim(0.0135);
+    shape.set_dimensions(dims);
+
+    MAS::CoreGeometricalDescriptionElement piece1, piece2;
+    piece1.set_type(MAS::CoreGeometricalDescriptionElementType::HALF_SET);
+    piece1.set_coordinates({0.0, 0.0, 0.0});
+    piece1.set_rotation(std::optional<std::vector<double>>(std::vector<double>{std::numbers::pi, std::numbers::pi, 0.0}));
+    piece1.set_shape(std::optional<MAS::CoreShapeDataOrNameUnion>(shape));
+
+    piece2.set_type(MAS::CoreGeometricalDescriptionElementType::HALF_SET);
+    piece2.set_coordinates({0.0, 0.0, 0.0});
+    piece2.set_rotation(std::optional<std::vector<double>>(std::vector<double>{0.0, 0.0, 0.0}));
+    piece2.set_shape(std::optional<MAS::CoreShapeDataOrNameUnion>(shape));
+
+    MAS::MagneticCore core;
+    core.set_geometrical_description(std::optional<std::vector<MAS::CoreGeometricalDescriptionElement>>(
+        std::vector<MAS::CoreGeometricalDescriptionElement>{piece1, piece2}));
+    magnetic.set_core(core);
+
+    MAS::Coil coil;
+    magnetic.set_coil(coil);
+
+    return magnetic;
+}
+
+TEST_CASE("PQ core builds manually with non-zero volume", "[core][pq]") {
+    auto magnetic = make_simple_pq_magnetic();
+
+    mvb::MagneticBuilder builder;
+    auto shapes = builder.buildCore(magnetic.get_core());
+
+    REQUIRE(shapes.size() == 2);
+
+    double totalVolume = 0.0;
+    for (const auto& s : shapes) {
+        REQUIRE(!s.IsNull());
+
+        Bnd_Box box;
+        BRepBndLib::Add(s, box);
+        REQUIRE(!box.IsVoid());
+
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(s, props);
+        totalVolume += props.Mass();
+    }
+
+    printf("PQ 32/12 total volume (2 pieces): %.8e m^3\n", totalVolume);
+    REQUIRE(totalVolume > 0.0);
+    REQUIRE(totalVolume > 5.32e-6);  // Python reference: 5.37779e-6 m^3, within 1%
+    REQUIRE(totalVolume < 5.43e-6);
+}
+
 TEST_CASE("T core builds manually", "[core][t]") {
     auto magnetic = make_simple_t_magnetic();
 

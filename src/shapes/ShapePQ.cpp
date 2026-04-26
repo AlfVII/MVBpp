@@ -9,6 +9,8 @@
 #include <BRepAlgoAPI_Cut.hxx>
 #include <gp_Pnt.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <gp_Trsf.hxx>
+#include <gp_Vec.hxx>
 #include <cmath>
 
 namespace mvb {
@@ -20,12 +22,18 @@ static TopoDS_Shape buildLateralPiece(double a, double c, double e, double sin_g
     poly.Add(gp_Pnt(j / 4.0, l / 4.0, 0.0));
     poly.Add(gp_Pnt(j / 4.0, -l / 4.0, 0.0));
     poly.Add(gp_Pnt(j / 2.0, -l / 2.0, 0.0));
-    poly.Add(gp_Pnt(e * sin_g, -e * cos_g, 0.0));
+    // When e*cos_g > c the arc extremum lies outside the flat-edge boundary,
+    // producing a self-intersecting polygon.  Only include it when it's inside.
+    if (e * cos_g < c) {
+        poly.Add(gp_Pnt(e * sin_g, -e * cos_g, 0.0));
+    }
     poly.Add(gp_Pnt(e * sin_g, -c, 0.0));
     poly.Add(gp_Pnt(a, -c, 0.0));
     poly.Add(gp_Pnt(a, c, 0.0));
     poly.Add(gp_Pnt(e * sin_g, c, 0.0));
-    poly.Add(gp_Pnt(e * sin_g, e * cos_g, 0.0));
+    if (e * cos_g < c) {
+        poly.Add(gp_Pnt(e * sin_g, e * cos_g, 0.0));
+    }
     poly.Add(gp_Pnt(j / 2.0, l / 2.0, 0.0));
     poly.Close();
 
@@ -51,7 +59,7 @@ TopoDS_Shape ShapePQ::buildPiece(const MAS::CoreShape& shapeData) const {
 
     if (b == 0.0) return TopoDS_Shape();
 
-    double l = f + (c * 2.0 - f) / 3.0;
+    double l = (f * 2.0) + (c * 2.0 - f * 2.0) / 3.0;
     auto itL = dims.find("L");
     if (itL != dims.end()) l = itL->second;
 
@@ -64,14 +72,33 @@ TopoDS_Shape ShapePQ::buildPiece(const MAS::CoreShape& shapeData) const {
         if (g > 0.0 && g <= e * 2.0) {
             g_angle = std::asin(g / (e * 2.0));
         } else {
-            g_angle = std::asin((e * 2.0 - (e * 2.0 - f)) / (e * 2.0));
+            g_angle = std::asin((e + f) / (e * 2.0));
         }
     }
     double sin_g = std::sin(g_angle);
     double cos_g = std::cos(g_angle);
 
-    // Central column
-    TopoDS_Shape central = build_polygon_cylinder(b, f, DEFAULT_CORE_POLYGON_SEGMENTS);
+    // Central structure: two cylinders stacked.
+    // 1) Connector disk (radius E/2, height B−D): solid yoke base that joins the
+    //    column to the lateral wings — this is the "solid cylinder joining the two
+    //    parts" of the PQ (column side + wing side).
+    // 2) Real column (radius F/2, height D): the cylinder that protrudes into the
+    //    winding space.  The winding-window cut will remove the E/2→F/2 annulus at
+    //    this height, leaving only this column.
+    double yoke_h = b - d;
+    TopoDS_Shape central;
+    {
+        TopoDS_Shape connector = build_polygon_cylinder(
+            (yoke_h > 1e-9 ? yoke_h : b), f, m_corePolygonSegments);
+        TopoDS_Shape column    = build_polygon_cylinder(d, f, m_corePolygonSegments);
+        // Translate column to sit on top of the connector disk.
+        if (yoke_h > 1e-9) {
+            gp_Trsf shift; shift.SetTranslation(gp_Vec(0, 0, yoke_h));
+            column = BRepBuilderAPI_Transform(column, shift).Shape();
+        }
+        BRepAlgoAPI_Fuse fconn(connector, column);
+        central = (yoke_h > 1e-9 && fconn.IsDone()) ? fconn.Shape() : connector;
+    }
 
     // Right lateral piece
     TopoDS_Shape rightLateral = buildLateralPiece(a, c, e, sin_g, cos_g, j, l, b);

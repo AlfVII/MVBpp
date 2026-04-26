@@ -38,6 +38,15 @@ public:
         const std::string& projection_color = "#000000",
         const std::string& dimension_color = "#1976d2");
 
+    // FrontView showing only gap dimensions (no core shape labels).
+    // Used by the gapping customizer panel.
+    static std::string drawCoreGappingTechnicalDrawing(
+        const OpenMagnetics::Magnetic& magnetic,
+        double width_px = 800.0,
+        double label_font_px = 12.0,
+        const std::string& projection_color = "#000000",
+        const std::string& dimension_color = "#1976d2");
+
     // Convenience: build the view and write to disk.
     static void writeDimensionedFrontView(
         const OpenMagnetics::Magnetic& magnetic,

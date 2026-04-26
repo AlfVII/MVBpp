@@ -1,7 +1,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Utils.h"
+#include "mvb/SectionDrawing.h"
 #include "MAS.hpp"
+#include "constructive_models/Magnetic.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <GProp_GProps.hxx>
@@ -75,4 +77,98 @@ TEST_CASE("Build complete magnetic from concentric_rectangular_column_one_turn.j
 
     REQUIRE(totalVolume > 0.0);
     REQUIRE(solids >= 3); // core + bobbin + turns
+}
+
+// Simulate what Core2DVisualizer.vue passes to drawDimensionedFrontView:
+// a magnetic with core-only (no coil), no processedDescription, no geometricalDescription.
+// This exercises the magnetic_autocomplete_safe empty-coil path.
+TEST_CASE("Core2DVisualizer: drawDimensionedFrontView with core-only E shape", "[2d][empty-coil]") {
+    // Minimal JSON that Core2DVisualizer passes: shape by name, material, gapping, no coil
+    json magneticJson = R"({
+        "core": {
+            "functionalDescription": {
+                "shape": "E 32/6/20",
+                "material": "N87",
+                "gapping": [
+                    {"type": "subtractive", "length": 0},
+                    {"type": "subtractive", "length": 0},
+                    {"type": "residual", "length": 0.0001}
+                ],
+                "numberStacks": 1,
+                "type": "two-piece set"
+            },
+            "geometricalDescription": null,
+            "processedDescription": null
+        }
+    })"_json;
+
+    // Step 1: magnetic_autocomplete_safe should not throw and should set geometricalDescription
+    OpenMagnetics::Magnetic enriched;
+    REQUIRE_NOTHROW(enriched = mvb::magnetic_autocomplete_safe(magneticJson));
+    INFO("geometricalDescription set: " << (enriched.get_core().get_geometrical_description() ? "yes" : "no"));
+    REQUIRE(enriched.get_core().get_geometrical_description().has_value());
+    REQUIRE(!enriched.get_core().get_geometrical_description()->empty());
+
+    // Step 2: drawDimensionedFrontView should not throw and should return non-empty SVG
+    std::string svg;
+    REQUIRE_NOTHROW(svg = mvb::SectionDrawing::drawDimensionedFrontView(enriched, 400, 12));
+    REQUIRE(!svg.empty());
+    REQUIRE(svg.find("<svg") != std::string::npos);
+}
+
+TEST_CASE("Core2DVisualizer: drawDimensionedFrontView with core-only E shape (gapped)", "[2d][empty-coil][gap]") {
+    json magneticJson = R"({
+        "core": {
+            "functionalDescription": {
+                "shape": "E 32/6/20",
+                "material": "N87",
+                "gapping": [
+                    {"type": "subtractive", "length": 0.0002},
+                    {"type": "subtractive", "length": 0.0002},
+                    {"type": "residual", "length": 0.0001}
+                ],
+                "numberStacks": 1,
+                "type": "two-piece set"
+            },
+            "geometricalDescription": null,
+            "processedDescription": null
+        }
+    })"_json;
+
+    OpenMagnetics::Magnetic enriched;
+    REQUIRE_NOTHROW(enriched = mvb::magnetic_autocomplete_safe(magneticJson));
+    REQUIRE(enriched.get_core().get_geometrical_description().has_value());
+
+    std::string svg;
+    REQUIRE_NOTHROW(svg = mvb::SectionDrawing::drawDimensionedFrontView(enriched, 400, 12));
+    REQUIRE(!svg.empty());
+}
+
+TEST_CASE("Core3DVisualizer: buildCoreSTL with core-only E shape", "[3d][empty-coil]") {
+    json magneticJson = R"({
+        "core": {
+            "functionalDescription": {
+                "shape": "E 32/6/20",
+                "material": "N87",
+                "gapping": [
+                    {"type": "subtractive", "length": 0},
+                    {"type": "subtractive", "length": 0},
+                    {"type": "residual", "length": 0.0001}
+                ],
+                "numberStacks": 1,
+                "type": "two-piece set"
+            },
+            "geometricalDescription": null,
+            "processedDescription": null
+        }
+    })"_json;
+
+    OpenMagnetics::Magnetic enriched;
+    REQUIRE_NOTHROW(enriched = mvb::magnetic_autocomplete_safe(magneticJson));
+    REQUIRE(enriched.get_core().get_geometrical_description().has_value());
+
+    mvb::MagneticBuilder builder;
+    std::vector<TopoDS_Shape> pieces;
+    REQUIRE_NOTHROW(pieces = builder.buildCore(enriched.get_core()));
+    REQUIRE(!pieces.empty());
 }

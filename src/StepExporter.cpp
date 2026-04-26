@@ -1,56 +1,162 @@
 #include "mvb/StepExporter.h"
+
+#include <BRepCheck_Analyzer.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
+#include <IFSelect_ReturnStatus.hxx>
+#include <STEPCAFControl_Reader.hxx>
 #include <STEPCAFControl_Writer.hxx>
-#include <TDocStd_Document.hxx>
-#include <XCAFDoc_DocumentTool.hxx>
-#include <XCAFDoc_ShapeTool.hxx>
-#include <TDataStd_Name.hxx>
+#include <StlAPI_Writer.hxx>
 #include <TDF_Label.hxx>
+#include <TDF_LabelSequence.hxx>
+#include <TDataStd_Name.hxx>
+#include <TDocStd_Application.hxx>
+#include <TDocStd_Document.hxx>
+#include <TCollection_ExtendedString.hxx>
 #include <TopoDS_Builder.hxx>
 #include <TopoDS_Compound.hxx>
-#include <BRepMesh_IncrementalMesh.hxx>
-#include <StlAPI_Writer.hxx>
-#include <BRepCheck_Analyzer.hxx>
+#include <TopoDS_Shape.hxx>
+#include <XCAFApp_Application.hxx>
+#include <XCAFDoc_DocumentTool.hxx>
+#include <XCAFDoc_ShapeTool.hxx>
+
+#include <cstdio>
+#include <fstream>
 #include <iostream>
 
 namespace mvb {
 
-bool exportSTEP(const std::vector<TopoDS_Shape>& shapes,
-                const std::vector<std::string>& names,
-                const std::string& filepath) {
-    if (shapes.empty()) {
-        return false;
-    }
+namespace {
 
-    // Combine all shapes into a single compound (like Python's cq.Compound.makeCompound)
-    TopoDS_Compound compound;
-    TopoDS_Builder builder;
-    builder.MakeCompound(compound);
-    for (const auto& shape : shapes) {
-        if (!shape.IsNull()) {
-            builder.Add(compound, shape);
+std::string label_name(const TDF_Label& label) {
+    Handle(TDataStd_Name) attr;
+    if (label.FindAttribute(TDataStd_Name::GetID(), attr)) {
+        const TCollection_ExtendedString& n = attr->Get();
+        std::string out;
+        out.reserve(n.Length());
+        for (int i = 1; i <= n.Length(); ++i) {
+            out.push_back(static_cast<char>(n.Value(i)));
+        }
+        return out;
+    }
+    return {};
+}
+
+} // namespace
+
+bool exportSTEP(const std::vector<NamedShape>& shapes,
+                const std::string& filepath) {
+    if (shapes.empty()) return false;
+
+    Handle(TDocStd_Document) doc =
+        new TDocStd_Document(TCollection_ExtendedString("BinXCAF"));
+    Handle(XCAFDoc_ShapeTool) shapeTool =
+        XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+
+    for (const auto& ns : shapes) {
+        if (ns.shape.IsNull()) continue;
+        // AddShape(isAssembly=false): register the shape as a free top-level
+        // component so STEPCAFControl_Writer emits it as a discrete product
+        // (with our name attached) rather than burying it in a compound.
+        TDF_Label lab = shapeTool->AddShape(ns.shape, Standard_False);
+        if (!ns.name.empty()) {
+            TDataStd_Name::Set(lab, TCollection_ExtendedString(ns.name.c_str()));
         }
     }
 
-    Handle(TDocStd_Document) doc = new TDocStd_Document("BinXCAF");
-    Handle(XCAFDoc_ShapeTool) shapeTool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
-
-    TDF_Label label = shapeTool->AddShape(compound, Standard_False);
-    TDataStd_Name::Set(label, "Assembly");
-
     STEPCAFControl_Writer writer;
-    writer.Perform(doc, filepath.c_str());
+    if (!writer.Transfer(doc)) {
+        std::cerr << "mvb::exportSTEP: STEPCAFControl_Writer::Transfer failed\n";
+        return false;
+    }
+    if (writer.Write(filepath.c_str()) != IFSelect_RetDone) {
+        std::cerr << "mvb::exportSTEP: write failed to " << filepath << "\n";
+        return false;
+    }
     return true;
 }
 
-bool exportSTL(const TopoDS_Shape& compound,
-               const std::string& filepath) {
-    if (compound.IsNull()) {
-        return false;
+bool exportSTEP(const std::vector<TopoDS_Shape>& shapes,
+                const std::vector<std::string>& names,
+                const std::string& filepath) {
+    std::vector<NamedShape> ns;
+    ns.reserve(shapes.size());
+    for (std::size_t i = 0; i < shapes.size(); ++i) {
+        const std::string n =
+            (i < names.size()) ? names[i] : std::string{};
+        ns.emplace_back(shapes[i], n);
     }
+    return exportSTEP(ns, filepath);
+}
+
+std::vector<NamedShape> importSTEP(const std::string& filepath) {
+    std::vector<NamedShape> out;
+
+    Handle(TDocStd_Document) doc =
+        new TDocStd_Document(TCollection_ExtendedString("BinXCAF"));
+
+    STEPCAFControl_Reader reader;
+    if (reader.ReadFile(filepath.c_str()) != IFSelect_RetDone) return out;
+    if (!reader.Transfer(doc)) return out;
+
+    Handle(XCAFDoc_ShapeTool) shapeTool =
+        XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+
+    TDF_LabelSequence freeShapes;
+    shapeTool->GetFreeShapes(freeShapes);
+    for (Standard_Integer i = 1; i <= freeShapes.Length(); ++i) {
+        const TDF_Label lab = freeShapes.Value(i);
+        TopoDS_Shape s = shapeTool->GetShape(lab);
+        if (s.IsNull()) continue;
+        out.emplace_back(s, label_name(lab));
+    }
+    return out;
+}
+
+bool exportSTL(const TopoDS_Shape& compound, const std::string& filepath) {
+    if (compound.IsNull()) return false;
     BRepMesh_IncrementalMesh mesh(compound, 0.001);
     StlAPI_Writer writer;
     writer.Write(compound, filepath.c_str());
     return true;
+}
+
+std::string exportSTLToBytes(const std::vector<TopoDS_Shape>& shapes,
+                              double toleranceMm,
+                              double angularTolerance,
+                              bool binary)
+{
+    if (shapes.empty()) return {};
+
+    // Combine into a single compound — StlAPI_Writer walks sub-solids.
+    TopoDS_Compound compound;
+    TopoDS_Builder b;
+    b.MakeCompound(compound);
+    bool any = false;
+    for (const auto& s : shapes) {
+        if (s.IsNull()) continue;
+        b.Add(compound, s);
+        any = true;
+    }
+    if (!any) return {};
+
+    // Model coordinates are in SI (meters). Use relative linear deflection so
+    // mesh quality is scale-independent; angularTolerance (radians) drives roundness.
+    BRepMesh_IncrementalMesh mesh(compound, 0.001, Standard_True,
+                                   angularTolerance, Standard_False);
+    mesh.Perform();
+
+    // StlAPI_Writer has no in-memory API; write to a temp file and slurp.
+    const char* tmpPath = "/tmp/mvbpp_stl_out.stl";
+    StlAPI_Writer writer;
+    writer.ASCIIMode() = !binary;
+    if (!writer.Write(compound, tmpPath)) return {};
+
+    std::ifstream f(tmpPath, std::ios::binary);
+    if (!f) return {};
+    std::string data((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+    std::remove(tmpPath);
+    return data;
 }
 
 } // namespace mvb

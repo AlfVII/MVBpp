@@ -14,7 +14,7 @@ TopoDS_Face ShapeP::buildProfile(const std::map<std::string, double>& dims) cons
     auto it = dims.find("A");
     if (it != dims.end()) a = it->second / 2.0;
 
-    TopoDS_Wire outer = build_polygon_circle(a, DEFAULT_CORE_POLYGON_SEGMENTS);
+    TopoDS_Wire outer = build_polygon_circle(a, m_corePolygonSegments);
     BRepBuilderAPI_MakeFace face(outer);
     return face.Face();
 }
@@ -31,10 +31,10 @@ TopoDS_Shape ShapeP::buildWindingWindow(const std::map<std::string, double>& dim
     double zCenter = b - d / 2.0;
 
     // build_polygon_cylinder creates a base-at-zero prism; shift down by d/2 to center it at zCenter
-    TopoDS_Shape outerCyl = build_polygon_cylinder(d, e / 2.0, DEFAULT_CORE_POLYGON_SEGMENTS);
+    TopoDS_Shape outerCyl = build_polygon_cylinder(d, e / 2.0, m_corePolygonSegments);
     outerCyl = translate_shape(outerCyl, 0.0, 0.0, zCenter - d / 2.0);
 
-    TopoDS_Shape innerCyl = build_polygon_cylinder(d, f / 2.0, DEFAULT_CORE_POLYGON_SEGMENTS);
+    TopoDS_Shape innerCyl = build_polygon_cylinder(d, f / 2.0, m_corePolygonSegments);
     innerCyl = translate_shape(innerCyl, 0.0, 0.0, zCenter - d / 2.0);
 
     BRepAlgoAPI_Cut cutter(outerCyl, innerCyl);

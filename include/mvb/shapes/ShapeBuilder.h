@@ -15,6 +15,12 @@ class ShapeBuilder {
 public:
     virtual ~ShapeBuilder() = default;
 
+    // Polygon segment count used by derived builders when approximating
+    // circles/cylinders. Set by the factory so subclasses can consult it
+    // via member access without changing their virtual signatures.
+    void setCorePolygonSegments(int segments) { m_corePolygonSegments = segments; }
+    int  corePolygonSegments() const { return m_corePolygonSegments; }
+
     // Build a single core piece (includes intrinsic family rotation)
     virtual TopoDS_Shape buildPiece(const MAS::CoreShape& shapeData) const;
 
@@ -45,11 +51,14 @@ protected:
 
     // Helper: create a cylinder along Z axis, centered at origin
     static TopoDS_Shape makeCylinder(double height, double radius, int segments);
+
+    int m_corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS;
 };
 
-// Factory
+// Factory — `corePolygonSegments` is applied to the returned builder.
 std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
-                                                  const std::string& subtype = "");
+                                                  const std::string& subtype = "",
+                                                  int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS);
 
 } // namespace shapes
 } // namespace mvb

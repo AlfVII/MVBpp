@@ -1,0 +1,14 @@
+{
+  "name": "@openmagnetics/mvbpp",
+  "version": "0.1.0",
+  "description": "MVB++ WASM bindings — OpenMagnetics 3-D geometry builder",
+  "main": "dist/mvbpp.js",
+  "files": ["dist/"],
+  "scripts": {
+    "build": "source ~/emsdk/emsdk_env.sh && emcmake cmake -S . -B build-wasm -DCMAKE_BUILD_TYPE=Release -GNinja && ninja -C build-wasm -j2 && mkdir -p dist && cp build-wasm/mvbpp.js build-wasm/mvbpp.wasm dist/",
+    "test":  "node tests/test_mvbpp.js",
+    "clean": "rm -rf build-wasm dist"
+  },
+  "keywords": ["openmagnetics", "magnetics", "cad", "wasm", "opencascade"],
+  "license": "MIT"
+}

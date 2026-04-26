@@ -25,10 +25,10 @@ TopoDS_Shape ShapeEr::buildWindingWindow(const std::map<std::string, double>& di
 
     double zCenter = b - d / 2.0;
 
-    TopoDS_Shape outerCyl = build_polygon_cylinder(d, e / 2.0, 0);
+    TopoDS_Shape outerCyl = build_polygon_cylinder(d, e / 2.0, m_corePolygonSegments);
     outerCyl = translate_shape(outerCyl, 0.0, 0.0, zCenter - d / 2.0);
 
-    TopoDS_Shape innerCyl = build_polygon_cylinder(d, f / 2.0, 0);
+    TopoDS_Shape innerCyl = build_polygon_cylinder(d, f / 2.0, m_corePolygonSegments);
     innerCyl = translate_shape(innerCyl, 0.0, 0.0, zCenter - d / 2.0);
 
     BRepAlgoAPI_Cut ringCut(outerCyl, innerCyl);
@@ -66,11 +66,15 @@ TopoDS_Shape ShapeEr::applyMachining(const TopoDS_Shape& piece,
         if (it != dims.end()) f = it->second;
         if (f <= 0.0) return piece;
 
-        // Center column: cylinder along Y axis, CENTERED on yCoord to match
-        // MVB Python apply_machining (which uses workplane XZ polygon_cylinder
-        // → centered on workplane origin → translate → centered on y_coord).
-        gp_Ax2 cylAxis(gp_Pnt(0, yCoord - gapLength / 2.0, 0), gp_Dir(0, 1, 0));
-        TopoDS_Shape tool = BRepPrimAPI_MakeCylinder(cylAxis, f / 2.0, gapLength).Shape();
+        // Center column: polygon-faceted cylinder along Y axis, CENTERED on
+        // yCoord. build_polygon_cylinder creates a base-at-z=0 prism along Z;
+        // rotate -90° about X to point along +Y, then translate.
+        TopoDS_Shape toolZ = build_polygon_cylinder(gapLength, f / 2.0,
+                                                    m_corePolygonSegments);
+        if (toolZ.IsNull()) return piece;
+        TopoDS_Shape toolY = rotate_shape(toolZ, -M_PI / 2.0, 0.0, 0.0);
+        TopoDS_Shape tool  = translate_shape(toolY, 0.0,
+                                             yCoord - gapLength / 2.0, 0.0);
         if (tool.IsNull()) return piece;
 
         BRepAlgoAPI_Cut cutter(piece, tool);
