@@ -1,5 +1,6 @@
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
+#include <emscripten/emscripten.h>
 
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Symmetry.h"
@@ -31,6 +32,38 @@ using namespace emscripten;
 using json = nlohmann::json;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// JS-throw helper + guard template.
+//
+// All registered embind entry points are wrapped through `guard<&fn>::call` so
+// any C++ exception thrown inside is converted to a JS Error with the original
+// message preserved. Without this, exceptions cross the WASM/JS boundary as a
+// bare numeric pointer that is unreadable from JS unless the runtime was built
+// with -sEXPORT_EXCEPTION_HANDLING_HELPERS=1 (which would in turn require
+// rebuilding OCCT with -fwasm-exceptions to keep the EH ABI consistent).
+// ─────────────────────────────────────────────────────────────────────────────
+[[noreturn]] inline void throw_js_error(const std::string& msg) {
+    // EM_ASM-thrown JS errors propagate up through WASM and surface in the
+    // calling JS context as a regular Error. Control does not return.
+    EM_ASM({ throw new Error(UTF8ToString($0)); }, msg.c_str());
+    __builtin_unreachable();
+}
+
+template <auto Fn> struct guard;
+
+template <typename R, typename... Args, R(*Fn)(Args...)>
+struct guard<Fn> {
+    static R call(Args... args) {
+        try {
+            return Fn(args...);
+        } catch (const std::exception& e) {
+            throw_js_error(std::string("[mvbpp] ") + e.what());
+        } catch (...) {
+            throw_js_error("[mvbpp] unknown C++ exception");
+        }
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 namespace {
@@ -60,7 +93,12 @@ std::vector<TopoDS_Shape> applyUniformScale(const std::vector<TopoDS_Shape>& sha
 }
 
 OpenMagnetics::Magnetic parseEnriched(const std::string& json_str) {
-    auto j = json::parse(json_str);
+    nlohmann::json j;
+    try {
+        j = json::parse(json_str);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("parseEnriched: json::parse failed: ") + e.what());
+    }
     // Skip expensive autocomplete if geometricalDescription is already present
     // (pre-enriched by the JS MKF worker before calling MVB++).
     bool alreadyEnriched =
@@ -68,25 +106,36 @@ OpenMagnetics::Magnetic parseEnriched(const std::string& json_str) {
         j.at("core").contains("geometricalDescription") &&
         !j.at("core").at("geometricalDescription").is_null();
     if (alreadyEnriched) {
+        using json = nlohmann::json;
+        json coreJson = j.at("core");
+        json coilJson = j.contains("coil") ? j.at("coil") : json::object();
+        OpenMagnetics::Core core;
         try {
-            using json = nlohmann::json;
-            json coreJson = j.at("core");
-            json coilJson = j.contains("coil") ? j.at("coil") : json::object();
-            OpenMagnetics::Core core(coreJson);
-            // Validate that the core has usable geometrical data
-            if (core.get_geometrical_description().has_value() &&
-                !core.get_geometrical_description()->empty()) {
-                OpenMagnetics::Coil coil(coilJson, false);
-                OpenMagnetics::Magnetic om;
-                om.set_core(core);
-                om.set_coil(coil);
-                return om;
-            }
-        } catch (...) {
-            // Fall through to autocomplete if direct construction fails
+            core = OpenMagnetics::Core(coreJson);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string("parseEnriched[fast]: Core ctor failed: ") + e.what());
         }
+        // Validate that the core has usable geometrical data
+        if (core.get_geometrical_description().has_value() &&
+            !core.get_geometrical_description()->empty()) {
+            OpenMagnetics::Coil coil;
+            try {
+                coil = OpenMagnetics::Coil(coilJson, false);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("parseEnriched[fast]: Coil ctor failed: ") + e.what());
+            }
+            OpenMagnetics::Magnetic om;
+            om.set_core(core);
+            om.set_coil(coil);
+            return om;
+        }
+        throw std::runtime_error("parseEnriched[fast]: core had geometricalDescription but it was empty/unusable");
     }
-    return mvb::magnetic_autocomplete_safe(j);
+    try {
+        return mvb::magnetic_autocomplete_safe(j);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("parseEnriched[autocomplete]: ") + e.what());
+    }
 }
 
 mvb::SectionPlane parsePlane(const std::string& plane) {
@@ -474,32 +523,32 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
 
     // 3D export (STL + STEP) — everything that mvbWorker.js used to
     // delegate to replicad+MVB.js is covered here.
-    function("buildMagneticSTL",  &buildMagneticSTL);
-    function("buildMagneticSTEP", &buildMagneticSTEP);
-    function("buildCoreSTL",      &buildCoreSTL);
-    function("buildSpacersSTL",   &buildSpacersSTL);
-    function("buildBobbinSTL",    &buildBobbinSTL);
-    function("buildTurnsSTL",     &buildTurnsSTL);
-    function("buildFR4BoardSTL",  &buildFR4BoardSTL);
+    function("buildMagneticSTL",  &guard<&buildMagneticSTL>::call);
+    function("buildMagneticSTEP", &guard<&buildMagneticSTEP>::call);
+    function("buildCoreSTL",      &guard<&buildCoreSTL>::call);
+    function("buildSpacersSTL",   &guard<&buildSpacersSTL>::call);
+    function("buildBobbinSTL",    &guard<&buildBobbinSTL>::call);
+    function("buildTurnsSTL",     &guard<&buildTurnsSTL>::call);
+    function("buildFR4BoardSTL",  &guard<&buildFR4BoardSTL>::call);
 
     // Metadata
-    function("getSymmetryPlanes",    &getSymmetryPlanes);
-    function("getSupportedFamilies", &getSupportedFamilies);
+    function("getSymmetryPlanes",    &guard<&getSymmetryPlanes>::call);
+    function("getSupportedFamilies", &guard<&getSupportedFamilies>::call);
 
     // 2D drawings — dimensioned (Python MVB technical-drawing surface)
-    function("drawDimensionedFrontView",     &drawDimensionedFrontView);
-    function("drawDimensionedTopView",       &drawDimensionedTopView);
-    function("drawCoreGappingTechnicalDrawing", &drawCoreGappingTechnicalDrawing);
+    function("drawDimensionedFrontView",        &guard<&drawDimensionedFrontView>::call);
+    function("drawDimensionedTopView",          &guard<&drawDimensionedTopView>::call);
+    function("drawCoreGappingTechnicalDrawing", &guard<&drawCoreGappingTechnicalDrawing>::call);
 
     // 2D projections — wire-frame outline seen looking along the plane normal
-    function("drawCoreProjection",      &drawCoreProjection);
-    function("drawPieceProjection",     &drawPieceProjection);
-    function("drawAssemblyProjection",  &drawAssemblyProjection);
+    function("drawCoreProjection",      &guard<&drawCoreProjection>::call);
+    function("drawPieceProjection",     &guard<&drawPieceProjection>::call);
+    function("drawAssemblyProjection",  &guard<&drawAssemblyProjection>::call);
 
     // 2D cutaway sections — project the half past the section plane, so the
     // drawing shows the cut surface AND everything beyond it, as seen
     // looking from the plane normal.
-    function("drawCoreCrossSection",     &drawCoreCrossSection);
-    function("drawPieceCrossSection",    &drawPieceCrossSection);
-    function("drawAssemblyCrossSection", &drawAssemblyCrossSection);
+    function("drawCoreCrossSection",     &guard<&drawCoreCrossSection>::call);
+    function("drawPieceCrossSection",    &guard<&drawPieceCrossSection>::call);
+    function("drawAssemblyCrossSection", &guard<&drawAssemblyCrossSection>::call);
 }

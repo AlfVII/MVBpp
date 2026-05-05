@@ -255,11 +255,20 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
     // which crashes for raw MAS files with "Basic" bobbins.
     // Also: if the "coil" key is missing or empty, use a default Coil —
     // Coil(empty_json, false) throws "key 'bobbin' not found".
-    OpenMagnetics::Core core(coreJson);
+    OpenMagnetics::Core core;
+    try {
+        core = OpenMagnetics::Core(coreJson);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("magnetic_autocomplete_safe: Core ctor failed: ") + e.what());
+    }
     OpenMagnetics::Coil coil;
     if (magneticJson.contains("coil") && !magneticJson.at("coil").is_null()
         && !magneticJson.at("coil").empty()) {
-        coil = OpenMagnetics::Coil(magneticJson.at("coil"), false);
+        try {
+            coil = OpenMagnetics::Coil(magneticJson.at("coil"), false);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string("magnetic_autocomplete_safe: Coil ctor failed: ") + e.what());
+        }
     }
 
     OpenMagnetics::Magnetic om;

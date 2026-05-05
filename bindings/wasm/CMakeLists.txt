@@ -162,6 +162,13 @@ target_link_libraries(mvb++ PUBLIC occt MKF nlohmann_json::nlohmann_json)
 add_executable(mvbpp_wasm mvbpp_wasm.cpp)
 target_link_libraries(mvbpp_wasm PRIVATE mvb++)
 
+# Enable C++ exception catching only in mvbpp_wasm.cpp so the guard wrappers
+# at each entry point can catch std::exception thrown from MKF/OCCT (which
+# already throw using the default legacy EH ABI). Scoped to this object so
+# we avoid the perf hit of recompiling OCCT/MKF/mvb++ with -fexceptions.
+target_compile_options(mvbpp_wasm PRIVATE -fexceptions)
+target_link_options(mvbpp_wasm PRIVATE -fexceptions)
+
 set_target_properties(mvbpp_wasm PROPERTIES
     OUTPUT_NAME "mvbpp"
     SUFFIX      ".js"

@@ -40,8 +40,8 @@ static bool isCoreToroidal(const MAS::MagneticCore& core) {
     return false;
 }
 
-template<typename BobbinT>
-static MAS::CoreBobbinProcessedDescription getBobbinProcessedT(const std::variant<BobbinT, std::string>& bobbinVar) {
+template<typename BobbinT, typename VariantT>
+static MAS::CoreBobbinProcessedDescription getBobbinProcessedT(const VariantT& bobbinVar) {
     const BobbinT* bobbin = std::get_if<BobbinT>(&bobbinVar);
     if (bobbin) {
         auto pd = bobbin->get_processed_description();
@@ -51,15 +51,15 @@ static MAS::CoreBobbinProcessedDescription getBobbinProcessedT(const std::varian
 }
 
 static MAS::CoreBobbinProcessedDescription getBobbinProcessed(const MAS::Coil& coil) {
-    return getBobbinProcessedT(coil.get_bobbin());
+    return getBobbinProcessedT<MAS::Bobbin>(coil.get_bobbin());
 }
 
 static MAS::CoreBobbinProcessedDescription getBobbinProcessed(const OpenMagnetics::Coil& coil) {
-    return getBobbinProcessedT(coil.get_bobbin());
+    return getBobbinProcessedT<OpenMagnetics::Bobbin>(coil.get_bobbin());
 }
 
-template<typename BobbinT>
-static std::string getBobbinNameT(const std::variant<BobbinT, std::string>& bobbinVar, const std::string& fallback) {
+template<typename BobbinT, typename VariantT>
+static std::string getBobbinNameT(const VariantT& bobbinVar, const std::string& fallback) {
     if (const BobbinT* b = std::get_if<BobbinT>(&bobbinVar)) {
         return b->get_name().value_or(fallback);
     }
