@@ -30,6 +30,7 @@
 #include <StdFail_NotDone.hxx>
 #include <iostream>
 #include <cmath>
+#include <numbers>
 #include <map>
 
 namespace mvb {
@@ -79,9 +80,9 @@ static TopoDS_Face build_circle_profile(const gp_Ax2& plane, double radius, int 
     }
 
     BRepBuilderAPI_MakePolygon poly;
-    double offset = M_PI / segments;
+    double offset = std::numbers::pi / segments;
     for (int i = 0; i < segments; ++i) {
-        double angle = 2.0 * M_PI * i / segments + offset;
+        double angle = 2.0 * std::numbers::pi * i / segments + offset;
         gp_Vec vx(dx);
         gp_Vec vy(dy);
         vx.Scale(radius * std::cos(angle));
@@ -146,7 +147,7 @@ static TopoDS_Shape build_concentric_round_column_turn(double turn_radius, doubl
         TopoDS_Face profile = faceMaker.Face();
 
         gp_Ax1 rev_axis(gp_Pnt(0.0, height_pos, 0.0), gp_Dir(0, 1, 0));
-        BRepPrimAPI_MakeRevol revol(profile, rev_axis, 2.0 * M_PI - 1e-6);
+        BRepPrimAPI_MakeRevol revol(profile, rev_axis, 2.0 * std::numbers::pi - 1e-6);
         if (!revol.IsDone()) {
             std::cerr << "ERROR build_concentric_round_column_turn: MakeRevol failed for rect wire turn\n";
             return TopoDS_Shape();
@@ -192,7 +193,7 @@ static TopoDS_Shape build_concentric_round_column_turn(double turn_radius, doubl
                           gp_Dir(0, 0, 1), gp_Dir(1, 0, 0));
     TopoDS_Face profile = build_circle_profile(profile_plane, wire_radius, segments);
     gp_Ax1 rev_axis(gp_Pnt(0.0, height_pos, 0.0), gp_Dir(0, 1, 0));
-    BRepPrimAPI_MakeRevol revol(profile, rev_axis, 2.0 * M_PI - 1e-6);
+    BRepPrimAPI_MakeRevol revol(profile, rev_axis, 2.0 * std::numbers::pi - 1e-6);
     if (!revol.IsDone()) {
         std::cerr << "ERROR build_concentric_round_column_turn: MakeRevol failed for round wire turn\n";
         return TopoDS_Shape();
@@ -274,7 +275,7 @@ static TopoDS_Shape build_concentric_rect_column_turn(double radial_pos, double 
 
             gp_Ax1 rev_axis(c_center, gp_Dir(0, 1, 0));
             // All corners sweep -90° around +Y (clockwise when viewed from +Y)
-            BRepPrimAPI_MakeRevol revol(circ_face, rev_axis, -M_PI / 2.0);
+            BRepPrimAPI_MakeRevol revol(circ_face, rev_axis, -std::numbers::pi / 2.0);
             if (revol.IsDone()) {
                 builder.Add(compound, revol.Shape());
             }
@@ -334,7 +335,7 @@ static TopoDS_Shape build_concentric_rect_column_turn(double radial_pos, double 
         TopoDS_Face rect_face = build_rect_profile(profPlane, wire_width, wire_height);
 
         gp_Ax1 rev_axis(c_center, gp_Dir(0, 1, 0));
-        BRepPrimAPI_MakeRevol revol(rect_face, rev_axis, -M_PI / 2.0);
+        BRepPrimAPI_MakeRevol revol(rect_face, rev_axis, -std::numbers::pi / 2.0);
         if (revol.IsDone()) {
             builder.Add(compound, revol.Shape());
         } else {
@@ -358,7 +359,7 @@ static TopoDS_Shape rotate_about_axis(const TopoDS_Shape& s, const gp_Pnt& pt,
 
 static TopoDS_Shape make_quarter_torus_at(double major_R, double minor_r,
                                             const gp_Pnt& center, double startAngleDeg) {
-    double a = startAngleDeg * M_PI / 180.0;
+    double a = startAngleDeg * std::numbers::pi / 180.0;
     gp_Ax2 ax(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1),
               gp_Dir(std::cos(a), std::sin(a), 0.0));
     try {
@@ -372,7 +373,7 @@ static TopoDS_Shape make_quarter_torus_at(double major_R, double minor_r,
         TopoDS_Wire wire = BRepBuilderAPI_MakeWire(edge).Wire();
         TopoDS_Face face = BRepBuilderAPI_MakeFace(wire, Standard_True).Face();
         gp_Ax1 rev_axis(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
-        BRepPrimAPI_MakeRevol mk(face, rev_axis, M_PI / 2.0);
+        BRepPrimAPI_MakeRevol mk(face, rev_axis, std::numbers::pi / 2.0);
         if (!mk.IsDone()) return TopoDS_Shape();
         TopoDS_Shape shape = mk.Shape();
         if (std::abs(a) > 1e-12) {
@@ -461,7 +462,7 @@ static TopoDS_Shape make_toroidal_quarter_swept_rectangle(
         }
 
         gp_Ax1 revAxis(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
-        BRepPrimAPI_MakeRevol revol(profile, revAxis, (M_PI / 2.0) * ySign, Standard_True);
+        BRepPrimAPI_MakeRevol revol(profile, revAxis, (std::numbers::pi / 2.0) * ySign, Standard_True);
         if (!revol.IsDone()) {
             std::cerr << "ERROR make_toroidal_quarter_swept_rectangle: MakeRevol not done\n";
             return TopoDS_Shape();
@@ -499,7 +500,7 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
     if (coords.size() < 2) return TopoDS_Shape();
     double cx = coords[0], cy = coords[1];
     double innerRadial = std::sqrt(cx * cx + cy * cy);
-    double innerAngleDeg = std::atan2(cy, cx) * 180.0 / M_PI;
+    double innerAngleDeg = std::atan2(cy, cx) * 180.0 / std::numbers::pi;
 
     double outerRadial = innerRadial;
     double outerAngleDeg = innerAngleDeg;
@@ -511,14 +512,14 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
     if (addCoords && !addCoords->empty() && (*addCoords)[0].size() >= 2) {
         double ax = (*addCoords)[0][0], ay = (*addCoords)[0][1];
         outerRadial = std::sqrt(ax * ax + ay * ay);
-        outerAngleDeg = std::atan2(ay, ax) * 180.0 / M_PI;
+        outerAngleDeg = std::atan2(ay, ax) * 180.0 / std::numbers::pi;
     } else {
         outerRadial = innerRadial + wwRadialHeight;
     }
 
     double turnAngleDeg = turn.get_rotation().value_or(0.0);
-    double angleDiffRad = (outerAngleDeg - innerAngleDeg) * M_PI / 180.0;
-    double turnRotationRad = (turnAngleDeg - 180.0) * M_PI / 180.0;
+    double angleDiffRad = (outerAngleDeg - innerAngleDeg) * std::numbers::pi / 180.0;
+    double turnRotationRad = (turnAngleDeg - 180.0) * std::numbers::pi / 180.0;
 
     double halfDepth = bobbin.get_column_depth();
     double bendRadius = rect_wire ? std::max(wire_w, wire_h) / 2.0 : wire_radius;
@@ -583,7 +584,7 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
                 }
                 // 4. Outer corner: sweep starts at radial connection (±90°), turns toward outer tube
                 {
-                    double startAngleRad = (ySign > 0) ? (M_PI / 2.0) : (3.0 * M_PI / 2.0);
+                    double startAngleRad = (ySign > 0) ? (std::numbers::pi / 2.0) : (3.0 * std::numbers::pi / 2.0);
                     gp_Pnt center(outerX + bendRadius, tubeLength * ySign, 0.0);
                     TopoDS_Shape s = make_toroidal_quarter_swept_rectangle(
                         bendRadius, wire_w, wire_h, center, startAngleRad, ySign);
@@ -607,7 +608,7 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
                 // 1. Inner tube along Y from origin
                 {
                     TopoDS_Shape c = BRepPrimAPI_MakeCylinder(wire_radius, tubeLength).Shape();
-                    c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(1,0,0), -M_PI/2.0 * ySign);
+                    c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(1,0,0), -std::numbers::pi/2.0 * ySign);
                     c = translate_shape(c, innerX, 0.0, 0.0);
                     if (!c.IsNull()) builder.Add(compound, c);
                 }
@@ -622,7 +623,7 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
                 // 3. Radial segment along X
                 {
                     TopoDS_Shape c = BRepPrimAPI_MakeCylinder(wire_radius, radialLength).Shape();
-                    c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(0,1,0), -M_PI/2.0);
+                    c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(0,1,0), -std::numbers::pi/2.0);
                     c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(0,1,0), angleDiffRad / 2.0);
                     c = translate_shape(c, innerX - bendRadius, radialHeight * ySign, 0.0);
                     c = rotate_about_axis(c, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad / 2.0);
@@ -639,7 +640,7 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
                 // 5. Outer tube
                 {
                     TopoDS_Shape c = BRepPrimAPI_MakeCylinder(wire_radius, tubeLength).Shape();
-                    c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(1,0,0), -M_PI/2.0 * ySign);
+                    c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(1,0,0), -std::numbers::pi/2.0 * ySign);
                     c = translate_shape(c, outerX, 0.0, 0.0);
                     c = rotate_about_axis(c, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad);
                     if (!c.IsNull()) builder.Add(compound, c);
@@ -686,7 +687,7 @@ static TopoDS_Shape build_concentric_oblong_turn(double radial_pos, double wire_
     // Half-torus arcs at ±Z ends
     auto make_half_torus = [&](double cz, double start_angle_deg) -> TopoDS_Shape {
         gp_Pnt circ_center(radial_pos, height_pos, cz);
-        double angle_rad = start_angle_deg * M_PI / 180.0;
+        double angle_rad = start_angle_deg * std::numbers::pi / 180.0;
         gp_Dir normal(std::cos(angle_rad), 0.0, std::sin(angle_rad));
         gp_Ax2 circ_axis(circ_center, normal);
 
@@ -696,7 +697,7 @@ static TopoDS_Shape build_concentric_oblong_turn(double radial_pos, double wire_
         TopoDS_Face circ_face = BRepBuilderAPI_MakeFace(circ_wire).Face();
 
         gp_Ax1 rev_axis(gp_Pnt(0, height_pos, cz), gp_Dir(0, 0, 1));
-        BRepPrimAPI_MakeRevol revol(circ_face, rev_axis, M_PI);
+        BRepPrimAPI_MakeRevol revol(circ_face, rev_axis, std::numbers::pi);
         try {
             return revol.Shape();
         } catch (const Standard_Failure& e) {

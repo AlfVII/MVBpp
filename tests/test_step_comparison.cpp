@@ -57,7 +57,14 @@ static MAS::Magnetic make_simple_e_magnetic() {
     piece2.set_rotation(std::optional<std::vector<double>>(std::vector<double>{std::numbers::pi, 0.0, 0.0}));
     piece2.set_shape(std::optional<MAS::CoreShapeDataOrNameUnion>(shape));
 
+    MAS::CoreFunctionalDescription coreFunc;
+    coreFunc.set_material(MAS::CoreMaterialDataOrNameUnion{std::string("N87")});
+    coreFunc.set_type(MAS::CoreType::TWO_PIECE_SET);
+    coreFunc.set_number_stacks(int64_t(1));
+    coreFunc.set_shape(shape);
+
     MAS::MagneticCore core;
+    core.set_functional_description(coreFunc);
     core.set_geometrical_description(std::optional<std::vector<MAS::CoreGeometricalDescriptionElement>>(std::vector<MAS::CoreGeometricalDescriptionElement>{piece1, piece2}));
     magnetic.set_core(core);
     magnetic.set_coil(MAS::Coil());
@@ -81,7 +88,14 @@ static MAS::Magnetic make_simple_t_magnetic() {
     piece.set_rotation(std::optional<std::vector<double>>(std::vector<double>{0.0, 0.0, 0.0}));
     piece.set_shape(std::optional<MAS::CoreShapeDataOrNameUnion>(shape));
 
+    MAS::CoreFunctionalDescription coreFunc;
+    coreFunc.set_material(MAS::CoreMaterialDataOrNameUnion{std::string("N87")});
+    coreFunc.set_type(MAS::CoreType::TOROIDAL);
+    coreFunc.set_number_stacks(int64_t(1));
+    coreFunc.set_shape(shape);
+
     MAS::MagneticCore core;
+    core.set_functional_description(coreFunc);
     core.set_geometrical_description(std::optional<std::vector<MAS::CoreGeometricalDescriptionElement>>(std::vector<MAS::CoreGeometricalDescriptionElement>{piece}));
     magnetic.set_core(core);
     magnetic.set_coil(MAS::Coil());
@@ -453,4 +467,46 @@ TEST_CASE("ETD49 5-turn assembly STEP matches Python MVB reference", "[step][ass
     auto magnetic = loadEnrichedMagneticFromJson("testData/ETD49_N87_10uH_5T.json");
     std::string refPath = std::string(REFERENCE_STEPS_DIR) + "/reference_etd49_5t.step";
     compareFullAssemblyAgainstReference(refPath, magnetic, "etd49_5t");
+}
+
+// ── STL export tests ────────────────────────────────────────────────────────
+
+TEST_CASE("E core STL export produces non-empty binary data", "[stl][e]") {
+    auto magnetic = make_simple_e_magnetic();
+    mvb::MagneticBuilder builder;
+    auto tmpDir = std::filesystem::temp_directory_path();
+    std::string outDir = (tmpDir / "mvb_stl_test_e").string();
+    std::filesystem::create_directories(outDir);
+    std::string path = builder.drawMagnetic(magnetic, outDir, "stl");
+    REQUIRE(std::filesystem::exists(path));
+    auto sz = std::filesystem::file_size(path);
+    CHECK(sz > 80);  // STL binary header is 80 bytes
+    std::filesystem::remove_all(outDir);
+}
+
+TEST_CASE("Rectangular one-turn STL export produces non-empty data", "[stl][assembly][json]") {
+    auto magnetic = loadEnrichedMagneticFromJson("testData/concentric_rectangular_column_one_turn.json");
+    mvb::MagneticBuilder builder;
+    auto tmpDir = std::filesystem::temp_directory_path();
+    std::string outDir = (tmpDir / "mvb_stl_test_rect").string();
+    std::filesystem::create_directories(outDir);
+    std::string path = builder.drawMagnetic(magnetic, outDir, "stl");
+    REQUIRE(std::filesystem::exists(path));
+    auto sz = std::filesystem::file_size(path);
+    CHECK(sz > 80);
+    std::filesystem::remove_all(outDir);
+}
+
+TEST_CASE("ETD49 5-turn STL export with mm scale", "[stl][assembly][json]") {
+    auto magnetic = loadEnrichedMagneticFromJson("testData/ETD49_N87_10uH_5T.json");
+    mvb::MagneticBuilder builder;
+    auto tmpDir = std::filesystem::temp_directory_path();
+    std::string outDir = (tmpDir / "mvb_stl_test_etd49").string();
+    std::filesystem::create_directories(outDir);
+    std::string path = builder.drawMagnetic(magnetic, outDir, "stl",
+                                             /*includeBobbin=*/true, /*scale=*/1000.0);
+    REQUIRE(std::filesystem::exists(path));
+    auto sz = std::filesystem::file_size(path);
+    CHECK(sz > 80);
+    std::filesystem::remove_all(outDir);
 }

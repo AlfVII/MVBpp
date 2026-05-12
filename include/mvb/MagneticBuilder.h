@@ -14,6 +14,18 @@ namespace OpenMagnetics { class Magnetic; class Coil; }
 
 namespace mvb {
 
+// Unified configuration for drawMagnetic / drawMagneticToBytes.
+// All bindings (Python, WASM) accept this struct so the API surface
+// is identical across languages.
+struct DrawConfig {
+    std::string format                = "step";  // "step" or "stl"
+    bool        includeBobbin         = true;
+    double      scale                 = 1.0;     // 1000 for mm export
+    int         symmetryPlanes        = 0;       // 0=full, 1=half, 2=quarter
+    int         wirePolygonSegments    = DEFAULT_WIRE_POLYGON_SEGMENTS;
+    int         corePolygonSegments    = DEFAULT_CORE_POLYGON_SEGMENTS;
+};
+
 class MagneticBuilder {
 public:
     // Build geometry and export to STEP ("step") or STL ("stl").
@@ -36,6 +48,11 @@ public:
                              int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                              int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
 
+    // Config-based overload — preferred for bindings.
+    std::string drawMagnetic(const MAS::Magnetic& magnetic,
+                             const std::string& outputPath,
+                             const DrawConfig& cfg) const;
+
     // Overload that accepts an already-enriched OpenMagnetics::Magnetic
     // to avoid object-slicing issues with MAS::Magnetic
     std::string drawMagnetic(const OpenMagnetics::Magnetic& magnetic,
@@ -46,6 +63,11 @@ public:
                              int symmetryPlanes = 0,
                              int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                              int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
+
+    // Config-based overload — preferred for bindings.
+    std::string drawMagnetic(const OpenMagnetics::Magnetic& magnetic,
+                             const std::string& outputPath,
+                             const DrawConfig& cfg) const;
 
     std::vector<TopoDS_Shape> buildCore(const MAS::MagneticCore& core,
                                          int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;

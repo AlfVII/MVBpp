@@ -13,6 +13,7 @@
 #include <gp_Trsf.hxx>
 #include <gp_Ax1.hxx>
 #include <cmath>
+#include <numbers>
 
 namespace mvb {
 namespace shapes {
@@ -31,7 +32,7 @@ TopoDS_Shape ShapePm::applyExtras(const std::map<std::string, double>& dims,
     it = dims.find("alpha"); if (it != dims.end()) alpha = it->second;
     if (alpha <= 0.0) alpha = (familySubtype_ == "1") ? 120.0 : 90.0;
 
-    double halfAlphaRad = (alpha / 2.0) * M_PI / 180.0;
+    double halfAlphaRad = (alpha / 2.0) * std::numbers::pi / 180.0;
     double wedgeLength = a * 1.5;
     double wedgeHalfWidth = wedgeLength * std::tan(halfAlphaRad);
 
@@ -64,7 +65,7 @@ TopoDS_Shape ShapePm::applyExtras(const std::map<std::string, double>& dims,
     TopoDS_Shape bottomWedge = makeWedge();
     {
         gp_Trsf rot;
-        rot.SetRotation(gp_Ax1(gp_Pnt(0,0,0), gp_Dir(0,0,1)), M_PI);
+        rot.SetRotation(gp_Ax1(gp_Pnt(0,0,0), gp_Dir(0,0,1)), std::numbers::pi);
         bottomWedge = BRepBuilderAPI_Transform(bottomWedge, rot).Shape();
     }
     bottomWedge = translate_shape(bottomWedge, 0.0, -c, 0.0);

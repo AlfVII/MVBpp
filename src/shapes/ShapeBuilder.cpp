@@ -8,6 +8,7 @@
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 #include <cmath>
+#include <numbers>
 
 namespace mvb {
 namespace shapes {

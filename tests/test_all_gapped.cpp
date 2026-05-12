@@ -25,6 +25,10 @@
 
 using json = nlohmann::json;
 
+#ifndef MAS_DATA_DIR
+#define MAS_DATA_DIR "."
+#endif
+
 static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t"};
 
 namespace {
@@ -95,7 +99,7 @@ GappingResult build_with_gapping(const json& shape, const json& gapping,
 
 void run_gap_test(const std::string& label, const json& gappingTemplate,
                    int numberStacks = 1) {
-    std::ifstream f("/home/alf/OpenMagnetics/MAS2/data/core_shapes.ndjson");
+    std::ifstream f(std::string(MAS_DATA_DIR) + "/core_shapes.ndjson");
     REQUIRE(f.is_open());
 
     int total = 0, skipped = 0;

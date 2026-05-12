@@ -53,7 +53,7 @@ TopoDS_Shape make_halfspace(SymmetryPlane plane, SymmetryHalf half,
     const double dy = b.ymax - b.ymin;
     const double dz = b.zmax - b.zmin;
     const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const double pad = std::max(diag * 5.0, 1e-3);
+    const double pad = std::max(diag * 2.0, 1e-3);
     const double cx = 0.5 * (b.xmin + b.xmax);
     const double cy = 0.5 * (b.ymin + b.ymax);
     const double cz = 0.5 * (b.zmin + b.zmax);

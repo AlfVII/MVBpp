@@ -40,7 +40,34 @@ ExternalProject_Add(
         -DCMAKE_INSTALL_PREFIX=${OCCT_PREFIX}
         -DINSTALL_DIR_LIB=lib
         -DINSTALL_DIR_INCLUDE=include/opencascade
-    BUILD_BYPRODUCTS ${OCCT_PREFIX}/lib/libTKernel.a
+    BUILD_BYPRODUCTS
+        ${OCCT_PREFIX}/lib/libTKernel.a
+        ${OCCT_PREFIX}/lib/libTKMath.a
+        ${OCCT_PREFIX}/lib/libTKG2d.a
+        ${OCCT_PREFIX}/lib/libTKG3d.a
+        ${OCCT_PREFIX}/lib/libTKGeomBase.a
+        ${OCCT_PREFIX}/lib/libTKBRep.a
+        ${OCCT_PREFIX}/lib/libTKGeomAlgo.a
+        ${OCCT_PREFIX}/lib/libTKTopAlgo.a
+        ${OCCT_PREFIX}/lib/libTKPrim.a
+        ${OCCT_PREFIX}/lib/libTKBO.a
+        ${OCCT_PREFIX}/lib/libTKBool.a
+        ${OCCT_PREFIX}/lib/libTKMesh.a
+        ${OCCT_PREFIX}/lib/libTKShHealing.a
+        ${OCCT_PREFIX}/lib/libTKCDF.a
+        ${OCCT_PREFIX}/lib/libTKLCAF.a
+        ${OCCT_PREFIX}/lib/libTKXSBase.a
+        ${OCCT_PREFIX}/lib/libTKXCAF.a
+        ${OCCT_PREFIX}/lib/libTKCAF.a
+        ${OCCT_PREFIX}/lib/libTKVCAF.a
+        ${OCCT_PREFIX}/lib/libTKBin.a
+        ${OCCT_PREFIX}/lib/libTKXml.a
+        ${OCCT_PREFIX}/lib/libTKStd.a
+        ${OCCT_PREFIX}/lib/libTKOffset.a
+        ${OCCT_PREFIX}/lib/libTKRWMesh.a
+        ${OCCT_PREFIX}/lib/libTKDESTEP.a
+        ${OCCT_PREFIX}/lib/libTKDEIGES.a
+        ${OCCT_PREFIX}/lib/libTKDESTL.a
     USES_TERMINAL_BUILD TRUE
 )
 
@@ -79,8 +106,9 @@ set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
 FetchContent_Declare(
     MAS
     GIT_REPOSITORY "${_MAS_LOCAL}"
-    GIT_TAG        main
-    GIT_SHALLOW    TRUE
+    # Pinned to same commit as root CMakeLists.txt — keep in sync.
+    GIT_TAG        a16a6007fa364e4af2fc81a1dc895da4fe393e7c
+    GIT_SHALLOW    FALSE
 )
 FetchContent_MakeAvailable(MAS)
 set(MAS_DIR "${mas_SOURCE_DIR}" CACHE PATH "" FORCE)
@@ -92,7 +120,8 @@ set(_MKF_BIN "${CMAKE_BINARY_DIR}/_deps/mkf-build")
 FetchContent_Declare(
     MKF
     GIT_REPOSITORY "${_MKF_LOCAL}"
-    GIT_TAG        8df6b8b740b291a3c48f27aee36ad4e2f6459032
+    # Pinned to same commit as root CMakeLists.txt — keep in sync.
+    GIT_TAG        424bf300022a07b73b9bafd90a53bb817514fef4
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
@@ -105,6 +134,13 @@ if(IS_DIRECTORY "${_MKF_SRC}/MAS" AND NOT IS_SYMLINK "${_MKF_SRC}/MAS")
 endif()
 if(NOT EXISTS "${_MKF_SRC}/MAS")
     file(CREATE_LINK "${_MAS_SRC}" "${_MKF_SRC}/MAS" SYMBOLIC)
+endif()
+# Initialize submodules MKF needs (cci_coords for codegen, CAS for Topology.h)
+if(IS_DIRECTORY "${_MKF_SRC}/cci_coords" AND NOT EXISTS "${_MKF_SRC}/cci_coords/coordinates")
+    execute_process(
+        COMMAND git submodule update --init cci_coords CAS EAS
+        WORKING_DIRECTORY "${_MKF_SRC}"
+    )
 endif()
 if(NOT TARGET MKF)
     # MKF hardcodes add_library(MKF SHARED ...) — patch it to STATIC.

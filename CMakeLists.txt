@@ -43,6 +43,32 @@ ExternalProject_Add(
         -DINSTALL_DIR_INCLUDE=include/opencascade
     BUILD_BYPRODUCTS
         ${OCCT_PREFIX}/lib/libTKernel.a
+        ${OCCT_PREFIX}/lib/libTKMath.a
+        ${OCCT_PREFIX}/lib/libTKG2d.a
+        ${OCCT_PREFIX}/lib/libTKG3d.a
+        ${OCCT_PREFIX}/lib/libTKGeomBase.a
+        ${OCCT_PREFIX}/lib/libTKBRep.a
+        ${OCCT_PREFIX}/lib/libTKGeomAlgo.a
+        ${OCCT_PREFIX}/lib/libTKTopAlgo.a
+        ${OCCT_PREFIX}/lib/libTKPrim.a
+        ${OCCT_PREFIX}/lib/libTKBO.a
+        ${OCCT_PREFIX}/lib/libTKBool.a
+        ${OCCT_PREFIX}/lib/libTKMesh.a
+        ${OCCT_PREFIX}/lib/libTKShHealing.a
+        ${OCCT_PREFIX}/lib/libTKCDF.a
+        ${OCCT_PREFIX}/lib/libTKLCAF.a
+        ${OCCT_PREFIX}/lib/libTKXSBase.a
+        ${OCCT_PREFIX}/lib/libTKXCAF.a
+        ${OCCT_PREFIX}/lib/libTKCAF.a
+        ${OCCT_PREFIX}/lib/libTKVCAF.a
+        ${OCCT_PREFIX}/lib/libTKBin.a
+        ${OCCT_PREFIX}/lib/libTKXml.a
+        ${OCCT_PREFIX}/lib/libTKStd.a
+        ${OCCT_PREFIX}/lib/libTKOffset.a
+        ${OCCT_PREFIX}/lib/libTKRWMesh.a
+        ${OCCT_PREFIX}/lib/libTKDESTEP.a
+        ${OCCT_PREFIX}/lib/libTKDEIGES.a
+        ${OCCT_PREFIX}/lib/libTKDESTL.a
     USES_TERMINAL_BUILD TRUE
 )
 
@@ -56,6 +82,11 @@ set(OCCT_ESSENTIAL_LIBS
     TKGeomAlgo TKTopAlgo TKPrim TKBO TKBool TKMesh TKShHealing
     TKCDF TKLCAF TKXSBase TKXCAF TKCAF TKVCAF TKBin TKXml TKStd
     TKOffset TKRWMesh TKDESTEP TKDEIGES TKDESTL
+    TKV3d TKService TKHLR TKFillet TKFeat
+    TKBinL TKStdL TKXmlL TKBinXCAF TKXmlXCAF
+    TKDE TKDECascade
+    TKTObj TKBinTObj TKXmlTObj
+    TKDEGLTF TKDEOBJ TKDEPLY TKDEVRML
 )
 target_link_libraries(occt INTERFACE ${OCCT_ESSENTIAL_LIBS})
 
@@ -102,11 +133,10 @@ set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
 FetchContent_Declare(
     MAS
     GIT_REPOSITORY "${_MAS_LOCAL}"
-    # Pinned to the commit BEFORE 7e89745 "Rename phaseShift to innerPhaseShift3"
-    # — the pinned MKF @ 8df6b8b still calls DabOperatingPoint::get_phase_shift(),
-    # which was generated from that older MAS schema. Fresh pipx/pip wheel
-    # builds otherwise fail in MKF/src/converter_models/Dab.cpp.
-    GIT_TAG        81634c20b07673db68c05c36b8f4e24414554211
+    # Bumped to MAS origin/main HEAD: PFC topology variants, AHB/PSFB schema
+    # updates, dutyCycle bounds, bulkCapacitance, plus MAS 1.0 enum migration
+    # (twoPieceSet, wound, innerOrTop, etc. via migrate-to-1.0.py).
+    GIT_TAG        a16a6007fa364e4af2fc81a1dc895da4fe393e7c
     GIT_SHALLOW    FALSE
 )
 FetchContent_MakeAvailable(MAS)
@@ -122,7 +152,10 @@ set(_MKF_BIN "${CMAKE_BINARY_DIR}/_deps/mkf-build")
 FetchContent_Declare(
     MKF
     GIT_REPOSITORY "${_MKF_LOCAL}"
-    GIT_TAG        8df6b8b740b291a3c48f27aee36ad4e2f6459032
+    # Bumped to MKF origin/main HEAD to match the MAS 2f37eea pin above.
+    # PtP harness additions, topology expansions. MKF's magnetic_autocomplete
+    # and Core/Coil constructors are what MVB++ actually uses.
+    GIT_TAG        424bf300022a07b73b9bafd90a53bb817514fef4
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
@@ -138,6 +171,17 @@ endif()
 if(NOT EXISTS "${_MKF_SRC}/MAS")
     file(CREATE_LINK "${_MAS_SRC}" "${_MKF_SRC}/MAS" SYMBOLIC)
 endif()
+# Initialize submodules MKF needs (cci_coords for codegen, CAS for Topology.h)
+if(IS_DIRECTORY "${_MKF_SRC}/cci_coords" AND NOT EXISTS "${_MKF_SRC}/cci_coords/coordinates")
+    execute_process(
+        COMMAND git submodule update --init cci_coords CAS EAS
+        WORKING_DIRECTORY "${_MKF_SRC}"
+        RESULT_VARIABLE _cci_result
+    )
+    if(NOT _cci_result EQUAL 0)
+        message(WARNING "Failed to init MKF submodules (exit ${_cci_result})")
+    endif()
+endif()
 if(NOT TARGET MKF)
     # MKF hardcodes add_library(MKF SHARED ...) — patch it to STATIC so the
     # Python wheel and WASM module are fully self-contained.
@@ -151,7 +195,7 @@ endif()
 # ============================================================================
 # MVB++ library
 # ============================================================================
-add_library(mvb++ STATIC
+add_library(mvb++ SHARED
     src/MagneticBuilder.cpp
     src/SectionBuilder.cpp
     src/SectionDrawing.cpp
@@ -216,6 +260,7 @@ add_executable(mvb_tests
 target_compile_definitions(mvb_tests PRIVATE
     REFERENCE_STEPS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/reference_steps"
     MAS_EXAMPLES_DIR="${CMAKE_BINARY_DIR}/_deps/mas-src/examples"
+    MAS_DATA_DIR="${CMAKE_BINARY_DIR}/_deps/mas-src/data"
 )
 
 target_link_libraries(mvb_tests PRIVATE mvb++ Catch2::Catch2WithMain)

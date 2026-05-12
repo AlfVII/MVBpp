@@ -9,6 +9,7 @@
 #include <BRepAlgoAPI_Cut.hxx>
 #include <gp_Pnt.hxx>
 #include <cmath>
+#include <numbers>
 
 namespace mvb {
 namespace shapes {

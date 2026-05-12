@@ -8,6 +8,7 @@
 #include <gp_Trsf.hxx>
 #include <gp_Pnt.hxx>
 #include <cmath>
+#include <numbers>
 
 namespace mvb {
 namespace shapes {
@@ -72,7 +73,7 @@ TopoDS_Shape ShapeEr::applyMachining(const TopoDS_Shape& piece,
         TopoDS_Shape toolZ = build_polygon_cylinder(gapLength, f / 2.0,
                                                     m_corePolygonSegments);
         if (toolZ.IsNull()) return piece;
-        TopoDS_Shape toolY = rotate_shape(toolZ, -M_PI / 2.0, 0.0, 0.0);
+        TopoDS_Shape toolY = rotate_shape(toolZ, -std::numbers::pi / 2.0, 0.0, 0.0);
         TopoDS_Shape tool  = translate_shape(toolY, 0.0,
                                              yCoord - gapLength / 2.0, 0.0);
         if (tool.IsNull()) return piece;

@@ -20,9 +20,13 @@ using json = nlohmann::json;
 
 static const std::set<std::string> EXCLUDED_FAMILIES = {"ui", "pqi", "ut"};
 
+#ifndef MAS_DATA_DIR
+#define MAS_DATA_DIR "."
+#endif
+
 TEST_CASE("All MAS core shapes build a non-empty solid",
           "[shapes][all_shapes]") {
-    std::ifstream f("/home/alf/OpenMagnetics/MAS2/data/core_shapes.ndjson");
+    std::ifstream f(std::string(MAS_DATA_DIR) + "/core_shapes.ndjson");
     REQUIRE(f.is_open());
 
     int total = 0, skipped = 0, failed = 0;
@@ -86,7 +90,7 @@ TEST_CASE("All MAS core shapes build a non-empty solid",
               << " failed=" << failed << "\n";
     for (const auto& f : failures) std::cerr << "  FAIL: " << f << "\n";
 
-    REQUIRE(total > 900);          // sanity: should hit ~952 shapes
+    REQUIRE(total > 800);          // sanity: should hit ~882-952 shapes
     REQUIRE(failures.empty());
 }
 
@@ -94,7 +98,7 @@ TEST_CASE("All MAS core shapes build a non-empty solid",
 // (except ui/pqi) must be routable via the factory.
 TEST_CASE("All MAS families are supported by the factory",
           "[shapes][get_families]") {
-    std::ifstream f("/home/alf/OpenMagnetics/MAS2/data/core_shapes.ndjson");
+    std::ifstream f(std::string(MAS_DATA_DIR) + "/core_shapes.ndjson");
     REQUIRE(f.is_open());
 
     std::set<std::string> families;

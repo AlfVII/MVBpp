@@ -22,6 +22,8 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <filesystem>
+#include <random>
 
 namespace mvb {
 
@@ -146,16 +148,22 @@ std::string exportSTLToBytes(const std::vector<TopoDS_Shape>& shapes,
     mesh.Perform();
 
     // StlAPI_Writer has no in-memory API; write to a temp file and slurp.
-    const char* tmpPath = "/tmp/mvbpp_stl_out.stl";
+    std::filesystem::path tmpDir = std::filesystem::temp_directory_path();
+    // Use random suffix to avoid race conditions with concurrent calls.
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+    std::string tmpName = "mvbpp_stl_" + std::to_string(dist(gen)) + ".stl";
+    std::filesystem::path tmpPath = tmpDir / tmpName;
     StlAPI_Writer writer;
     writer.ASCIIMode() = !binary;
-    if (!writer.Write(compound, tmpPath)) return {};
+    if (!writer.Write(compound, tmpPath.string().c_str())) return {};
 
     std::ifstream f(tmpPath, std::ios::binary);
-    if (!f) return {};
+    if (!f) { std::filesystem::remove(tmpPath); return {}; }
     std::string data((std::istreambuf_iterator<char>(f)),
                       std::istreambuf_iterator<char>());
-    std::remove(tmpPath);
+    std::filesystem::remove(tmpPath);
     return data;
 }
 

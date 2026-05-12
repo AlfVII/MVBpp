@@ -57,8 +57,11 @@ protected:
 
 // Factory — `corePolygonSegments` is applied to the returned builder.
 std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
-                                                  const std::string& subtype = "",
-                                                  int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS);
+                                                   const std::string& subtype = "",
+                                                   int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS);
+
+// Return all shape family strings that have a registered builder.
+std::vector<std::string> getSupportedShapeFamilies();
 
 } // namespace shapes
 } // namespace mvb

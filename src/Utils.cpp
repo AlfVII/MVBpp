@@ -22,9 +22,7 @@
 #include <gp_Ax3.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Trsf.hxx>
-#include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
-#include <gp_Dir.hxx>
 #include <variant>
 #include <stdexcept>
 #include <numbers>
@@ -116,7 +114,7 @@ TopoDS_Shape build_polygon_ring(double turn_radius, double wire_radius,
         BRepBuilderAPI_MakeFace face(placed_wire);
         gp_Ax1 rev_axis(gp_Pnt(0.0, y, 0.0), gp_Dir(0, 1, 0));
         return BRepPrimAPI_MakeRevol(face.Face(), rev_axis,
-                                      2.0 * M_PI - 1e-6).Shape();
+                                      2.0 * std::numbers::pi - 1e-6).Shape();
     }
 
     // ThruSections: place `revolution_segments` copies of the polygonal
@@ -130,7 +128,7 @@ TopoDS_Shape build_polygon_ring(double turn_radius, double wire_radius,
     // azimuthal (φ̂) direction at that angle — so rotating around Y sweeps
     // the polygon's plane through the ring.
     for (int i = 0; i <= revolution_segments; ++i) {
-        double angle = 2.0 * M_PI * static_cast<double>(i)
+        double angle = 2.0 * std::numbers::pi * static_cast<double>(i)
                        / static_cast<double>(revolution_segments);
         double cx = turn_radius * std::cos(angle);
         double cz = turn_radius * std::sin(angle);
@@ -235,16 +233,6 @@ std::string core_shape_family_to_string(MAS::CoreShapeFamily family) {
     return "unknown";
 }
 
-std::vector<std::string> get_supported_families() {
-    // Mirror the case list in shapes::createShapeBuilder — anything that
-    // returns a non-null builder belongs in this list.
-    return {
-        "c",   "e",   "ec",  "efd", "ei",  "el",  "elp", "ep",
-        "epx", "eq",  "er",  "etd", "lp",  "p",   "planar e", "planar el",
-        "planar er", "pm",  "pq",  "pqi", "rm",  "t",   "u",   "ur",  "ut",
-    };
-}
-
 OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneticJson) {
     using json = nlohmann::json;
 
@@ -296,39 +284,24 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
             mutCore.get_mutable_functional_description().set_number_stacks(int64_t(1));
         }
 
-        try { mutCore.resolve_shape(); }
-        catch (...) { return om; }
+        mutCore.resolve_shape();
 
-        try {
-            auto shapeFamily = mutCore.get_shape_family();
-            if (shapeFamily == MAS::CoreShapeFamily::T) {
-                mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TOROIDAL);
-            } else {
-                mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TWO_PIECE_SET);
-            }
-        } catch (...) {
+        auto shapeFamily = mutCore.get_shape_family();
+        if (shapeFamily == MAS::CoreShapeFamily::T) {
+            mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TOROIDAL);
+        } else {
             mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TWO_PIECE_SET);
         }
 
-        try {
-            mutCore.resolve_material();
-        } catch (...) {
-            mutCore.get_mutable_functional_description().set_material(
-                MAS::CoreMaterialDataOrNameUnion{std::string("Dummy")});
-            try { mutCore.resolve_material(); } catch (...) {}
-        }
+        mutCore.resolve_material();
 
         if (!mutCore.get_processed_description()) {
-            try { mutCore.process_data(); } catch (...) {}
-            try { mutCore.process_gap(); } catch (...) {}
+            mutCore.process_data();
+            mutCore.process_gap();
         }
 
-        // Always create_geometrical_description so buildCore gets a full CoreShape variant
-        // (resolve_shape may store a name-only reference that buildCore can't use).
-        try {
-            auto geoDesc = mutCore.create_geometrical_description();
-            mutCore.set_geometrical_description(geoDesc);
-        } catch (...) {}
+        auto geoDesc = mutCore.create_geometrical_description();
+        mutCore.set_geometrical_description(geoDesc);
 
         return om;
     }
@@ -344,13 +317,9 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const MAS::Magnetic& magnetic
 
 bool is_shape_usable(const TopoDS_Shape& shape) {
     if (shape.IsNull()) return false;
-    try {
-        Bnd_Box bb;
-        BRepBndLib::Add(shape, bb);
-        return !bb.IsVoid();
-    } catch (...) {
-        return false;
-    }
+    Bnd_Box bb;
+    BRepBndLib::Add(shape, bb);
+    return !bb.IsVoid();
 }
 
 TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Shape>& cutters) {

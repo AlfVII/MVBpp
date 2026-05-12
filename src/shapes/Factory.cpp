@@ -72,4 +72,19 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
 }
 
 } // namespace shapes
+
+std::vector<std::string> get_supported_families() {
+    // Derive from the factory: try every CoreShapeFamily and keep the ones
+    // that produce a non-null builder.
+    std::vector<std::string> result;
+    for (int i = 0; i <= static_cast<int>(MAS::CoreShapeFamily::UT); ++i) {
+        auto family = static_cast<MAS::CoreShapeFamily>(i);
+        auto builder = shapes::createShapeBuilder(family);
+        if (builder) {
+            result.push_back(core_shape_family_to_string(family));
+        }
+    }
+    return result;
+}
+
 } // namespace mvb

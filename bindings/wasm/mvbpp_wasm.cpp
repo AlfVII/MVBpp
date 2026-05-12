@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -249,13 +250,18 @@ val buildMagneticSTEP(const std::string& magnetic_json,
 {
     auto named = buildAssemblyNamed(magnetic_json, includeBobbin, symmetryPlanes,
                                      wirePolygonSegments, corePolygonSegments, scale);
-    const char* tmp = "/tmp/mvbpp_out.step";
-    mvb::exportSTEP(named, tmp);
+    // Use random suffix to avoid race conditions with concurrent calls.
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+    std::string tmpName = "mvbpp_" + std::to_string(dist(gen)) + ".step";
+    auto tmp = std::filesystem::temp_directory_path() / tmpName;
+    mvb::exportSTEP(named, tmp.string());
     std::ifstream f(tmp, std::ios::binary);
-    if (!f) throw std::runtime_error("buildMagneticSTEP: failed to read temp file");
+    if (!f) { std::filesystem::remove(tmp); throw std::runtime_error("buildMagneticSTEP: failed to read temp file"); }
     std::string data((std::istreambuf_iterator<char>(f)),
                       std::istreambuf_iterator<char>());
-    std::remove(tmp);
+    std::filesystem::remove(tmp);
     return makeUint8Array(data);
 }
 
