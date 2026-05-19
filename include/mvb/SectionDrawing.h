@@ -54,6 +54,25 @@ public:
     static void writeDimensionedTopView(
         const OpenMagnetics::Magnetic& magnetic,
         const std::string& outputPath);
+
+    // Unified pictorial-view dispatcher used by drawView in the bindings.
+    //   - plane="XY" : front elevation (delegates to drawDimensionedFrontView
+    //                  if dimensions=true, otherwise plain section SVG).
+    //   - plane="XZ" : top view (delegates to drawDimensionedTopView when
+    //                  dimensions=true).
+    //   - plane="YZ" : not currently dimensioned — falls back to a plain
+    //                  section SVG cut at x=offset.
+    // `offset` (metres) shifts the cut plane along its normal. For
+    // dimensioned views only offset=0.0 is supported (throws otherwise).
+    static std::string drawView(
+        const OpenMagnetics::Magnetic& magnetic,
+        const std::string& plane = "XY",
+        double offset = 0.0,
+        bool dimensions = true,
+        double width_px = 800.0,
+        double label_font_px = 12.0,
+        const std::string& projection_color = "#000000",
+        const std::string& dimension_color = "#1976d2");
 };
 
 } // namespace mvb

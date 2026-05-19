@@ -8,6 +8,7 @@
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <Bnd_Box.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
@@ -44,6 +45,8 @@ struct Dim {
 
 // Edge sampler that projects onto the plane coordinates of the view.
 // FrontView: (X, Y) from section plane XY. TopView: (X, Z) from XZ.
+// Toroidal TopView is forced through the FrontView projection by the caller
+// (sees the donut from above) — see drawDimensionedViewImpl for the routing.
 std::vector<std::pair<double,double>> sampleEdge(const TopoDS_Edge& edge, ViewKind view) {
     std::vector<std::pair<double,double>> out;
     try {
@@ -547,13 +550,13 @@ std::vector<Dim> buildCoreShapeTopDims(const MAS::CoreShape& shape) {
 // ==========================================================================
 TopoDS_Shape buildFusedCore(const OpenMagnetics::Magnetic& magnetic, int corePolygonSegments = 0) {
     MagneticBuilder builder;
-    auto pieces = builder.buildCore(magnetic.get_core(), corePolygonSegments);
+    auto pieces = builder.buildCoreNamed(magnetic.get_core(), corePolygonSegments);
     if (pieces.empty()) {
         throw std::runtime_error("SectionDrawing: no core pieces built");
     }
-    TopoDS_Shape core = pieces[0];
+    TopoDS_Shape core = pieces[0].shape;
     for (size_t i = 1; i < pieces.size(); ++i) {
-        BRepAlgoAPI_Fuse fuser(core, pieces[i]);
+        BRepAlgoAPI_Fuse fuser(core, pieces[i].shape);
         if (fuser.IsDone()) core = fuser.Shape();
     }
     return core;
@@ -684,7 +687,7 @@ std::string emitSvg(const std::vector<std::vector<std::pair<double,double>>>& po
 // ==========================================================================
 // Main rendering paths.
 // ==========================================================================
-std::string drawView(const OpenMagnetics::Magnetic& magnetic,
+static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnetic,
                      ViewKind view,
                      double width_px, double label_font_px,
                      const std::string& projection_color,
@@ -695,7 +698,7 @@ std::string drawView(const OpenMagnetics::Magnetic& magnetic,
     // For FRONT: fuse all pieces so the section cuts through the whole assembly.
     // For TOP: use a single piece (mirrors MVB.py's DrawViewPart on one half-set).
     MagneticBuilder builder;
-    auto pieces = builder.buildCore(magnetic.get_core(), corePolygonSegments);
+    auto pieces = builder.buildCoreNamed(magnetic.get_core(), corePolygonSegments);
     if (pieces.empty()) throw std::runtime_error("SectionDrawing: no core pieces built");
 
     // Sample edges → polylines in mm; collect bbox.
@@ -743,28 +746,68 @@ std::string drawView(const OpenMagnetics::Magnetic& magnetic,
 
     if (view == ViewKind::FRONT) {
         // FRONT: section the fused assembly at z=0 (XY plane).
-        TopoDS_Shape core = pieces[0];
+        TopoDS_Shape core = pieces[0].shape;
         for (size_t i = 1; i < pieces.size(); ++i) {
-            BRepAlgoAPI_Fuse fuser(core, pieces[i]);
+            BRepAlgoAPI_Fuse fuser(core, pieces[i].shape);
             if (fuser.IsDone()) core = fuser.Shape();
         }
         auto edges = SectionBuilder::sectionCore(core, SectionPlane::XY);
         if (edges.IsNull()) throw std::runtime_error("SectionDrawing: front section returned nothing");
         collectEdges(edges);
+    } else if (view == ViewKind::TOP && [&]{
+                  auto geo = magnetic.get_core().get_geometrical_description();
+                  if (!geo) return false;
+                  for (const auto& p : *geo)
+                      if (p.get_type() == MAS::CoreGeometricalDescriptionElementType::TOROIDAL)
+                          return true;
+                  return false;
+              }()) {
+        // Toroidal TOP: by MVB++ convention the toroid lies in XY with axis Z,
+        // so the canonical "top view" (donut from above) is the section at z=0
+        // projected onto X-Y — not the X-Z side projection used by E-family
+        // half-sets. Routing through sampleEdge with FRONT gets (X, Y).
+        TopoDS_Shape core = pieces[0].shape;
+        for (size_t i = 1; i < pieces.size(); ++i) {
+            BRepAlgoAPI_Fuse fuser(core, pieces[i].shape);
+            if (fuser.IsDone()) core = fuser.Shape();
+        }
+        auto edges = SectionBuilder::sectionCore(core, SectionPlane::XY);
+        if (edges.IsNull())
+            throw std::runtime_error("SectionDrawing: toroidal top section returned nothing");
+        for (TopExp_Explorer exp(edges, TopAbs_EDGE); exp.More(); exp.Next()) {
+            auto poly = sampleEdge(TopoDS::Edge(exp.Current()), ViewKind::FRONT);
+            if (poly.size() < 2) continue;
+            double px0 = poly.front().first, py0 = poly.front().second;
+            double px1 = poly.back().first,  py1 = poly.back().second;
+            if (std::abs(px1 - px0) < 1e-9 && std::abs(py1 - py0) < 1e-9) continue;
+            std::vector<std::pair<double,double>> mmPoly;
+            mmPoly.reserve(poly.size());
+            for (auto& p : poly) mmPoly.emplace_back(p.first * 1000.0, p.second * 1000.0);
+            std::string fwd = polylineKey(mmPoly);
+            std::vector<std::pair<double,double>> rev(mmPoly.rbegin(), mmPoly.rend());
+            if (!seenEdges.insert(std::min(fwd, polylineKey(rev))).second) continue;
+            for (auto& p : mmPoly) {
+                if (p.first  < xmin) xmin = p.first;
+                if (p.first  > xmax) xmax = p.first;
+                if (p.second < ymin) ymin = p.second;
+                if (p.second > ymax) ymax = p.second;
+            }
+            polylines.push_back(std::move(mmPoly));
+        }
     } else {
         // TOP: project a single piece orthographically onto XZ, exactly as
         // MVB.py does with FreeCAD DrawViewPart(Direction=(0,0,1)) on one half-set.
         // For a symmetric core both pieces give the same projection; we pick the
         // piece whose Y centroid is closest to +B/2 (the outer face of the assembly).
         // A simple heuristic: choose the piece with the largest positive Y bound.
-        TopoDS_Shape topPiece = pieces[0];
+        TopoDS_Shape topPiece = pieces[0].shape;
         double bestYhi = -1e30;
         for (const auto& p : pieces) {
             Bnd_Box pb;
-            BRepBndLib::Add(p, pb);
+            BRepBndLib::Add(p.shape, pb);
             double xlo, ylo, zlo, xhi, yhi, zhi;
             pb.Get(xlo, ylo, zlo, xhi, yhi, zhi);
-            if (yhi > bestYhi) { bestYhi = yhi; topPiece = p; }
+            if (yhi > bestYhi) { bestYhi = yhi; topPiece = p.shape; }
         }
         // Heal the fused solid: merge co-planar adjacent faces and remove the
         // redundant seam edges left by BRepAlgoAPI_Fuse (unifyEdges + unifyFaces).
@@ -821,7 +864,7 @@ std::string SectionDrawing::drawDimensionedFrontView(
         const std::string& projection_color,
         const std::string& dimension_color) {
     // Show core shape dims only; gap dims belong in drawCoreGappingTechnicalDrawing.
-    return drawView(magnetic, ViewKind::FRONT, width_px, label_font_px,
+    return drawDimensionedViewImpl(magnetic, ViewKind::FRONT, width_px, label_font_px,
                     projection_color, dimension_color, 0, true, false);
 }
 
@@ -830,7 +873,7 @@ std::string SectionDrawing::drawDimensionedTopView(
         double width_px, double label_font_px,
         const std::string& projection_color,
         const std::string& dimension_color) {
-    return drawView(magnetic, ViewKind::TOP, width_px, label_font_px,
+    return drawDimensionedViewImpl(magnetic, ViewKind::TOP, width_px, label_font_px,
                     projection_color, dimension_color, 0, true, false);
 }
 
@@ -840,7 +883,7 @@ std::string SectionDrawing::drawCoreGappingTechnicalDrawing(
         const std::string& projection_color,
         const std::string& dimension_color) {
     // Show only gap dimensions — no core shape labels.
-    return drawView(magnetic, ViewKind::FRONT, width_px, label_font_px,
+    return drawDimensionedViewImpl(magnetic, ViewKind::FRONT, width_px, label_font_px,
                     projection_color, dimension_color, 0, false, true);
 }
 
@@ -860,6 +903,72 @@ void SectionDrawing::writeDimensionedTopView(
     std::ofstream f(outputPath);
     if (!f.is_open()) throw std::runtime_error("Cannot open " + outputPath);
     f << svg;
+}
+
+std::string SectionDrawing::drawView(
+        const OpenMagnetics::Magnetic& magnetic,
+        const std::string& plane,
+        double offset,
+        bool dimensions,
+        double width_px,
+        double label_font_px,
+        const std::string& projection_color,
+        const std::string& dimension_color) {
+    SectionPlane sp = parseSectionPlane(plane);
+
+    if (dimensions) {
+        if (offset != 0.0) {
+            throw std::runtime_error(
+                "SectionDrawing::drawView: dimensioned views currently support "
+                "only offset=0.0 (got " + std::to_string(offset) + ")");
+        }
+        switch (sp) {
+            case SectionPlane::XY:
+                return drawDimensionedFrontView(magnetic, width_px, label_font_px,
+                                                 projection_color, dimension_color);
+            case SectionPlane::XZ:
+                return drawDimensionedTopView(magnetic, width_px, label_font_px,
+                                                projection_color, dimension_color);
+            case SectionPlane::YZ:
+                throw std::runtime_error(
+                    "SectionDrawing::drawView: dimensioned YZ view not implemented");
+        }
+    }
+
+    // Non-dimensioned: section every named shape in the magnetic and render
+    // a plain SVG outline.
+    MagneticBuilder builder;
+    auto named = builder.buildAllNamed(magnetic, /*includeBobbin=*/true,
+                                        /*symmetryPlanes=*/0);
+    BRep_Builder bb;
+    TopoDS_Compound allEdges;
+    bb.MakeCompound(allEdges);
+    bool any = false;
+    // Translate by -offset along the cut normal so SectionBuilder's plane
+    // (which always passes through the origin) becomes the requested plane.
+    gp_Trsf shift;
+    switch (sp) {
+        case SectionPlane::XY: shift.SetTranslation(gp_Vec(0, 0, -offset)); break;
+        case SectionPlane::XZ: shift.SetTranslation(gp_Vec(0, -offset, 0)); break;
+        case SectionPlane::YZ: shift.SetTranslation(gp_Vec(-offset, 0, 0)); break;
+    }
+    for (auto& ns : named) {
+        TopoDS_Shape shifted = (offset == 0.0)
+            ? ns.shape
+            : BRepBuilderAPI_Transform(ns.shape, shift).Shape();
+        TopoDS_Shape edges = SectionBuilder::sectionCore(shifted, sp);
+        if (edges.IsNull()) continue;
+        for (TopExp_Explorer exp(edges, TopAbs_EDGE); exp.More(); exp.Next()) {
+            bb.Add(allEdges, exp.Current());
+            any = true;
+        }
+    }
+    if (!any) {
+        throw std::runtime_error(
+            "SectionDrawing::drawView: section produced no edges (offset=" +
+            std::to_string(offset) + ", plane=" + plane + ")");
+    }
+    return SectionBuilder::edgesToSvg(allEdges, sp, width_px);
 }
 
 } // namespace mvb

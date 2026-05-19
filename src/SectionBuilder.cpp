@@ -2,18 +2,24 @@
 
 #include <BRepAlgoAPI_Section.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRep_Builder.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
+#include <ShapeAnalysis_FreeBounds.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
+#include <TopoDS_Wire.hxx>
+#include <TopTools_HSequenceOfShape.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Pln.hxx>
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -28,6 +34,15 @@ gp_Pln planeFor(SectionPlane plane) {
         case SectionPlane::XY: return gp_Pln(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
         case SectionPlane::XZ: return gp_Pln(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0));
         case SectionPlane::YZ: return gp_Pln(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0));
+    }
+    return gp_Pln(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
+}
+
+gp_Pln planeFor(SectionPlane plane, double offset) {
+    switch (plane) {
+        case SectionPlane::XY: return gp_Pln(gp_Pnt(0, 0, offset), gp_Dir(0, 0, 1));
+        case SectionPlane::XZ: return gp_Pln(gp_Pnt(0, offset, 0), gp_Dir(0, 1, 0));
+        case SectionPlane::YZ: return gp_Pln(gp_Pnt(offset, 0, 0), gp_Dir(1, 0, 0));
     }
     return gp_Pln(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
 }
@@ -161,6 +176,91 @@ void SectionBuilder::writeSectionSvg(const TopoDS_Shape& solid,
         throw std::runtime_error("Cannot open " + outputPath + " for writing");
     }
     f << svg;
+}
+
+SectionPlane parseSectionPlane(const std::string& s) {
+    std::string up = s;
+    std::transform(up.begin(), up.end(), up.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (up == "XY") return SectionPlane::XY;
+    if (up == "XZ") return SectionPlane::XZ;
+    if (up == "YZ") return SectionPlane::YZ;
+    throw std::runtime_error("Invalid section plane '" + s + "' (expected XY, XZ or YZ)");
+}
+
+std::vector<NamedShape> SectionBuilder::cut2DFaces(const std::vector<NamedShape>& shapes,
+                                                    SectionPlane plane,
+                                                    double offset) {
+    std::vector<NamedShape> out;
+    out.reserve(shapes.size());
+
+    gp_Pln pln = planeFor(plane, offset);
+
+    for (const auto& ns : shapes) {
+        if (ns.shape.IsNull()) continue;
+
+        BRepAlgoAPI_Section section(ns.shape, pln, Standard_False);
+        section.ComputePCurveOn1(Standard_True);
+        section.Approximation(Standard_True);
+        section.Build();
+        if (!section.IsDone()) continue;
+        TopoDS_Shape edgesShape = section.Shape();
+        if (edgesShape.IsNull()) continue;
+
+        // Collect edges
+        Handle(TopTools_HSequenceOfShape) edgeSeq = new TopTools_HSequenceOfShape();
+        for (TopExp_Explorer exp(edgesShape, TopAbs_EDGE); exp.More(); exp.Next()) {
+            edgeSeq->Append(exp.Current());
+        }
+        if (edgeSeq->IsEmpty()) continue;
+
+        // Connect edges into wires
+        Handle(TopTools_HSequenceOfShape) wireSeq;
+        ShapeAnalysis_FreeBounds::ConnectEdgesToWires(edgeSeq, 1e-6, Standard_False, wireSeq);
+
+        BRep_Builder builder;
+        TopoDS_Compound compound;
+        builder.MakeCompound(compound);
+        std::vector<TopoDS_Shape> children;
+
+        if (!wireSeq.IsNull()) {
+            for (Standard_Integer i = 1; i <= wireSeq->Length(); ++i) {
+                TopoDS_Wire wire = TopoDS::Wire(wireSeq->Value(i));
+                if (wire.IsNull()) continue;
+                if (wire.Closed()) {
+                    BRepBuilderAPI_MakeFace mkFace(pln, wire, Standard_True);
+                    if (mkFace.IsDone()) {
+                        children.push_back(mkFace.Face());
+                        continue;
+                    }
+                }
+                // Open or face-build failed → keep wire as-is
+                children.push_back(wire);
+            }
+        }
+        if (children.empty()) {
+            // Fallback: keep raw edges
+            for (TopExp_Explorer exp(edgesShape, TopAbs_EDGE); exp.More(); exp.Next()) {
+                children.push_back(exp.Current());
+            }
+        }
+        if (children.empty()) continue;
+
+        // Emit one NamedShape per child so STEPCAFControl_Writer attaches
+        // the source name to every product, not just the compound parent
+        // (which OCCT auto-decomposes on write).  Multi-face sections get a
+        // suffix so each face is uniquely identifiable.
+        if (children.size() == 1) {
+            out.push_back(NamedShape{children[0], ns.name});
+        } else {
+            for (std::size_t k = 0; k < children.size(); ++k) {
+                out.push_back(NamedShape{children[k],
+                                          ns.name + "_" + std::to_string(k)});
+            }
+        }
+    }
+
+    return out;
 }
 
 } // namespace mvb
