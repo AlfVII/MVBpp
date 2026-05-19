@@ -297,11 +297,11 @@ std::vector<mvb::NamedShape> build_core_piece(const std::string& json_str, int p
     return {b.buildCorePieceNamed(shape, polygonSegments)};
 }
 
-std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int /*polygonSegments*/) {
+std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int polygonSegments) {
     auto j = json::parse(json_str);
     auto bobbin = j.get<MAS::Bobbin>();
     mvb::MagneticBuilder b;
-    return {b.buildBobbinNamedFromBobbin(bobbin, /*axisIsY=*/true)};
+    return {b.buildBobbinNamedFromBobbin(bobbin, /*axisIsY=*/true, polygonSegments)};
 }
 
 std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments) {
