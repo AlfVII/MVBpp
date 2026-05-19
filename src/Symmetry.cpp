@@ -13,7 +13,10 @@
 #include <gp_Pnt.hxx>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 namespace mvb {
 
@@ -209,6 +212,124 @@ std::vector<NamedShape> cut_to_region(
         if (current.empty()) break;
     }
     return current;
+}
+
+// ---- High-level helpers --------------------------------------------------
+
+namespace {
+
+// Centroid of a shape via mass properties — works for solids, faces, and
+// edges (BRepGProp picks the right integral based on dimensionality).
+gp_Pnt shape_centroid(const TopoDS_Shape& s) {
+    GProp_GProps props;
+    if (TopExp_Explorer(s, TopAbs_SOLID).More()) {
+        BRepGProp::VolumeProperties(s, props);
+    } else if (TopExp_Explorer(s, TopAbs_FACE).More()) {
+        BRepGProp::SurfaceProperties(s, props);
+    } else {
+        BRepGProp::LinearProperties(s, props);
+    }
+    return props.CentreOfMass();
+}
+
+} // namespace
+
+std::vector<NamedShape> filter_by_side(const std::vector<NamedShape>& in,
+                                       const std::array<int, 3>& axisSign,
+                                       double eps) {
+    if (axisSign[0] == 0 && axisSign[1] == 0 && axisSign[2] == 0) return in;
+    std::vector<NamedShape> out;
+    out.reserve(in.size());
+    for (const auto& ns : in) {
+        if (ns.shape.IsNull()) continue;
+        gp_Pnt c = shape_centroid(ns.shape);
+        const double coord[3] = { c.X(), c.Y(), c.Z() };
+        bool keep = true;
+        for (int i = 0; i < 3; ++i) {
+            if (axisSign[i] == 0) continue;
+            // |coord| within eps of plane → on the plane, keep it.
+            if (std::abs(coord[i]) <= eps) continue;
+            const double signed_v = coord[i] * axisSign[i];
+            if (signed_v < 0) { keep = false; break; }
+        }
+        if (keep) out.push_back(ns);
+    }
+    return out;
+}
+
+std::array<int, 3> parse_side_spec(const std::string& spec) {
+    std::array<int, 3> out{0, 0, 0};
+    std::string s = spec;
+    // strip whitespace + lowercase
+    s.erase(std::remove_if(s.begin(), s.end(),
+                            [](unsigned char c) { return std::isspace(c); }),
+            s.end());
+    std::string lower = s;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (lower.empty() || lower == "auto" || lower == "none") return out;
+
+    int sign = 0;
+    for (char c : s) {
+        if (c == '+') { sign = +1; continue; }
+        if (c == '-') { sign = -1; continue; }
+        int axis;
+        switch (c) {
+            case 'X': case 'x': axis = 0; break;
+            case 'Y': case 'y': axis = 1; break;
+            case 'Z': case 'z': axis = 2; break;
+            default:
+                throw std::invalid_argument(
+                    "parse_side_spec: bad token '" + std::string(1, c) +
+                    "' in '" + spec + "' (expected +X/-X/+Y/-Y/+Z/-Z)");
+        }
+        if (sign == 0) {
+            throw std::invalid_argument(
+                "parse_side_spec: missing +/- before axis in '" + spec + "'");
+        }
+        out[axis] = sign;
+        sign = 0;
+    }
+    return out;
+}
+
+std::vector<NamedShape> apply_symmetry(const std::vector<NamedShape>& in,
+                                       int nPlanes) {
+    if (nPlanes <= 0 || in.empty()) return in;
+    if (nPlanes > 3) nPlanes = 3;
+    SymmetryResult res = analyze_symmetry(in);
+    if (res.valid_planes.empty()) return in;
+    std::vector<std::pair<SymmetryPlane, SymmetryHalf>> cuts;
+    for (int i = 0; i < nPlanes && i < static_cast<int>(res.valid_planes.size()); ++i) {
+        cuts.emplace_back(res.valid_planes[i], SymmetryHalf::Positive);
+    }
+    if (cuts.empty()) return in;
+    ShapeBBox bb = aggregate_bbox(in);
+    return cut_to_region(in, cuts, bb);
+}
+
+int parse_symmetry_spec(const std::string& spec) {
+    std::string s = spec;
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (s.empty() || s == "auto" || s == "none" || s == "0") return 0;
+    if (s == "half"    || s == "1") return 1;
+    if (s == "quarter" || s == "2") return 2;
+    if (s == "eighth"  || s == "3") return 3;
+    // Try numeric
+    try {
+        int n = std::stoi(spec);
+        if (n < 0 || n > 3) {
+            throw std::invalid_argument(
+                "parse_symmetry_spec: out of range " + spec +
+                " (expected 0..3 or auto/half/quarter/eighth)");
+        }
+        return n;
+    } catch (const std::exception&) {
+        throw std::invalid_argument(
+            "parse_symmetry_spec: bad value '" + spec +
+            "' (expected auto/half/quarter/eighth or 0..3)");
+    }
 }
 
 } // namespace mvb

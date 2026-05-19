@@ -3,6 +3,7 @@
 #include "mvb/NamedShape.h"
 
 #include <array>
+#include <string>
 #include <vector>
 
 namespace mvb {
@@ -87,5 +88,29 @@ const char* to_string(SymmetryPlane p);
 // Convenience: index of the normal and the two in-plane axes (0=X, 1=Y, 2=Z).
 // For SymmetryPlane::YZ the normal is X (0) and in-plane axes are Y, Z.
 void plane_axes(SymmetryPlane p, int& i_normal, int& i_in_a, int& i_in_b);
+
+// ---- High-level helpers used by the Python / WASM bindings ----------------
+
+// Side filter: keep only shapes whose centroid lies in the requested octant.
+// `axisSign[i]` ∈ {-1, 0, +1} for axis i (0=X, 1=Y, 2=Z).  0 = unconstrained.
+// A centroid coordinate within `eps` of the plane is considered on it and
+// always kept (avoids dropping shapes that straddle the cut plane).
+std::vector<NamedShape> filter_by_side(const std::vector<NamedShape>& in,
+                                       const std::array<int, 3>& axisSign,
+                                       double eps = 1e-9);
+
+// Parse a side spec like "+X", "+X+Y", "-Z", "+X-Y+Z", "" or "auto".
+// Empty / "auto" / "none" → no constraints.  Throws on malformed input.
+std::array<int, 3> parse_side_spec(const std::string& spec);
+
+// Apply N detected symmetry planes (in the order returned by
+// analyze_symmetry).  N=0 returns input unchanged.  Always keeps the
+// SymmetryHalf::Positive side of each cut.
+std::vector<NamedShape> apply_symmetry(const std::vector<NamedShape>& in,
+                                       int nPlanes);
+
+// Parse a symmetry spec: "auto"/"none"/"" → 0, "half" → 1,
+// "quarter" → 2, "eighth" → 3, or any int in [0, 3].
+int parse_symmetry_spec(const std::string& spec);
 
 } // namespace mvb
