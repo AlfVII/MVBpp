@@ -69,25 +69,12 @@ public:
                              const std::string& outputPath,
                              const DrawConfig& cfg) const;
 
-    std::vector<TopoDS_Shape> buildCore(const MAS::MagneticCore& core,
-                                         int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
-    TopoDS_Shape buildBobbin(const MAS::Coil& coil, const MAS::MagneticCore& core) const;
-    TopoDS_Shape buildBobbin(const OpenMagnetics::Coil& coil, const MAS::MagneticCore& core) const;
-    std::vector<TopoDS_Shape> buildTurns(const MAS::Coil& coil, const MAS::MagneticCore& core,
-                                          int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) const;
-    std::vector<TopoDS_Shape> buildTurns(const OpenMagnetics::Coil& coil, const MAS::MagneticCore& core,
-                                          int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) const;
-    std::vector<TopoDS_Shape> buildTurns(const MAS::Coil& coil, const MAS::MagneticCore& core,
-                                          std::vector<std::string>& names,
-                                          int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) const;
-    std::vector<TopoDS_Shape> buildTurns(const OpenMagnetics::Coil& coil, const MAS::MagneticCore& core,
-                                          std::vector<std::string>& names,
-                                          int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) const;
-
     // Named-shape overloads. Each returned element carries the logical
     // name (core name / "Turn_<i>" or Turn::get_name / bobbin name) so the
     // identity survives downstream operations (symmetry cut, STEP export
-    // with XCAF labels, mesh tagging).
+    // with XCAF labels, mesh tagging). These are the only public builders;
+    // the prior unnamed variants (buildCore / buildBobbin / buildTurns) have
+    // been removed in favour of this Named API.
     std::vector<NamedShape> buildCoreNamed(const MAS::MagneticCore& core,
                                             int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
     std::vector<NamedShape> buildTurnsNamed(const MAS::Coil& coil,
@@ -97,9 +84,11 @@ public:
                                             const MAS::MagneticCore& core,
                                             int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) const;
     NamedShape buildBobbinNamed(const MAS::Coil& coil,
-                                const MAS::MagneticCore& core) const;
+                                const MAS::MagneticCore& core,
+                                int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
     NamedShape buildBobbinNamed(const OpenMagnetics::Coil& coil,
-                                const MAS::MagneticCore& core) const;
+                                const MAS::MagneticCore& core,
+                                int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
 
     // Assemble all geometry as named shapes (no export). Optionally applies
     // symmetry cuts according to symmetryPlanes (0=full, 1=half, 2=quarter).
@@ -113,6 +102,32 @@ public:
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
+
+    // ---- Standalone builders for the unified bindings API -----------------
+    //
+    // Build a single core piece from a MAS::CoreShape. Validates the shape
+    // through OpenMagnetics::CorePiece::factory (which also fills in derived
+    // parameters), then dispatches to mvb's ShapeBuilder for geometry.
+    // Returns a single NamedShape with name = shape.name (or family code).
+    NamedShape buildCorePieceNamed(const MAS::CoreShape& shape,
+                                    int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
+
+    // Build a bobbin from a fully-populated MAS::Bobbin. Throws if
+    // `processed_description` is not present. `axisIsY=true` orients the
+    // bobbin tube along Y (matches concentric-core convention); pass false
+    // for toroidal bobbins (kept along Z).
+    NamedShape buildBobbinNamedFromBobbin(const MAS::Bobbin& bobbin,
+                                          bool axisIsY = true,
+                                          int polygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
+
+    // Build a list of turns where every Turn carries its own dimensions and
+    // cross_sectional_shape (no Wire/bobbin lookup). Throws if any turn is
+    // missing required fields. Toroidal layout is auto-detected from the
+    // presence of `additional_coordinates`; otherwise concentric round
+    // column is assumed.
+    std::vector<NamedShape> buildTurnsNamedFromTurns(
+        const std::vector<MAS::Turn>& turns,
+        int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) const;
 };
 
 } // namespace mvb

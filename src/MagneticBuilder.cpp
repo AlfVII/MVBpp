@@ -6,6 +6,7 @@
 #include "mvb/TurnBuilder.h"
 #include "mvb/BobbinBuilder.h"
 #include "constructive_models/Magnetic.h"
+#include "constructive_models/CorePiece.h"
 #include "support/Utils.h"
 #include <nlohmann/json.hpp>
 #include <TopExp_Explorer.hxx>
@@ -198,8 +199,14 @@ std::string MagneticBuilder::drawMagnetic(const OpenMagnetics::Magnetic& magneti
     return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale);
 }
 
-std::vector<TopoDS_Shape> MagneticBuilder::buildCore(const MAS::MagneticCore& core,
-                                                     int corePolygonSegments) const {
+namespace {
+
+// Internal core-piece builder. Kept as a free helper so the only public API
+// for emitting core shapes is buildCoreNamed(). Callers that don't need the
+// piece names use this directly; callers that need names go through
+// MagneticBuilder::buildCoreNamed.
+std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
+                                               int corePolygonSegments) {
     std::vector<TopoDS_Shape> result;
     auto geoOpt = core.get_geometrical_description();
     if (!geoOpt) return result;
@@ -294,26 +301,23 @@ std::vector<TopoDS_Shape> MagneticBuilder::buildCore(const MAS::MagneticCore& co
     return result;
 }
 
-TopoDS_Shape MagneticBuilder::buildBobbin(const MAS::Coil& coil, const MAS::MagneticCore& core) const {
+// Internal bobbin builder. Public surface goes through buildBobbinNamed().
+template<typename CoilT>
+TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& core,
+                                    int polygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) {
     auto bobbinPd = getBobbinProcessed(coil);
     patchBobbinDimensions(bobbinPd, core);
     if (bobbinPd.get_column_width().value_or(0.0) <= 0.0) return TopoDS_Shape();
     double flangeThickness = bobbinPd.get_wall_thickness();
     if (flangeThickness < 0.0 || std::isnan(flangeThickness)) flangeThickness = 0.0;
-    return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core));
+    return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments);
 }
 
-TopoDS_Shape MagneticBuilder::buildBobbin(const OpenMagnetics::Coil& coil, const MAS::MagneticCore& core) const {
-    auto bobbinPd = getBobbinProcessed(coil);
-    patchBobbinDimensions(bobbinPd, core);
-    if (bobbinPd.get_column_width().value_or(0.0) <= 0.0) return TopoDS_Shape();
-    double flangeThickness = bobbinPd.get_wall_thickness();
-    if (flangeThickness < 0.0 || std::isnan(flangeThickness)) flangeThickness = 0.0;
-    return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core));
-}
-
+// Internal turns builder. Public surface goes through buildTurnsNamed() or
+// buildTurnsNamedFromTurns(). The template covers both the MAS and the
+// OpenMagnetics coil/wire variants used internally by buildAllNamed.
 template<typename CoilT, typename WireT>
-static std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::MagneticCore& core, std::vector<std::string>* outNames, int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) {
+std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::MagneticCore& core, std::vector<std::string>* outNames, int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) {
     std::vector<TopoDS_Shape> result;
     auto turnsOpt = coil.get_turns_description();
     if (!turnsOpt || turnsOpt->empty()) return result;
@@ -355,33 +359,13 @@ static std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::Ma
     return result;
 }
 
-std::vector<TopoDS_Shape> MagneticBuilder::buildTurns(const MAS::Coil& coil, const MAS::MagneticCore& core,
-                                                       int wirePolygonSegments) const {
-    return buildTurnsImpl<MAS::Coil, MAS::Wire>(coil, core, nullptr, wirePolygonSegments);
-}
-
-std::vector<TopoDS_Shape> MagneticBuilder::buildTurns(const OpenMagnetics::Coil& coil, const MAS::MagneticCore& core,
-                                                       int wirePolygonSegments) const {
-    return buildTurnsImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, core, nullptr, wirePolygonSegments);
-}
-
-std::vector<TopoDS_Shape> MagneticBuilder::buildTurns(const MAS::Coil& coil, const MAS::MagneticCore& core,
-                                                       std::vector<std::string>& names,
-                                                       int wirePolygonSegments) const {
-    return buildTurnsImpl<MAS::Coil, MAS::Wire>(coil, core, &names, wirePolygonSegments);
-}
-
-std::vector<TopoDS_Shape> MagneticBuilder::buildTurns(const OpenMagnetics::Coil& coil, const MAS::MagneticCore& core,
-                                                       std::vector<std::string>& names,
-                                                       int wirePolygonSegments) const {
-    return buildTurnsImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, core, &names, wirePolygonSegments);
-}
+} // anonymous namespace
 
 // ---- Named-shape overloads ------------------------------------------------
 
 std::vector<NamedShape> MagneticBuilder::buildCoreNamed(const MAS::MagneticCore& core,
                                                          int corePolygonSegments) const {
-    auto shapes = buildCore(core, corePolygonSegments);
+    auto shapes = buildCoreShapes_impl(core, corePolygonSegments);
     std::vector<NamedShape> out;
     out.reserve(shapes.size());
     const std::string base = core.get_name().value_or("Core");
@@ -397,7 +381,7 @@ std::vector<NamedShape> MagneticBuilder::buildTurnsNamed(const MAS::Coil& coil,
                                                          const MAS::MagneticCore& core,
                                                          int wirePolygonSegments) const {
     std::vector<std::string> names;
-    auto shapes = buildTurns(coil, core, names, wirePolygonSegments);
+    auto shapes = buildTurnsImpl<MAS::Coil, MAS::Wire>(coil, core, &names, wirePolygonSegments);
     std::vector<NamedShape> out;
     out.reserve(shapes.size());
     for (std::size_t i = 0; i < shapes.size(); ++i) {
@@ -413,7 +397,7 @@ std::vector<NamedShape> MagneticBuilder::buildTurnsNamed(const OpenMagnetics::Co
                                                          const MAS::MagneticCore& core,
                                                          int wirePolygonSegments) const {
     std::vector<std::string> names;
-    auto shapes = buildTurns(coil, core, names, wirePolygonSegments);
+    auto shapes = buildTurnsImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, core, &names, wirePolygonSegments);
     std::vector<NamedShape> out;
     out.reserve(shapes.size());
     for (std::size_t i = 0; i < shapes.size(); ++i) {
@@ -426,17 +410,19 @@ std::vector<NamedShape> MagneticBuilder::buildTurnsNamed(const OpenMagnetics::Co
 }
 
 NamedShape MagneticBuilder::buildBobbinNamed(const MAS::Coil& coil,
-                                             const MAS::MagneticCore& core) const {
+                                             const MAS::MagneticCore& core,
+                                             int corePolygonSegments) const {
     NamedShape ns;
-    ns.shape = buildBobbin(coil, core);
+    ns.shape = buildBobbinShape_impl(coil, core, corePolygonSegments);
     ns.name = getBobbinNameT<MAS::Bobbin>(coil.get_bobbin(), "Bobbin");
     return ns;
 }
 
 NamedShape MagneticBuilder::buildBobbinNamed(const OpenMagnetics::Coil& coil,
-                                             const MAS::MagneticCore& core) const {
+                                             const MAS::MagneticCore& core,
+                                             int corePolygonSegments) const {
     NamedShape ns;
-    ns.shape = buildBobbin(coil, core);
+    ns.shape = buildBobbinShape_impl(coil, core, corePolygonSegments);
     ns.name = getBobbinNameT<OpenMagnetics::Bobbin>(coil.get_bobbin(), "Bobbin");
     return ns;
 }
@@ -457,24 +443,7 @@ static std::vector<NamedShape> buildTurnsNamedImpl(const CoilT& coil, const MAS:
     return out;
 }
 
-// Apply up to `numPlanes` symmetry cuts to `shapes`, picking the most valid
-// planes from analyze_symmetry. Returns the cut shapes.
-static std::vector<NamedShape> apply_symmetry(std::vector<NamedShape> shapes, int numPlanes) {
-    if (numPlanes <= 0 || shapes.empty()) return shapes;
-
-    SymmetryResult sym = analyze_symmetry(shapes);
-    if (sym.valid_planes.empty()) return shapes;
-
-    const int n = std::min(numPlanes, static_cast<int>(sym.valid_planes.size()));
-    ShapeBBox bbox = aggregate_bbox(shapes);
-
-    std::vector<std::pair<SymmetryPlane, SymmetryHalf>> cuts;
-    cuts.reserve(n);
-    for (int i = 0; i < n; ++i)
-        cuts.emplace_back(sym.valid_planes[i], SymmetryHalf::Positive);
-
-    return cut_to_region(shapes, cuts, bbox);
-}
+// Apply up to `numPlanes` symmetry cuts — defined in Symmetry.cpp.
 
 std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magnetic,
                                                          bool includeBobbin,
@@ -493,7 +462,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
             magnetic.get_coil(), magnetic.get_core(), &turnNames, wirePolygonSegments);
 
         if (includeBobbin) {
-            auto bobbin = buildBobbinNamed(magnetic.get_coil(), magnetic.get_core());
+            auto bobbin = buildBobbinNamed(magnetic.get_coil(), magnetic.get_core(), corePolygonSegments);
             if (!bobbin.shape.IsNull()) {
                 std::vector<TopoDS_Shape> cutters;
                 for (const auto& ns : all) cutters.push_back(ns.shape);
@@ -531,7 +500,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         magnetic.get_coil(), magnetic.get_core(), &turnNames, wirePolygonSegments);
 
     if (includeBobbin) {
-        auto bobbin = buildBobbinNamed(magnetic.get_coil(), magnetic.get_core());
+        auto bobbin = buildBobbinNamed(magnetic.get_coil(), magnetic.get_core(), corePolygonSegments);
         if (!bobbin.shape.IsNull()) {
             std::vector<TopoDS_Shape> cutters;
             for (const auto& ns : all) cutters.push_back(ns.shape);
@@ -550,6 +519,81 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     }
 
     return apply_symmetry(std::move(all), symmetryPlanes);
+}
+
+// ---- Standalone builders for the unified bindings API ---------------------
+
+NamedShape MagneticBuilder::buildCorePieceNamed(const MAS::CoreShape& shape,
+                                                  int corePolygonSegments) const {
+    // Validate / process the shape via MKF (computes effective parameters
+    // and per-piece data; throws if the shape data is malformed).
+    auto corePiece = OpenMagnetics::CorePiece::factory(shape, /*process=*/true);
+    if (!corePiece) {
+        throw std::runtime_error(
+            "buildCorePieceNamed: OpenMagnetics::CorePiece::factory returned null");
+    }
+
+    auto family = shape.get_family();
+    std::string subtype = shape.get_family_subtype().value_or("");
+    auto builder = shapes::createShapeBuilder(family, subtype, corePolygonSegments);
+    if (!builder) {
+        throw std::runtime_error(
+            "buildCorePieceNamed: no geometry builder for family '"
+            + core_shape_family_to_string(family) + "'");
+    }
+
+    TopoDS_Shape geom = builder->buildPiece(shape);
+    if (geom.IsNull()) {
+        throw std::runtime_error(
+            "buildCorePieceNamed: builder produced null shape for '"
+            + shape.get_name().value_or(core_shape_family_to_string(family)) + "'");
+    }
+
+    std::string name = shape.get_name().value_or(core_shape_family_to_string(family));
+    return NamedShape{geom, name};
+}
+
+NamedShape MagneticBuilder::buildBobbinNamedFromBobbin(const MAS::Bobbin& bobbin,
+                                                       bool axisIsY,
+                                                       int polygonSegments) const {
+    auto pdOpt = bobbin.get_processed_description();
+    if (!pdOpt) {
+        throw std::runtime_error(
+            "buildBobbinNamedFromBobbin: bobbin.processedDescription is required "
+            "(MAS Bobbin is not enriched). Use OpenMagnetics::Bobbin::process_data() "
+            "or feed a fully-populated MAS::Magnetic to drawMagnetic instead.");
+    }
+    if (pdOpt->get_column_width().value_or(0.0) <= 0.0) {
+        throw std::runtime_error(
+            "buildBobbinNamedFromBobbin: processedDescription.columnWidth must be > 0");
+    }
+    double flangeThickness = pdOpt->get_wall_thickness();
+    if (flangeThickness < 0.0 || std::isnan(flangeThickness)) flangeThickness = 0.0;
+    TopoDS_Shape s = BobbinBuilder::buildBobbin(*pdOpt, flangeThickness, axisIsY, polygonSegments);
+    if (s.IsNull()) {
+        throw std::runtime_error("buildBobbinNamedFromBobbin: BobbinBuilder produced null shape");
+    }
+    std::string name = bobbin.get_name().value_or("Bobbin");
+    return NamedShape{s, name};
+}
+
+std::vector<NamedShape> MagneticBuilder::buildTurnsNamedFromTurns(
+    const std::vector<MAS::Turn>& turns,
+    int wirePolygonSegments) const {
+    std::vector<NamedShape> out;
+    out.reserve(turns.size());
+    TurnBuilder::clearCache();
+    for (std::size_t i = 0; i < turns.size(); ++i) {
+        TopoDS_Shape s = TurnBuilder::buildFromTurnAlone(turns[i], wirePolygonSegments);
+        if (s.IsNull()) {
+            throw std::runtime_error(
+                "buildTurnsNamedFromTurns: TurnBuilder produced null shape for turn "
+                + std::to_string(i));
+        }
+        const std::string& n = turns[i].get_name();
+        out.emplace_back(s, n.empty() ? ("Turn_" + std::to_string(i)) : n);
+    }
+    return out;
 }
 
 } // namespace mvb

@@ -6,6 +6,7 @@
 #include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
+#include <BOPAlgo_GlueEnum.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -25,6 +26,7 @@
 #include <gp_Vec.hxx>
 #include <variant>
 #include <stdexcept>
+#include <sstream>
 #include <numbers>
 #include <map>
 
@@ -306,7 +308,36 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
         return om;
     }
 
-    return OpenMagnetics::magnetic_autocomplete(om, json{});
+    auto enriched = OpenMagnetics::magnetic_autocomplete(om, json{});
+
+    // No-fallbacks rule: if the design has windings but MKF produced zero
+    // turnsDescription (typically because the winding does not fit the
+    // bobbin window), surface that as a hard failure instead of returning
+    // a magnetic with an empty turns list that silently propagates as a
+    // zero-turn build.
+    {
+        const auto& coilE = enriched.get_coil();
+        const auto& fd    = coilE.get_functional_description();
+        if (!fd.empty()) {
+            int64_t expected = 0;
+            for (const auto& w : fd) {
+                expected += w.get_number_turns() * w.get_number_parallels();
+            }
+            const auto& td = coilE.get_turns_description();
+            const size_t got = td ? td->size() : 0;
+            if (expected > 0 && got == 0) {
+                std::ostringstream s;
+                s << "magnetic_autocomplete_safe: MKF produced 0 turns for a coil "
+                     "that declares " << expected
+                  << " turns total — the winding likely does not fit the bobbin "
+                     "window. Refusing to return a magnetic with an empty "
+                     "turnsDescription.";
+                throw std::runtime_error(s.str());
+            }
+        }
+    }
+
+    return enriched;
 }
 
 OpenMagnetics::Magnetic magnetic_autocomplete_safe(const MAS::Magnetic& magnetic) {
@@ -332,32 +363,94 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
     gp_Trsf up;   up.SetScale(gp_Pnt(0, 0, 0), S);
     gp_Trsf down; down.SetScale(gp_Pnt(0, 0, 0), 1.0 / S);
 
-    TopTools_ListOfShape tools;
+    // Pre-scale tools once; reuse for every per-solid cut.
+    struct ScaledTool { TopoDS_Shape shape; Bnd_Box box; };
+    std::vector<ScaledTool> scaledTools;
+    scaledTools.reserve(cutters.size());
     for (const auto& tool : cutters) {
         if (tool.IsNull()) continue;
-        tools.Append(BRepBuilderAPI_Transform(tool, up).Shape());
+        TopoDS_Shape s = BRepBuilderAPI_Transform(tool, up).Shape();
+        Bnd_Box tb;
+        BRepBndLib::Add(s, tb);
+        if (tb.IsVoid()) continue;
+        scaledTools.push_back({s, tb});
     }
-    if (tools.IsEmpty()) return bobbin;
+    if (scaledTools.empty()) return bobbin;
 
-    TopoDS_Shape bobbinScaled = BRepBuilderAPI_Transform(bobbin, up).Shape();
-    TopTools_ListOfShape args;
-    args.Append(bobbinScaled);
-
-    BRepAlgoAPI_Cut cutter;
-    cutter.SetArguments(args);
-    cutter.SetTools(tools);
-    cutter.Build();
-    if (!cutter.IsDone()) return bobbin;
-    TopoDS_Shape candidate = cutter.Shape();
-    if (candidate.IsNull()) return bobbin;
-
-    for (TopExp_Explorer exp(candidate, TopAbs_SOLID); exp.More(); exp.Next()) {
-        GProp_GProps props;
-        BRepGProp::VolumeProperties(exp.Current(), props);
-        if (props.Mass() < 0) return bobbin;
+    // Iterate solids in the bobbin. BobbinBuilder returns a compound of
+    // body + topFlange + bottomFlange (3 solids) when flanges are present.
+    // Per-solid AABB prefiltering means flange cuts only see the few turns
+    // whose AABB actually pokes into the flange volume — typically 0 for a
+    // tall winding. Drops `Cut` tool count from O(N) total to O(few) per
+    // solid and is the difference between a multi-second BOP on a NURBS
+    // bobbin against 50 polygonal turns and a near-instant compound result.
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer exp(bobbin, TopAbs_SOLID); exp.More(); exp.Next()) {
+        solids.push_back(exp.Current());
+    }
+    if (solids.empty()) {
+        // Bobbin isn't decomposable into solids — fall back to original
+        // single-shape cut.
+        solids.push_back(bobbin);
     }
 
-    return BRepBuilderAPI_Transform(candidate, down).Shape();
+    TopoDS_Compound resultComp;
+    BRep_Builder cbld;
+    cbld.MakeCompound(resultComp);
+
+    for (const auto& solid : solids) {
+        TopoDS_Shape solidScaled = BRepBuilderAPI_Transform(solid, up).Shape();
+        Bnd_Box solidBox;
+        BRepBndLib::Add(solidScaled, solidBox);
+
+        TopTools_ListOfShape tools;
+        for (const auto& st : scaledTools) {
+            if (solidBox.IsOut(st.box)) continue;
+            tools.Append(st.shape);
+        }
+        if (tools.IsEmpty()) {
+            cbld.Add(resultComp, solid);
+            continue;
+        }
+
+        TopTools_ListOfShape args;
+        args.Append(solidScaled);
+
+        BRepAlgoAPI_Cut cutter;
+        cutter.SetArguments(args);
+        cutter.SetTools(tools);
+        cutter.SetUseOBB(true);
+        cutter.SetRunParallel(true);
+        cutter.SetGlue(BOPAlgo_GlueShift);
+        cutter.SetCheckInverted(false);
+        cutter.SetNonDestructive(false);
+        cutter.Build();
+        if (!cutter.IsDone()) {
+            cbld.Add(resultComp, solid);
+            continue;
+        }
+        TopoDS_Shape candidate = cutter.Shape();
+        if (candidate.IsNull()) {
+            cbld.Add(resultComp, solid);
+            continue;
+        }
+
+        bool inverted = false;
+        for (TopExp_Explorer exp(candidate, TopAbs_SOLID); exp.More(); exp.Next()) {
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(exp.Current(), props);
+            if (props.Mass() < 0) { inverted = true; break; }
+        }
+        if (inverted) {
+            cbld.Add(resultComp, solid);
+            continue;
+        }
+
+        TopoDS_Shape downScaled = BRepBuilderAPI_Transform(candidate, down).Shape();
+        cbld.Add(resultComp, downScaled);
+    }
+
+    return resultComp;
 }
 
 } // namespace mvb

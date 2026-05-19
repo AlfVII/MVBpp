@@ -10,6 +10,8 @@
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRep_Builder.hxx>
+#include <TopoDS_Compound.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 #include <gp_Ax1.hxx>
@@ -26,7 +28,7 @@ static void checkIsDone(const BRepAlgoAPI_Fuse& op, const char* ctx) {
     if (!op.IsDone()) throw std::runtime_error(std::string("BobbinBuilder: Fuse failed: ") + ctx);
 }
 
-TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescription& bobbin, double flangeThickness, bool axisIsY) {
+TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescription& bobbin, double flangeThickness, bool axisIsY, int polygonSegments) {
     if (flangeThickness < 0.0 || std::isnan(flangeThickness)) {
         throw std::invalid_argument("BobbinBuilder: flangeThickness is invalid");
     }
@@ -66,16 +68,21 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         double innerR = colWidth - bobbin.get_column_thickness();
         if (innerR <= 0.0) innerR = outerR - wallThickness;
 
-        TopoDS_Shape outerCyl = BRepPrimAPI_MakeCylinder(outerR, height).Shape();
-        outerCyl = translate_shape(outerCyl, 0.0, 0.0, -height / 2.0);
+        // Build the cylinder along +Z then translate down by height/2 so it
+        // straddles z=0 (matches the legacy MakeCylinder placement).
+        auto make_cyl = [&](double radius, double h, double zBottom) -> TopoDS_Shape {
+            TopoDS_Shape c = build_polygon_cylinder(h, radius, polygonSegments);
+            return translate_shape(c, 0.0, 0.0, zBottom);
+        };
+
+        TopoDS_Shape outerCyl = make_cyl(outerR, height, -height / 2.0);
 
         TopoDS_Shape body;
         if (innerR + 1e-9 >= outerR) {
             body = outerCyl;
         } else {
             double innerHeight = height * 1.1;
-            TopoDS_Shape innerCyl = BRepPrimAPI_MakeCylinder(innerR, innerHeight).Shape();
-            innerCyl = translate_shape(innerCyl, 0.0, 0.0, -innerHeight / 2.0);
+            TopoDS_Shape innerCyl = make_cyl(innerR, innerHeight, -innerHeight / 2.0);
             BRepAlgoAPI_Cut cutOp(outerCyl, innerCyl);
             checkIsDone(cutOp, "round body hollow");
             body = cutOp.Shape();
@@ -86,25 +93,29 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             double holeHeight = flangeThickness * 1.2;
             double holeMargin = (holeHeight - flangeThickness) / 2.0;
 
-            TopoDS_Shape topFlangeDisc = BRepPrimAPI_MakeCylinder(flangeOuterR, flangeThickness).Shape();
-            topFlangeDisc = translate_shape(topFlangeDisc, 0.0, 0.0, height / 2.0);
-            TopoDS_Shape topHole = BRepPrimAPI_MakeCylinder(innerR, holeHeight).Shape();
-            topHole = translate_shape(topHole, 0.0, 0.0, height / 2.0 - holeMargin);
+            TopoDS_Shape topFlangeDisc = make_cyl(flangeOuterR, flangeThickness, height / 2.0);
+            TopoDS_Shape topHole = make_cyl(innerR, holeHeight, height / 2.0 - holeMargin);
             BRepAlgoAPI_Cut topCut(topFlangeDisc, topHole);
             checkIsDone(topCut, "round top flange");
 
-            TopoDS_Shape bottomFlangeDisc = BRepPrimAPI_MakeCylinder(flangeOuterR, flangeThickness).Shape();
-            bottomFlangeDisc = translate_shape(bottomFlangeDisc, 0.0, 0.0, -(height / 2.0 + flangeThickness));
-            TopoDS_Shape bottomHole = BRepPrimAPI_MakeCylinder(innerR, holeHeight).Shape();
-            bottomHole = translate_shape(bottomHole, 0.0, 0.0, -(height / 2.0 + flangeThickness) - holeMargin);
+            TopoDS_Shape bottomFlangeDisc = make_cyl(flangeOuterR, flangeThickness,
+                                                     -(height / 2.0 + flangeThickness));
+            TopoDS_Shape bottomHole = make_cyl(innerR, holeHeight,
+                                               -(height / 2.0 + flangeThickness) - holeMargin);
             BRepAlgoAPI_Cut bottomCut(bottomFlangeDisc, bottomHole);
             checkIsDone(bottomCut, "round bottom flange");
 
-            BRepAlgoAPI_Fuse fuseTop(body, topCut.Shape());
-            checkIsDone(fuseTop, "round top fuse");
-            BRepAlgoAPI_Fuse fuseBottom(fuseTop.Shape(), bottomCut.Shape());
-            checkIsDone(fuseBottom, "round bottom fuse");
-            bobbinShape = fuseBottom.Shape();
+            // Skip the Fuse: return body + flanges as a compound of 3 solids.
+            // Downstream cut_bobbin can then AABB-prefilter tools per solid;
+            // most turns sit in the winding window and don't intersect the
+            // flange AABBs, so per-solid cuts run against far fewer tools.
+            TopoDS_Compound comp;
+            BRep_Builder bld;
+            bld.MakeCompound(comp);
+            bld.Add(comp, body);
+            bld.Add(comp, topCut.Shape());
+            bld.Add(comp, bottomCut.Shape());
+            bobbinShape = comp;
         } else {
             bobbinShape = body;
         }
@@ -145,11 +156,14 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             BRepAlgoAPI_Cut bottomCut(bottomFlange, bottomHole);
             checkIsDone(bottomCut, "rect bottom flange");
 
-            BRepAlgoAPI_Fuse fuseTop(bodyCut.Shape(), topCut.Shape());
-            checkIsDone(fuseTop, "rect top fuse");
-            BRepAlgoAPI_Fuse fuseBottom(fuseTop.Shape(), bottomCut.Shape());
-            checkIsDone(fuseBottom, "rect bottom fuse");
-            bobbinShape = fuseBottom.Shape();
+            // Skip the Fuse: compound body + flanges as 3 solids (see round path).
+            TopoDS_Compound comp;
+            BRep_Builder bld;
+            bld.MakeCompound(comp);
+            bld.Add(comp, bodyCut.Shape());
+            bld.Add(comp, topCut.Shape());
+            bld.Add(comp, bottomCut.Shape());
+            bobbinShape = comp;
         } else {
             bobbinShape = bodyCut.Shape();
         }
