@@ -9,6 +9,15 @@ namespace mvb {
 
 class TurnBuilder {
 public:
+    // GLOBAL setting: fuse each turn's sub-solid compound (straight segments + corner pieces) into
+    // ONE solid. A round/rect turn is built as a COMPOUND of overlapping cylinders/boxes + corner
+    // tori/swept-rects -- fast, and perfectly fine for STL/STEP VISUALISATION (the web frontend), so
+    // the default is OFF. But the overlapping sub-solids make a tetrahedral MESH fail ("overlapping
+    // facets"), so the FEM meshing path must enable fusing to get a single clean conductor per turn.
+    // Fusing is a boolean per turn (slower) -- hence the toggle. Also honoured via env MVB_FUSE_TURNS.
+    static void setFuseTurnParts(bool on);
+    static bool fuseTurnParts();
+
     // paintCoating: true  → turn solid drawn at the OUTER (insulation) footprint
     //                       (default; unchanged behaviour for visualisation).
     //               false → turn solid drawn at the CONDUCTING (copper) footprint

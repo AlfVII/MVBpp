@@ -35,8 +35,45 @@
 #include <cmath>
 #include <numbers>
 #include <map>
+#include <vector>
+#include <string>
+#include <cstdlib>
 
 namespace mvb {
+
+// --- GLOBAL turn-part fusing toggle (see TurnBuilder.h) --------------------------------------
+// Default OFF (fast compound for STL/STEP visualisation). The FEM meshing path turns it ON so each
+// turn is a single clean solid (overlapping compound sub-solids otherwise crash tet meshing).
+static bool s_fuseTurnParts = [](){ const char* e = std::getenv("MVB_FUSE_TURNS");
+                                    return e && *e && std::string(e) != "0"; }();
+void TurnBuilder::setFuseTurnParts(bool on) { s_fuseTurnParts = on; }
+bool TurnBuilder::fuseTurnParts() { return s_fuseTurnParts; }
+
+// Fuse all SOLIDs in a shape (a turn's compound of segments+corners) into one. The sub-solids
+// genuinely OVERLAP at the corners (a straight cylinder runs into the corner torus), so this is a
+// real boolean union (no glue). Returns the input unchanged if there is <=1 solid or the fuse
+// fails (a warning is emitted; an unfused compound is still valid geometry for callers that don't
+// mesh). One boolean per adjacent pair -> O(nparts) per turn.
+static TopoDS_Shape fuse_turn_solids(const TopoDS_Shape& shape) {
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) solids.push_back(ex.Current());
+    if (solids.size() <= 1) return shape;
+    TopoDS_Shape acc = solids[0];
+    for (std::size_t i = 1; i < solids.size(); ++i) {
+        try {
+            BRepAlgoAPI_Fuse f(acc, solids[i]);
+            if (!f.IsDone()) { std::cerr << "WARN TurnBuilder: turn-part fuse not done; returning unfused compound\n"; return shape; }
+            acc = f.Shape();
+        } catch (const Standard_Failure& e) {
+            std::cerr << "WARN TurnBuilder: turn-part fuse threw (" << e.GetMessageString() << "); returning unfused compound\n";
+            return shape;
+        }
+    }
+    return acc;
+}
+static inline TopoDS_Shape maybe_fuse_turn(const TopoDS_Shape& s) {
+    return s_fuseTurnParts ? fuse_turn_solids(s) : s;
+}
 
 static double get_wire_diameter(const MAS::Wire& wire) {
     auto cd = wire.get_conducting_diameter();
@@ -878,30 +915,33 @@ TopoDS_Shape TurnBuilder::buildTurn(const MAS::Turn& turn,
     auto [wire_w, wire_h] = get_wire_dimensions(wire, turn, paintCoating);
     double wire_radius = std::min(wire_w, wire_h) / 2.0;
 
+    // Dispatch by topology/column shape; maybe_fuse_turn() collapses the per-turn sub-solid
+    // compound into ONE solid when fusing is enabled (FEM meshing), else returns it unchanged
+    // (fast compound for visualisation). Applied here so every column shape + toroidal is covered.
     if (isToroidal) {
-        return build_toroidal_turn(turn, wire, bobbin, paintCoating);
+        return maybe_fuse_turn(build_toroidal_turn(turn, wire, bobbin, paintCoating));
     }
 
     double half_col_width = bobbin.get_column_width().value_or(0.0);
     double half_col_depth = bobbin.get_column_depth();
 
     if (bobbin.get_column_shape() == MAS::ColumnShape::ROUND) {
-        return build_concentric_round_column_turn(radial_pos, wire_radius, height_pos,
+        return maybe_fuse_turn(build_concentric_round_column_turn(radial_pos, wire_radius, height_pos,
                                                    rect_wire, wire_w, wire_h,
                                                    wirePolygonSegments,
-                                                   wireRevolutionSegments);
+                                                   wireRevolutionSegments));
     }
 
     if (bobbin.get_column_shape() == MAS::ColumnShape::OBLONG) {
-        return build_concentric_oblong_turn(radial_pos, wire_radius, height_pos,
+        return maybe_fuse_turn(build_concentric_oblong_turn(radial_pos, wire_radius, height_pos,
                                              half_col_width, half_col_depth,
-                                             rect_wire, wire_w, wire_h, wirePolygonSegments);
+                                             rect_wire, wire_w, wire_h, wirePolygonSegments));
     }
 
     // Default: rectangular column
-    return build_concentric_rect_column_turn(radial_pos, wire_radius, height_pos,
+    return maybe_fuse_turn(build_concentric_rect_column_turn(radial_pos, wire_radius, height_pos,
                                               half_col_width, half_col_depth,
-                                              rect_wire, wire_w, wire_h);
+                                              rect_wire, wire_w, wire_h));
 }
 
 void TurnBuilder::clearCache() {
