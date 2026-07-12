@@ -132,26 +132,6 @@ static void patchBobbinDimensions(MAS::CoreBobbinProcessedDescription& bobbinPd,
     }
 }
 
-static double getDimValue(const MAS::Dimension& dim) {
-    if (const double* v = std::get_if<double>(&dim)) return *v;
-    if (const MAS::DimensionWithTolerance* v = std::get_if<MAS::DimensionWithTolerance>(&dim)) {
-        auto n = v->get_nominal();
-        if (n) return *n;
-    }
-    return 0.0;
-}
-
-
-static MAS::Wire defaultWire() {
-    MAS::Wire wire;
-    wire.set_type(MAS::WireType::ROUND);
-    MAS::DimensionWithTolerance dim;
-    dim.set_nominal(0.001);
-    wire.set_outer_diameter(std::optional<MAS::DimensionWithTolerance>(dim));
-    wire.set_conducting_diameter(std::optional<MAS::DimensionWithTolerance>(dim));
-    return wire;
-}
-
 static std::string drawMagneticCommon(const std::vector<NamedShape>& named,
                                       const std::string& outputPath,
                                       const std::string& format,
@@ -407,14 +387,16 @@ std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::MagneticC
 
     size_t turnIdx = 0;
     for (const auto& turn : *turnsOpt) {
-        MAS::Wire wire = defaultWire();
-        auto it = wireMap.find(turn.get_winding());
-        if (it != wireMap.end()) {
-            wire = it->second;
-        }
-
         const std::string baseName = turn.get_name().empty()
                                         ? ("Turn_" + std::to_string(turnIdx)) : turn.get_name();
+        auto it = wireMap.find(turn.get_winding());
+        if (it == wireMap.end()) {
+            throw std::runtime_error(
+                "buildTurnsImpl: turn '" + baseName + "' references winding '" + turn.get_winding()
+                + "' which has no wire in coil.functionalDescription — refusing to draw it with "
+                  "an invented default wire");
+        }
+        const MAS::Wire& wire = it->second;
         auto emit = [&](bool coat, const std::string& suffix) {
             TopoDS_Shape t = TurnBuilder::buildTurn(turn, wire, bobbinPd, toroidal, wirePolygonSegments,
                                                     DEFAULT_WIRE_REVOLUTION_SEGMENTS, coat);
@@ -460,9 +442,15 @@ std::vector<NamedShape> buildInsulationLayersImpl(const CoilT& coil, const MAS::
         const double w = dims[0], h = dims[1];
         if (w <= 1e-9 || h <= 1e-9) continue;   // zero-thickness placeholder -> nothing physical to build
         MAS::Turn turn;
+        turn.set_name("insulation_layer_" + std::to_string(i));
         turn.set_coordinates(std::vector<double>{coords[0], coords[1]});
         turn.set_dimensions(std::vector<double>{w, h});
         turn.set_cross_sectional_shape(MAS::TurnCrossSectionalShape::RECTANGULAR);
+        // Toroidal layers carry their outer-ring crossing in additionalCoordinates (written
+        // by MKF); the synthesized turn must carry it too — TurnBuilder refuses to invent it.
+        if (const auto& layerAdd = layer.get_additional_coordinates()) {
+            turn.set_additional_coordinates(*layerAdd);
+        }
         MAS::Wire wire; wire.set_type(MAS::WireType::RECTANGULAR);
         MAS::DimensionWithTolerance ww; ww.set_nominal(w);
         MAS::DimensionWithTolerance hh; hh.set_nominal(h);

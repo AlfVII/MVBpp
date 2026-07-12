@@ -11,6 +11,7 @@
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BOPAlgo_GlueEnum.hxx>
 #include <TopTools_ListOfShape.hxx>
@@ -75,12 +76,27 @@ static inline TopoDS_Shape maybe_fuse_turn(const TopoDS_Shape& s) {
     return s_fuseTurnParts ? fuse_turn_solids(s) : s;
 }
 
+// Collapse a dimensionWithTolerance to a scalar with MKF's preference order
+// (nominal -> (min+max)/2 -> max -> min) via OpenMagnetics::resolve_dimensional_values,
+// but THROW when the tolerance object is empty — the MKF resolver silently returns 0.
+static double resolve_dim_or_throw(const MAS::DimensionWithTolerance& dwt, const std::string& what) {
+    if (!dwt.get_nominal() && !dwt.get_maximum() && !dwt.get_minimum()) {
+        throw std::runtime_error(what + " has an empty dimensionWithTolerance "
+                                 "(no nominal/minimum/maximum)");
+    }
+    return OpenMagnetics::resolve_dimensional_values(dwt);
+}
+
 static double get_wire_diameter(const MAS::Wire& wire) {
-    auto cd = wire.get_conducting_diameter();
-    if (cd) return cd->get_nominal().value_or(0.0);
-    auto od = wire.get_outer_diameter();
-    if (od) return od->get_nominal().value_or(0.0);
-    return 0.001;
+    const std::string wireName = wire.get_name().value_or("<unnamed>");
+    if (auto cd = wire.get_conducting_diameter()) {
+        return resolve_dim_or_throw(*cd, "wire '" + wireName + "' conductingDiameter");
+    }
+    if (auto od = wire.get_outer_diameter()) {
+        return resolve_dim_or_throw(*od, "wire '" + wireName + "' outerDiameter");
+    }
+    throw std::runtime_error("get_wire_diameter: wire '" + wireName
+                             + "' has neither conductingDiameter nor outerDiameter");
 }
 
 // Copper (conducting) cross-section of the wire — the geometry FEM winding-loss
@@ -97,24 +113,25 @@ static std::pair<double, double> get_conducting_dimensions(const MAS::Wire& wire
     switch (wire.get_type()) {
         case MAS::WireType::ROUND: {
             auto cd = wire.get_conducting_diameter();
-            if (!cd || !cd->get_nominal()) {
+            if (!cd) {
                 throw std::runtime_error(
                     "get_conducting_dimensions: ROUND wire '" + wireName
-                    + "' has no conductingDiameter.nominal (required to draw the copper cross-section)");
+                    + "' has no conductingDiameter (required to draw the copper cross-section)");
             }
-            double d = cd->get_nominal().value();
+            double d = resolve_dim_or_throw(*cd, "ROUND wire '" + wireName + "' conductingDiameter");
             return {d, d};
         }
         case MAS::WireType::RECTANGULAR:
         case MAS::WireType::PLANAR: {
             auto cw = wire.get_conducting_width();
             auto ch = wire.get_conducting_height();
-            if (!cw || !cw->get_nominal() || !ch || !ch->get_nominal()) {
+            if (!cw || !ch) {
                 throw std::runtime_error(
                     "get_conducting_dimensions: RECTANGULAR/PLANAR wire '" + wireName
-                    + "' has no conductingWidth.nominal / conductingHeight.nominal");
+                    + "' has no conductingWidth / conductingHeight");
             }
-            return {cw->get_nominal().value(), ch->get_nominal().value()};
+            return {resolve_dim_or_throw(*cw, "wire '" + wireName + "' conductingWidth"),
+                    resolve_dim_or_throw(*ch, "wire '" + wireName + "' conductingHeight")};
         }
         case MAS::WireType::LITZ: {
             OpenMagnetics::Wire omWire(wire);
@@ -125,13 +142,9 @@ static std::pair<double, double> get_conducting_dimensions(const MAS::Wire& wire
             }
             int numberConductors = static_cast<int>(omWire.get_number_conductors().value());
             auto strand = omWire.resolve_strand();
-            auto scd = strand.get_conducting_diameter();
-            if (!scd.get_nominal()) {
-                throw std::runtime_error(
-                    "get_conducting_dimensions: LITZ wire '" + wireName
-                    + "' strand has no conductingDiameter.nominal");
-            }
-            double strandConductingDiameter = scd.get_nominal().value();
+            double strandConductingDiameter = resolve_dim_or_throw(
+                strand.get_conducting_diameter(),
+                "LITZ wire '" + wireName + "' strand conductingDiameter");
             auto strandCoating = OpenMagnetics::Wire::resolve_coating(strand);
             if (!strandCoating || !strandCoating->get_grade()) {
                 throw std::runtime_error(
@@ -163,15 +176,18 @@ static std::pair<double, double> get_wire_dimensions(const MAS::Wire& wire, cons
     if (td && td->size() >= 2) {
         return {(*td)[0], (*td)[1]};
     }
+    const std::string wireName = wire.get_name().value_or("<unnamed>");
     auto ow = wire.get_outer_width();
     auto oh = wire.get_outer_height();
     if (ow && oh) {
-        return {ow->get_nominal().value_or(0.001), oh->get_nominal().value_or(0.001)};
+        return {resolve_dim_or_throw(*ow, "wire '" + wireName + "' outerWidth"),
+                resolve_dim_or_throw(*oh, "wire '" + wireName + "' outerHeight")};
     }
     auto cw = wire.get_conducting_width();
     auto ch = wire.get_conducting_height();
     if (cw && ch) {
-        return {cw->get_nominal().value_or(0.001), ch->get_nominal().value_or(0.001)};
+        return {resolve_dim_or_throw(*cw, "wire '" + wireName + "' conductingWidth"),
+                resolve_dim_or_throw(*ch, "wire '" + wireName + "' conductingHeight")};
     }
     double d = get_wire_diameter(wire);
     return {d, d};
@@ -326,32 +342,60 @@ static TopoDS_Shape build_concentric_rect_column_turn(double radial_pos, double 
                                                        double half_col_width, double half_col_depth,
                                                        bool rect_wire,
                                                        double wire_width, double wire_height) {
-    double turn_turn_radius = radial_pos - half_col_width;
-    double min_bend = std::max(wire_width, wire_height) / 2.0 * 1.02;
-    if (turn_turn_radius < min_bend) {
-        turn_turn_radius = min_bend;
+    // The straight runs sit at exactly the MAS radial position: coordinates[0] is the
+    // cross-section centre on the X faces, and the same clearance past the column is used
+    // on the Z faces. This offset is MKF data and must never be adjusted here.
+    double clearance = radial_pos - half_col_width;
+    if (clearance <= 0.0) {
+        throw std::runtime_error(
+            "build_concentric_rect_column_turn: turn radial position " + std::to_string(radial_pos)
+            + " m lies inside the column (half-width " + std::to_string(half_col_width)
+            + " m) — inconsistent MAS turn/bobbin data");
     }
 
-    double wire_x_pos = half_col_width + turn_turn_radius;
-    double wire_z_pos = half_col_depth + turn_turn_radius;
+    double wire_x_pos = half_col_width + clearance;   // == radial_pos, exactly
+    double wire_z_pos = half_col_depth + clearance;
     double y = height_pos;
 
+    // Corner bend radius. Normally equal to the clearance (arc axis at the column corner).
+    // When the wire sits closer to the column than half a wire the quarter-torus would
+    // self-intersect (major < minor), so grow ONLY the corner radius and pull the arc axis
+    // inward along the corner diagonal — the straights stay tangent at their exact MAS
+    // positions and the arc still meets them. Geometrically infeasible data throws instead
+    // of silently repositioning the turn.
+    double turn_turn_radius = clearance;
+    double corner_inset = 0.0;
+    double min_bend = std::max(wire_width, wire_height) / 2.0 * 1.02;
+    if (turn_turn_radius < min_bend) {
+        corner_inset = min_bend - clearance;
+        turn_turn_radius = min_bend;
+        if (corner_inset > std::min(half_col_width, half_col_depth)) {
+            throw std::runtime_error(
+                "build_concentric_rect_column_turn: minimum bend radius " + std::to_string(min_bend)
+                + " m cannot be accommodated (clearance " + std::to_string(clearance)
+                + " m, column half-dims " + std::to_string(half_col_width) + "/"
+                + std::to_string(half_col_depth) + " m) — adjacent corner arcs would cross");
+        }
+    }
+    double seg_x = half_col_width - corner_inset;   // straight-run half-extent along X
+    double seg_z = half_col_depth - corner_inset;   // straight-run half-extent along Z
+
     gp_Pnt pts[8] = {
-        gp_Pnt(+half_col_width, y, +wire_z_pos),
-        gp_Pnt(-half_col_width, y, +wire_z_pos),
-        gp_Pnt(-wire_x_pos,     y, +half_col_depth),
-        gp_Pnt(-wire_x_pos,     y, -half_col_depth),
-        gp_Pnt(-half_col_width, y, -wire_z_pos),
-        gp_Pnt(+half_col_width, y, -wire_z_pos),
-        gp_Pnt(+wire_x_pos,     y, -half_col_depth),
-        gp_Pnt(+wire_x_pos,     y, +half_col_depth),
+        gp_Pnt(+seg_x,      y, +wire_z_pos),
+        gp_Pnt(-seg_x,      y, +wire_z_pos),
+        gp_Pnt(-wire_x_pos, y, +seg_z),
+        gp_Pnt(-wire_x_pos, y, -seg_z),
+        gp_Pnt(-seg_x,      y, -wire_z_pos),
+        gp_Pnt(+seg_x,      y, -wire_z_pos),
+        gp_Pnt(+wire_x_pos, y, -seg_z),
+        gp_Pnt(+wire_x_pos, y, +seg_z),
     };
 
     std::pair<gp_Pnt, gp_Dir> corners[4] = {
-        {gp_Pnt(-half_col_width, y, +half_col_depth), gp_Dir(0, 0, 1)},
-        {gp_Pnt(-half_col_width, y, -half_col_depth), gp_Dir(-1, 0, 0)},
-        {gp_Pnt(+half_col_width, y, -half_col_depth), gp_Dir(0, 0, -1)},
-        {gp_Pnt(+half_col_width, y, +half_col_depth), gp_Dir(1, 0, 0)},
+        {gp_Pnt(-seg_x, y, +seg_z), gp_Dir(0, 0, 1)},
+        {gp_Pnt(-seg_x, y, -seg_z), gp_Dir(-1, 0, 0)},
+        {gp_Pnt(+seg_x, y, -seg_z), gp_Dir(0, 0, -1)},
+        {gp_Pnt(+seg_x, y, +seg_z), gp_Dir(1, 0, 0)},
     };
 
     // For round wire, build the turn manually from straight cylinders and corner quarter-tori.
@@ -412,29 +456,23 @@ static TopoDS_Shape build_concentric_rect_column_turn(double radial_pos, double 
     TopoDS_Compound compound;
     builder.MakeCompound(compound);
 
-    // Straight segment 0: along -X at z=+wire_z_pos
-    {
-        gp_Pnt corner(-half_col_width, y - hh_wire, wire_z_pos - hw_wire);
-        TopoDS_Shape box = BRepPrimAPI_MakeBox(corner, 2.0 * half_col_width, wire_height, wire_width).Shape();
-        builder.Add(compound, box);
+    // Straight segments (skipped when the corner inset consumed the whole face,
+    // i.e. adjacent corner arcs meet exactly at the face midpoint).
+    if (seg_x > 1e-12) {
+        // Segment 0: along -X at z=+wire_z_pos
+        gp_Pnt corner0(-seg_x, y - hh_wire, wire_z_pos - hw_wire);
+        builder.Add(compound, BRepPrimAPI_MakeBox(corner0, 2.0 * seg_x, wire_height, wire_width).Shape());
+        // Segment 2: along +X at z=-wire_z_pos
+        gp_Pnt corner2(-seg_x, y - hh_wire, -wire_z_pos - hw_wire);
+        builder.Add(compound, BRepPrimAPI_MakeBox(corner2, 2.0 * seg_x, wire_height, wire_width).Shape());
     }
-    // Straight segment 1: along -Z at x=-wire_x_pos
-    {
-        gp_Pnt corner(-wire_x_pos - hw_wire, y - hh_wire, -half_col_depth);
-        TopoDS_Shape box = BRepPrimAPI_MakeBox(corner, wire_width, wire_height, 2.0 * half_col_depth).Shape();
-        builder.Add(compound, box);
-    }
-    // Straight segment 2: along +X at z=-wire_z_pos
-    {
-        gp_Pnt corner(-half_col_width, y - hh_wire, -wire_z_pos - hw_wire);
-        TopoDS_Shape box = BRepPrimAPI_MakeBox(corner, 2.0 * half_col_width, wire_height, wire_width).Shape();
-        builder.Add(compound, box);
-    }
-    // Straight segment 3: along +Z at x=+wire_x_pos
-    {
-        gp_Pnt corner(wire_x_pos - hw_wire, y - hh_wire, -half_col_depth);
-        TopoDS_Shape box = BRepPrimAPI_MakeBox(corner, wire_width, wire_height, 2.0 * half_col_depth).Shape();
-        builder.Add(compound, box);
+    if (seg_z > 1e-12) {
+        // Segment 1: along -Z at x=-wire_x_pos
+        gp_Pnt corner1(-wire_x_pos - hw_wire, y - hh_wire, -seg_z);
+        builder.Add(compound, BRepPrimAPI_MakeBox(corner1, wire_width, wire_height, 2.0 * seg_z).Shape());
+        // Segment 3: along +Z at x=+wire_x_pos
+        gp_Pnt corner3(wire_x_pos - hw_wire, y - hh_wire, -seg_z);
+        builder.Add(compound, BRepPrimAPI_MakeBox(corner3, wire_width, wire_height, 2.0 * seg_z).Shape());
     }
 
     // 4 corner quarter-swept rectangles: revolve a rect face -90° around Y
@@ -612,26 +650,36 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
     auto [wire_w, wire_h] = get_wire_dimensions(wire, turn, paintCoating);
     double wire_radius = std::min(wire_w, wire_h) / 2.0;
 
+    const std::string turnName = turn.get_name().empty() ? "<unnamed>" : turn.get_name();
     const auto& coords = turn.get_coordinates();
-    if (coords.size() < 2) return TopoDS_Shape();
+    if (coords.size() < 2) {
+        throw std::runtime_error("build_toroidal_turn: turn '" + turnName
+                                 + "' has fewer than 2 coordinates");
+    }
     double cx = coords[0], cy = coords[1];
     double innerRadial = std::sqrt(cx * cx + cy * cy);
     double innerAngleDeg = std::atan2(cy, cx) * 180.0 / std::numbers::pi;
 
-    double outerRadial = innerRadial;
-    double outerAngleDeg = innerAngleDeg;
     auto addCoords = turn.get_additional_coordinates();
-    double wwRadialHeight = 0.0;
     const auto& wws = bobbin.get_winding_windows();
-    if (!wws.empty()) wwRadialHeight = wws[0].get_radial_height().value_or(0.0);
-
-    if (addCoords && !addCoords->empty() && (*addCoords)[0].size() >= 2) {
-        double ax = (*addCoords)[0][0], ay = (*addCoords)[0][1];
-        outerRadial = std::sqrt(ax * ax + ay * ay);
-        outerAngleDeg = std::atan2(ay, ax) * 180.0 / std::numbers::pi;
-    } else {
-        outerRadial = innerRadial + wwRadialHeight;
+    if (wws.empty() || !wws[0].get_radial_height()) {
+        throw std::runtime_error("build_toroidal_turn: toroidal bobbin has no winding-window "
+                                 "radialHeight (required for the turn's face-run clearance)");
     }
+    double wwRadialHeight = wws[0].get_radial_height().value();
+
+    // The outer XY-plane crossing is MAS data (additionalCoordinates[0], written by MKF's
+    // wind_toroidal_additional_turns with its own collision avoidance) — never invented here.
+    if (!(addCoords && !addCoords->empty() && (*addCoords)[0].size() >= 2)) {
+        throw std::runtime_error(
+            "build_toroidal_turn: toroidal turn '" + turnName
+            + "' has no additionalCoordinates (outer XY-plane crossing). MKF emits it when "
+              "settings coil_include_additional_coordinates is enabled (the default); refusing "
+              "to invent the outer crossing");
+    }
+    double ax = (*addCoords)[0][0], ay = (*addCoords)[0][1];
+    double outerRadial = std::sqrt(ax * ax + ay * ay);
+    double outerAngleDeg = std::atan2(ay, ax) * 180.0 / std::numbers::pi;
 
     // Special case: when the inner cartesian is at (or very near) the toroid
     // origin, atan2(0, 0) returns 0 — but the racetrack is meant to extend
@@ -642,9 +690,22 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
         innerAngleDeg = outerAngleDeg;
     }
 
-    double turnAngleDeg = turn.get_rotation().value_or(0.0);
-    double angleDiffRad = (outerAngleDeg - innerAngleDeg) * std::numbers::pi / 180.0;
-    double turnRotationRad = (turnAngleDeg - 180.0) * std::numbers::pi / 180.0;
+    // Azimuthal skew between the two crossings, normalized to (-pi, pi] so the outer
+    // leg always takes the short way around, and the turn's placement azimuth — from
+    // the MAS coordinates, NEVER from turn.rotation: MKF's angular compaction shifts
+    // coordinates without updating rotation (stale; MKF ABT #186), and per the MAS
+    // schema rotation is the cross-section orientation, not the placement.
+    //
+    // Frames: the canonical racetrack is built with the inner leg on the -X axis and the
+    // toroid hole axis along +Y; buildAllNamed later counter-rotates the whole assembly by
+    // -pi/2 about X, mapping build (x, y, z) -> final (x, z, -y). For the inner crossing to
+    // land exactly at the MAS point (cx, cy, 0) the whole-turn rotation about +Y must be
+    // beta = 180 deg - innerAngle (NOT innerAngle - 180: that mirrors the y sign — the
+    // chirality bug this replaces). Same derivation makes the outer pieces rotate about the
+    // GLOBAL axis by -angleDiff (see below), landing the outer leg exactly on (ax, ay, 0).
+    double angleDiffRad = std::remainder(
+        (outerAngleDeg - innerAngleDeg) * std::numbers::pi / 180.0, 2.0 * std::numbers::pi);
+    double turnRotationRad = (180.0 - innerAngleDeg) * std::numbers::pi / 180.0;
 
     double halfDepth = bobbin.get_column_depth();
     double bendRadius = rect_wire ? std::max(wire_w, wire_h) / 2.0 : wire_radius;
@@ -674,9 +735,43 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
 
     double tubeLength = std::max(1e-7, radialHeight - bendRadius);
     double radialDistance = outerRadial - innerRadial;
-    double radialLength = std::max(1e-7, radialDistance - 2.0 * bendRadius);
     double innerX = -innerRadial;
     double outerX = innerX - radialDistance;
+
+    // --- Exact outer-leg placement ---------------------------------------------------
+    // The outer corner + tube rotate about the GLOBAL toroid axis by -angleDiff, landing
+    // the outer vertical leg exactly on additionalCoordinates[0]. The run between the two
+    // corners is then the straight CHORD between their radial-side faces (not a pure
+    // radial segment), and each corner yaws about its own tube axis so its exit meets the
+    // chord. The previous code rotated the whole outer half about the INNER leg, which
+    // misplaces the outer crossing whenever the two crossing angles differ.
+    // All horizontal (x, z) in the canonical frame; rotY = right-handed rotation about +Y.
+    auto rotY = [](double x, double z, double ang) -> std::pair<double, double> {
+        return {x * std::cos(ang) + z * std::sin(ang), -x * std::sin(ang) + z * std::cos(ang)};
+    };
+    const double deltaOut = -angleDiffRad;
+    // Corner exit faces before yawing: inner at (innerX - b, 0); outer rotated by deltaOut.
+    const double exInX = innerX - bendRadius;
+    const auto [eOutX, eOutZ] = rotY(outerX + bendRadius, 0.0, deltaOut);
+    const double vX = eOutX - exInX, vZ = eOutZ - 0.0;
+    const double vLen = std::hypot(vX, vZ);
+    double psiIn = 0.0, psiOut = 0.0;
+    if (vLen > 1e-12) {
+        // Yaw of the inner corner so its exit direction (-X canonically) points along the
+        // chord: R_Y(psi)(-1,0) = (-cos psi, sin psi) == v/|v|.
+        psiIn = std::atan2(vZ, -vX);
+        // Yaw of the outer corner so its radial entry direction u points back along -v.
+        const auto [uX, uZ] = rotY(1.0, 0.0, deltaOut);
+        const double bX = -vX / vLen, bZ = -vZ / vLen;
+        psiOut = std::atan2(uZ * bX - uX * bZ, uX * bX + uZ * bZ);
+    }
+    // Chord endpoints after the corners yaw (horizontal parts; y = ±radialHeight per half).
+    const auto [rInX, rInZ] = rotY(-bendRadius, 0.0, psiIn);
+    const double chordInX = innerX + rInX, chordInZ = rInZ;
+    const auto [tOutX, tOutZ] = rotY(outerX, 0.0, deltaOut);
+    const auto [rOutX, rOutZ] = rotY(eOutX - tOutX, eOutZ - tOutZ, psiOut);
+    const double chordOutX = tOutX + rOutX, chordOutZ = tOutZ + rOutZ;
+    const double chordLen = std::hypot(chordOutX - chordInX, chordOutZ - chordInZ);
 
     // Check cache: turns sharing the geometry parameters have identical
     // canonical shapes — only turnRotationRad differs.
@@ -710,38 +805,42 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
                     box = translate_shape(box, innerX, (tubeLength / 2.0) * ySign, 0.0);
                     if (!box.IsNull()) builder.Add(compound, box);
                 }
-                // 2. Inner corner: sweep starts at +X (tube end), turns toward radial
+                // 2. Inner corner: sweep starts at +X (tube end), turns toward the chord
                 {
                     gp_Pnt center(innerX - bendRadius, tubeLength * ySign, 0.0);
                     TopoDS_Shape s = make_toroidal_quarter_swept_rectangle(
                         bendRadius, wire_w, wire_h, center, 0.0, ySign);
-                    s = rotate_about_axis(s, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad / 2.0);
+                    s = rotate_about_axis(s, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), psiIn);
                     if (!s.IsNull()) builder.Add(compound, s);
                 }
-                // 3. Radial segment
-                {
-                    gp_Pnt corner(-radialLength / 2.0, -wire_w / 2.0, -wire_h / 2.0);
-                    TopoDS_Shape box = BRepPrimAPI_MakeBox(corner, radialLength, wire_w, wire_h).Shape();
-                    box = translate_shape(box, innerX - bendRadius - radialLength / 2.0,
-                                          radialHeight * ySign, 0.0);
-                    box = rotate_about_axis(box, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad / 2.0);
+                // 3. Chord run between the two corner faces (top view), wire_w vertical
+                if (chordLen > 1e-9) {
+                    gp_Pnt p0(chordInX, radialHeight * ySign, chordInZ);
+                    gp_Dir chordDir((chordOutX - chordInX) / chordLen, 0.0,
+                                    (chordOutZ - chordInZ) / chordLen);
+                    gp_Ax2 profPlane(p0, chordDir, gp_Dir(0, 1, 0));
+                    TopoDS_Face face = build_rect_profile(profPlane, wire_w, wire_h);
+                    TopoDS_Shape box = BRepPrimAPI_MakePrism(
+                        face, gp_Vec(chordDir.XYZ() * chordLen)).Shape();
                     if (!box.IsNull()) builder.Add(compound, box);
                 }
-                // 4. Outer corner: sweep starts at radial connection (±90°), turns toward outer tube
+                // 4. Outer corner: sweep starts at radial connection (±90°), turns toward outer tube;
+                //    placed by the GLOBAL-axis rotation, then yawed about its own tube axis
                 {
                     double startAngleRad = (ySign > 0) ? (std::numbers::pi / 2.0) : (3.0 * std::numbers::pi / 2.0);
                     gp_Pnt center(outerX + bendRadius, tubeLength * ySign, 0.0);
                     TopoDS_Shape s = make_toroidal_quarter_swept_rectangle(
                         bendRadius, wire_w, wire_h, center, startAngleRad, ySign);
-                    s = rotate_about_axis(s, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad);
+                    s = rotate_about_axis(s, gp_Pnt(0, 0, 0), gp_Dir(0,1,0), deltaOut);
+                    s = rotate_about_axis(s, gp_Pnt(tOutX, 0, tOutZ), gp_Dir(0,1,0), psiOut);
                     if (!s.IsNull()) builder.Add(compound, s);
                 }
-                // 5. Outer tube
+                // 5. Outer tube: exactly on additionalCoordinates[0] via the global-axis rotation
                 {
                     gp_Pnt corner(-wire_w / 2.0, -tubeLength / 2.0, -wire_h / 2.0);
                     TopoDS_Shape box = BRepPrimAPI_MakeBox(corner, wire_w, tubeLength, wire_h).Shape();
                     box = translate_shape(box, outerX, (tubeLength / 2.0) * ySign, 0.0);
-                    box = rotate_about_axis(box, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad);
+                    box = rotate_about_axis(box, gp_Pnt(0, 0, 0), gp_Dir(0,1,0), deltaOut);
                     if (!box.IsNull()) builder.Add(compound, box);
                 }
             };
@@ -757,37 +856,38 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
                     c = translate_shape(c, innerX, 0.0, 0.0);
                     if (!c.IsNull()) builder.Add(compound, c);
                 }
-                // 2. Inner corner
+                // 2. Inner corner: turns from the tube toward the chord
                 {
                     double sa = (ySign > 0) ? 0.0 : 270.0;
                     gp_Pnt center(innerX - bendRadius, tubeLength * ySign, 0.0);
                     TopoDS_Shape s = make_quarter_torus_at(bendRadius, wire_radius, center, sa);
-                    s = rotate_about_axis(s, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad / 2.0);
+                    s = rotate_about_axis(s, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), psiIn);
                     if (!s.IsNull()) builder.Add(compound, s);
                 }
-                // 3. Radial segment along X
-                {
-                    TopoDS_Shape c = BRepPrimAPI_MakeCylinder(wire_radius, radialLength).Shape();
-                    c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(0,1,0), -std::numbers::pi/2.0);
-                    c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(0,1,0), angleDiffRad / 2.0);
-                    c = translate_shape(c, innerX - bendRadius, radialHeight * ySign, 0.0);
-                    c = rotate_about_axis(c, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad / 2.0);
+                // 3. Chord run between the two corner faces (top view)
+                if (chordLen > 1e-9) {
+                    gp_Pnt p0(chordInX, radialHeight * ySign, chordInZ);
+                    gp_Dir chordDir((chordOutX - chordInX) / chordLen, 0.0,
+                                    (chordOutZ - chordInZ) / chordLen);
+                    TopoDS_Shape c = BRepPrimAPI_MakeCylinder(
+                        gp_Ax2(p0, chordDir), wire_radius, chordLen).Shape();
                     if (!c.IsNull()) builder.Add(compound, c);
                 }
-                // 4. Outer corner
+                // 4. Outer corner: placed by the GLOBAL-axis rotation, then yawed to meet the chord
                 {
                     double sa = (ySign > 0) ? 90.0 : 180.0;
                     gp_Pnt center(outerX + bendRadius, tubeLength * ySign, 0.0);
                     TopoDS_Shape s = make_quarter_torus_at(bendRadius, wire_radius, center, sa);
-                    s = rotate_about_axis(s, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad);
+                    s = rotate_about_axis(s, gp_Pnt(0, 0, 0), gp_Dir(0,1,0), deltaOut);
+                    s = rotate_about_axis(s, gp_Pnt(tOutX, 0, tOutZ), gp_Dir(0,1,0), psiOut);
                     if (!s.IsNull()) builder.Add(compound, s);
                 }
-                // 5. Outer tube
+                // 5. Outer tube: exactly on additionalCoordinates[0] via the global-axis rotation
                 {
                     TopoDS_Shape c = BRepPrimAPI_MakeCylinder(wire_radius, tubeLength).Shape();
                     c = rotate_about_axis(c, gp_Pnt(0,0,0), gp_Dir(1,0,0), -std::numbers::pi/2.0 * ySign);
                     c = translate_shape(c, outerX, 0.0, 0.0);
-                    c = rotate_about_axis(c, gp_Pnt(innerX, 0, 0), gp_Dir(0,1,0), angleDiffRad);
+                    c = rotate_about_axis(c, gp_Pnt(0, 0, 0), gp_Dir(0,1,0), deltaOut);
                     if (!c.IsNull()) builder.Add(compound, c);
                 }
             };
@@ -908,8 +1008,13 @@ TopoDS_Shape TurnBuilder::buildTurn(const MAS::Turn& turn,
                                     int wireRevolutionSegments,
                                     bool paintCoating) {
     const auto& coords = turn.get_coordinates();
-    double radial_pos = coords.size() > 0 ? coords[0] : 0.0;
-    double height_pos = coords.size() > 1 ? coords[1] : 0.0;
+    if (coords.size() < 2) {
+        throw std::runtime_error("TurnBuilder::buildTurn: turn '"
+                                 + (turn.get_name().empty() ? std::string("<unnamed>") : turn.get_name())
+                                 + "' has fewer than 2 coordinates");
+    }
+    double radial_pos = coords[0];
+    double height_pos = coords[1];
 
     bool rect_wire = is_rectangular_wire(wire);
     auto [wire_w, wire_h] = get_wire_dimensions(wire, turn, paintCoating);

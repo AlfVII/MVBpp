@@ -48,10 +48,15 @@ TEST_CASE("E core with bobbin and turns builds complete assembly", "[integration
     core.set_geometrical_description(std::optional<std::vector<MAS::CoreGeometricalDescriptionElement>>(std::vector<MAS::CoreGeometricalDescriptionElement>{piece1, piece2}));
     magnetic.set_core(core);
 
-    // Bobbin processed description
+    // Bobbin processed description. MKF convention (see patchBobbinDimensions):
+    // column_width/depth = core central-column half-dim + wall thickness — for this
+    // E 19/8/5 core (F=6 mm wide, C=5 mm deep): 0.003+0.0005 and 0.0025+0.0005.
+    // The previous values (0.007/0.004) placed the winding turns INSIDE the bobbin
+    // tube; TurnBuilder now throws on such inconsistent data instead of silently
+    // pushing the turn outward.
     MAS::CoreBobbinProcessedDescription bobbinPd;
-    bobbinPd.set_column_width(0.007);
-    bobbinPd.set_column_depth(0.004);
+    bobbinPd.set_column_width(0.0035);
+    bobbinPd.set_column_depth(0.003);
     bobbinPd.set_column_thickness(0.006);
     bobbinPd.set_wall_thickness(0.0005);
     bobbinPd.set_column_shape(MAS::ColumnShape::RECTANGULAR);
