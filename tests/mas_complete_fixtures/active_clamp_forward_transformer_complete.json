@@ -115,11 +115,11 @@
             }
         },
         "coil": {
-            "bobbin": "Bobbin RM 14/20",
+            "bobbin": "Basic",
             "functionalDescription": [
                 {
                     "name": "Primary",
-                    "numberTurns": 66,
+                    "numberTurns": 48,
                     "numberParallels": 1,
                     "isolationSide": "primary",
                     "wire": "Litz 20x0.1 - Grade 1 - Single Served"
@@ -127,7 +127,7 @@
                 {
                     "name": "Secondary",
                     "numberTurns": 2,
-                    "numberParallels": 6,
+                    "numberParallels": 2,
                     "isolationSide": "secondary",
                     "wire": "Litz 100x0.14 - Grade 1 - Single Served"
                 }
