@@ -127,7 +127,7 @@
             }
         },
         "coil": {
-            "bobbin": "RM 12",
+            "bobbin": "Bobbin RM 12",
             "functionalDescription": [
                 {
                     "name": "Primary",

@@ -116,7 +116,7 @@
             }
         },
         "coil": {
-            "bobbin": "E 42/21/15",
+            "bobbin": "Basic",
             "functionalDescription": [
                 {
                     "name": "Primary",

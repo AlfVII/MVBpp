@@ -86,25 +86,7 @@
             }
         },
         "coil": {
-            "bobbin": {
-                "processedDescription": {
-                    "wallThickness": 0,
-                    "columnThickness": 0,
-                    "columnDepth": 0.01,
-                    "columnShape": "round",
-                    "windingWindows": [
-                        {
-                            "height": 0.01,
-                            "width": 0.00525,
-                            "coordinates": [
-                                0.00987,
-                                0,
-                                0
-                            ]
-                        }
-                    ]
-                }
-            },
+            "bobbin": "Basic",
             "functionalDescription": [
                 {
                     "name": "Winding 1",

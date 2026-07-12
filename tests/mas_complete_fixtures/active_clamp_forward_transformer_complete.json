@@ -115,7 +115,7 @@
             }
         },
         "coil": {
-            "bobbin": "RM 14/20",
+            "bobbin": "Bobbin RM 14/20",
             "functionalDescription": [
                 {
                     "name": "Primary",
