@@ -363,9 +363,14 @@ static TopoDS_Shape build_concentric_rect_column_turn(double radial_pos, double 
     // inward along the corner diagonal — the straights stay tangent at their exact MAS
     // positions and the arc still meets them. Geometrically infeasible data throws instead
     // of silently repositioning the turn.
+    // Minimum feasible corner radius: the swept corner self-intersects when the arc radius
+    // is smaller than the profile's RADIAL half-extent — wire_width/2 for rectangular/foil
+    // wire (the width lies radially in the racetrack; a foil bends about its thin axis), the
+    // wire radius for round wire. max(w,h)/2 would wrongly reject foil windings whose HEIGHT
+    // is large but which bend trivially.
     double turn_turn_radius = clearance;
     double corner_inset = 0.0;
-    double min_bend = std::max(wire_width, wire_height) / 2.0 * 1.02;
+    double min_bend = (rect_wire ? wire_width / 2.0 : wire_radius) * 1.02;
     if (turn_turn_radius < min_bend) {
         corner_inset = min_bend - clearance;
         turn_turn_radius = min_bend;
