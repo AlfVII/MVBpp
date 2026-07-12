@@ -1005,6 +1005,15 @@ static TopoDS_Shape build_concentric_oblong_turn(double radial_pos, double wire_
     return comp;
 }
 
+std::pair<double, double> TurnBuilder::wireDimensions(const MAS::Wire& wire, bool paintCoating) {
+    MAS::Turn contextlessTurn;   // no per-turn dimensions: the wire's own data decides
+    return get_wire_dimensions(wire, contextlessTurn, paintCoating);
+}
+
+TopoDS_Shape TurnBuilder::fuseSolids(const TopoDS_Shape& compound) {
+    return fuse_turn_solids(compound);
+}
+
 TopoDS_Shape TurnBuilder::buildTurn(const MAS::Turn& turn,
                                     const MAS::Wire& wire,
                                     const MAS::CoreBobbinProcessedDescription& bobbin,

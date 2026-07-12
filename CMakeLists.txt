@@ -238,6 +238,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/Symmetry.cpp
     src/Utils.cpp
     src/TurnBuilder.cpp
+    src/ConductorBuilder.cpp
     src/BobbinBuilder.cpp
     src/shapes/ShapeBuilder.cpp
     src/shapes/ShapeE.cpp
@@ -292,6 +293,7 @@ add_executable(mvb_tests
     tests/test_toroidal_topview.cpp
     tests/test_toroidal_single_turn_centered.cpp
     tests/test_oblong_planar_turn.cpp
+    tests/test_real_winding.cpp
     tests/test_section_projection.cpp
 )
 
@@ -378,6 +380,10 @@ add_custom_command(TARGET mvb_tests POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E create_symlink
         ${CMAKE_CURRENT_SOURCE_DIR}/../MVB/tests/testData
         ${CMAKE_CURRENT_BINARY_DIR}/testData
-    COMMENT "Linking MVB testData"
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/tests
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/realwinding_fixtures
+        ${CMAKE_CURRENT_BINARY_DIR}/tests/realwinding_fixtures
+    COMMENT "Linking MVB testData and MVB++ realwinding fixtures"
 )
 

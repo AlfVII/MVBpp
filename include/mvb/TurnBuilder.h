@@ -3,6 +3,7 @@
 #include "MAS.hpp"
 #include "mvb/Utils.h"
 #include <TopoDS_Shape.hxx>
+#include <utility>
 #include <vector>
 
 namespace mvb {
@@ -48,6 +49,15 @@ public:
     static TopoDS_Shape buildFromTurnAlone(const MAS::Turn& turn,
                                             int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                             bool paintCoating = true);
+
+    // Resolve the wire cross-section {width, height} without a Turn context (outer
+    // footprint or copper per paintCoating). Used by ConductorBuilder, which sweeps whole
+    // conductors instead of per-turn solids. Throws on missing wire data (no fallbacks).
+    static std::pair<double, double> wireDimensions(const MAS::Wire& wire, bool paintCoating);
+
+    // Fuse all SOLIDs of a compound into one — the same routine the per-turn fuse toggle
+    // uses; exposed for ConductorBuilder's per-conductor compounds.
+    static TopoDS_Shape fuseSolids(const TopoDS_Shape& compound);
 
     static void clearCache();
 };

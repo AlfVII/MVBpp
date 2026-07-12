@@ -24,10 +24,12 @@ static void printUsage(const char* prog) {
               << "  -o, --output <path>   Output STEP file path\n"
               << "  -d, --output-dir <dir> Output directory (batch mode)\n"
               << "  --no-mkf              Skip MKF enrichment\n"
+              << "  --real                Real winding: continuous conductor per (winding, parallel)\n"
               << "  -h, --help            Show this help\n";
 }
 
-static bool processFile(const fs::path& inputPath, const fs::path& outputPath, bool useMkf) {
+static bool processFile(const fs::path& inputPath, const fs::path& outputPath, bool useMkf,
+                        bool useRealWinding) {
     try {
         // Read JSON
         std::ifstream f(inputPath);
@@ -58,7 +60,13 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
         const int symmetryPlanes       = 0;
 
         std::string result;
-        if (useMkf) {
+        if (useRealWinding) {
+            // Real winding requires the MKF wind (turn blocking on); no fallback.
+            auto enriched = mvb::magnetic_autocomplete_safe(magnetic, true);
+            mvb::DrawConfig cfg{format, includeBobbin, scale, symmetryPlanes};
+            cfg.useRealWindingGeometry = true;
+            result = builder.drawMagnetic(enriched, outputPath.parent_path().string(), cfg);
+        } else if (useMkf) {
             try {
                 // Use MVB++'s safe MKF wrapper to avoid Coil::wind() crashes on raw MAS files
                 auto enriched = mvb::magnetic_autocomplete_safe(magnetic);
@@ -104,6 +112,7 @@ int main(int argc, char* argv[]) {
     fs::path outputPath;
     fs::path outputDir;
     bool useMkf = true;
+    bool useRealWinding = false;
     
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
@@ -118,6 +127,8 @@ int main(int argc, char* argv[]) {
             if (++i < argc) outputDir = argv[i];
         } else if (arg == "--no-mkf") {
             useMkf = false;
+        } else if (arg == "--real") {
+            useRealWinding = true;
         } else if (arg[0] != '-') {
             inputPath = arg;
         }
@@ -136,6 +147,6 @@ int main(int argc, char* argv[]) {
         outputPath = dir / (inputPath.stem().string() + "_mvbpp.step");
     }
     
-    bool success = processFile(inputPath, outputPath, useMkf);
+    bool success = processFile(inputPath, outputPath, useMkf, useRealWinding);
     return success ? 0 : 1;
 }

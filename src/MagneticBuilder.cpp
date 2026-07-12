@@ -4,6 +4,7 @@
 #include "mvb/Utils.h"
 #include "mvb/shapes/ShapeBuilder.h"
 #include "mvb/TurnBuilder.h"
+#include "mvb/ConductorBuilder.h"
 #include "mvb/BobbinBuilder.h"
 #include "mvb/FR4Builder.h"
 #include "constructive_models/Magnetic.h"
@@ -192,7 +193,9 @@ std::string MagneticBuilder::drawMagnetic(const MAS::Magnetic& magnetic,
                                            const DrawConfig& cfg) const {
     auto named = buildAllNamed(magnetic, cfg.includeBobbin, cfg.symmetryPlanes,
                                cfg.wirePolygonSegments, cfg.corePolygonSegments,
-                               cfg.paintCoating);
+                               cfg.paintCoating, /*emitCoatingShells=*/false,
+                               /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                               cfg.useRealWindingGeometry);
     return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale);
 }
 
@@ -214,7 +217,9 @@ std::string MagneticBuilder::drawMagnetic(const OpenMagnetics::Magnetic& magneti
                                            const DrawConfig& cfg) const {
     auto named = buildAllNamed(magnetic, cfg.includeBobbin, cfg.symmetryPlanes,
                                cfg.wirePolygonSegments, cfg.corePolygonSegments,
-                               cfg.paintCoating);
+                               cfg.paintCoating, /*emitCoatingShells=*/false,
+                               /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                               cfg.useRealWindingGeometry);
     return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale);
 }
 
@@ -561,7 +566,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                                                          bool paintCoating,
                                                          bool emitCoatingShells,
                                                          bool includeInsulation,
-                                                         double coreCoatingThickness) const {
+                                                         double coreCoatingThickness,
+                                                         bool useRealWindingGeometry) const {
     // MAS 1.x makes Magnetic.core / Magnetic.coil optional, but this builder
     // requires both present. The generated getters return the optional BY VALUE,
     // so bind COPIES (not references — a reference would dangle past the temporary).
@@ -571,6 +577,13 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
     // autocomplete and use the pre-enriched data directly.
     auto geoOpt = core.get_geometrical_description();
     if (geoOpt && geoOpt.has_value() && !geoOpt->empty()) {
+        if (useRealWindingGeometry) {
+            throw std::runtime_error(
+                "buildAllNamed: useRealWindingGeometry requires MKF to (re-)wind the magnetic, "
+                "but the input already carries a geometricalDescription — pass the raw "
+                "functional design instead (caller-provided turn positions are never "
+                "silently re-interpreted)");
+        }
         // Build directly from MAS types — no MKF enrichment needed.
         auto all = buildCoreNamed(core, corePolygonSegments);
 
@@ -626,10 +639,10 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
         return apply_symmetry(std::move(all), symmetryPlanes);
     }
 
-    OpenMagnetics::Magnetic enriched = magnetic_autocomplete_safe(magnetic);
+    OpenMagnetics::Magnetic enriched = magnetic_autocomplete_safe(magnetic, useRealWindingGeometry);
     return buildAllNamed(enriched, includeBobbin, symmetryPlanes,
                          wirePolygonSegments, corePolygonSegments, paintCoating, emitCoatingShells,
-                         includeInsulation, coreCoatingThickness);
+                         includeInsulation, coreCoatingThickness, useRealWindingGeometry);
 }
 
 std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
@@ -640,7 +653,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                                          bool paintCoating,
                                                          bool emitCoatingShells,
                                                          bool includeInsulation,
-                                                         double coreCoatingThickness) const {
+                                                         double coreCoatingThickness,
+                                                         bool useRealWindingGeometry) const {
     auto all = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
 
     if (coreCoatingThickness > 0.0) {   // conformal core-coating shells (offset core - core)
@@ -652,10 +666,35 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         for (auto& c : coatings) all.push_back(std::move(c));
     }
 
-    // Build turns ONCE, then reuse for both bobbin-cutting and the final assembly.
+    // Build the winding solids ONCE, then reuse for both bobbin-cutting and the assembly.
+    // Real winding: one continuous conductor per (winding, parallel) replaces the per-turn
+    // closed loops; positions come verbatim from the MKF-wound coil.
     std::vector<std::string> turnNames;
-    auto turnShapes = buildTurnsImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(
-        magnetic.get_coil(), magnetic.get_core(), &turnNames, wirePolygonSegments, paintCoating, emitCoatingShells);
+    std::vector<TopoDS_Shape> turnShapes;
+    if (useRealWindingGeometry) {
+        auto bobbinPd = getBobbinProcessed(magnetic.get_coil());
+        patchBobbinDimensions(bobbinPd, magnetic.get_core());
+        const bool toroidalCore = isCoreToroidal(magnetic.get_core());
+        ConductorBuilder::Options copts;
+        copts.wirePolygonSegments = wirePolygonSegments;
+        auto emitConductors = [&](bool coat, const std::string& suffix) {
+            copts.paintCoating = coat;
+            for (auto& ns : ConductorBuilder::buildAll(magnetic.get_coil(), bobbinPd,
+                                                       toroidalCore, copts)) {
+                turnShapes.push_back(ns.shape);
+                turnNames.push_back(ns.name + suffix);
+            }
+        };
+        if (emitCoatingShells) {
+            emitConductors(false, "");           // bare copper conductor
+            emitConductors(true, " coating");    // outer insulated footprint
+        } else {
+            emitConductors(paintCoating, "");
+        }
+    } else {
+        turnShapes = buildTurnsImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(
+            magnetic.get_coil(), magnetic.get_core(), &turnNames, wirePolygonSegments, paintCoating, emitCoatingShells);
+    }
 
     if (includeBobbin) {
         auto bobbin = buildBobbinNamed(magnetic.get_coil(), magnetic.get_core(), corePolygonSegments);

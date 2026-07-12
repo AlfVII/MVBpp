@@ -28,6 +28,9 @@ struct DrawConfig {
     // false → turns drawn at the CONDUCTING (copper) diameter — required for
     //         FEM winding-loss meshing (LITZ → bare bundle as a solid).
     bool        paintCoating           = true;
+    // true → real winding: ONE continuous conductor per (winding, parallel) instead of
+    //        independent per-turn loops; MKF enriches with real-winding turn blocking on.
+    bool        useRealWindingGeometry = false;
 };
 
 class MagneticBuilder {
@@ -104,6 +107,11 @@ public:
     // includeInsulation: also emit INSULATION-layer solids ("insulation_layer_<i>") for the
     // inter-layer/inter-section tape, when they carry real thickness (zero-thickness placeholders
     // are skipped). For thermal FEA -- a low-k conduction barrier between windings.
+    // useRealWindingGeometry: replace the per-turn closed loops with ONE continuous copper
+    // body per (winding, parallel) ("<winding> parallel <k>", ConductorBuilder), enriching
+    // through MKF with its real-winding turn blocking on. A magnetic that already carries a
+    // geometricalDescription THROWS with the flag on — MKF must (re-)wind; caller-provided
+    // turn positions are never silently re-interpreted.
     std::vector<NamedShape> buildAllNamed(const MAS::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
@@ -112,7 +120,8 @@ public:
                                           bool paintCoating = true,
                                           bool emitCoatingShells = false,
                                           bool includeInsulation = false,
-                                          double coreCoatingThickness = 0.0) const;
+                                          double coreCoatingThickness = 0.0,
+                                          bool useRealWindingGeometry = false) const;
     std::vector<NamedShape> buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
@@ -123,7 +132,8 @@ public:
                                           bool includeInsulation = false,
                                           // >0: build the core's insulating coating as a conformal
                                           // shell solid ("<core> coating") of this thickness [m].
-                                          double coreCoatingThickness = 0.0) const;
+                                          double coreCoatingThickness = 0.0,
+                                          bool useRealWindingGeometry = false) const;
 
     // ---- Standalone builders for the unified bindings API -----------------
     //

@@ -237,8 +237,17 @@ std::string core_shape_family_to_string(MAS::CoreShapeFamily family) {
     return "unknown";
 }
 
-OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneticJson) {
+OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneticJson,
+                                                   bool useRealWindingGeometry) {
     using json = nlohmann::json;
+
+    // Flip MKF's real-winding setting for the duration of the enrichment only
+    // (exception-safe; restores the previous value on every path out of this function).
+    OpenMagnetics::SettingsGuard<bool> realWindingGuard(
+        OpenMagnetics::Settings::GetInstance(),
+        &OpenMagnetics::Settings::get_coil_use_real_winding_geometry,
+        &OpenMagnetics::Settings::set_coil_use_real_winding_geometry,
+        useRealWindingGeometry);
 
     json coreJson = magneticJson.contains("core") ? magneticJson.at("core") : json::object();
 
@@ -342,10 +351,11 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
     return enriched;
 }
 
-OpenMagnetics::Magnetic magnetic_autocomplete_safe(const MAS::Magnetic& magnetic) {
+OpenMagnetics::Magnetic magnetic_autocomplete_safe(const MAS::Magnetic& magnetic,
+                                                   bool useRealWindingGeometry) {
     json j;
     to_json(j, magnetic);
-    return magnetic_autocomplete_safe(j);
+    return magnetic_autocomplete_safe(j, useRealWindingGeometry);
 }
 
 bool is_shape_usable(const TopoDS_Shape& shape) {

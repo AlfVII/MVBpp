@@ -78,8 +78,15 @@ void patch_dimension_nominals(nlohmann::json& j);
 // This avoids object-slicing and Coil::wind() crashes for raw MAS files
 // (e.g. with "Basic" bobbins) by constructing OpenMagnetics::Coil with
 // windInConstructor=false before calling MKF enrichment.
-OpenMagnetics::Magnetic magnetic_autocomplete_safe(const MAS::Magnetic& magnetic);
-OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneticJson);
+//
+// useRealWindingGeometry flips MKF's Settings::set_coil_use_real_winding_geometry for the
+// duration of the enrichment (exception-safe RAII guard), so Coil::wind() places turns
+// with connection-lead turn blocking — the positions ConductorBuilder then honours
+// verbatim. Default false = byte-identical legacy behaviour.
+OpenMagnetics::Magnetic magnetic_autocomplete_safe(const MAS::Magnetic& magnetic,
+                                                   bool useRealWindingGeometry = false);
+OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneticJson,
+                                                   bool useRealWindingGeometry = false);
 
 // Helpers for cutting bobbin with cores/turns to match Python MVB behavior
 bool is_shape_usable(const TopoDS_Shape& shape);
