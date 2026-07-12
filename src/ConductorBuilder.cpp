@@ -36,6 +36,24 @@ constexpr double kTwoPi = 2.0 * std::numbers::pi;
 // Adjacent MKF slots are exactly one wire OD apart, so contact is normal; only
 // penetration beyond numeric fuzz is a collision.
 constexpr double kContactTol = 1e-7;
+// Curved primitives are collision-checked as sampled polylines; the sampling step is
+// chosen so each chord sags inward by at most this fraction of the wire radius. The same
+// bound is granted back as contact allowance in the gate (a chord can under-report the
+// true curve-to-curve distance by exactly this much per side).
+constexpr double kMaxSagFraction = 0.02;
+// Terminal stubs of neighbouring ranks are spaced this many wire ODs apart in arc length
+// (one OD would be touching; half an OD of daylight keeps distinct leads distinct).
+constexpr double kStubSpacingODs = 1.5;
+// Arc length (in wire ODs) a layer-jump crossover consumes: it must span at least its own
+// wire (1 OD) to ride over the wrap start below, plus the same again to come down.
+constexpr double kCrossoverArcODs = 2.0;
+// Hard cap on the crossover arc so thick-wire/small-core combinations degrade into a
+// visible error (via the gate) instead of a quarter-toroid of diagonal wire.
+constexpr double kMaxCrossoverArc = kPi / 4.0;
+// The bulge ramps outside the plateau re-approach the layer radius; their width is a
+// shape choice (any positive width clears, since the wrap is already one OD away
+// axially by the plateau edge — see the bulge derivation at the call site).
+constexpr double kBulgeRampFraction = 0.3;
 
 // Azimuth convention (OCCT right-handed rotation about +Y, the column axis):
 //   pos(r, y, az) = (r cos az, y, -r sin az)
@@ -68,6 +86,12 @@ struct Primitive {
     Seg seg{};
     Spiral spiral{};
     std::string label;                 // for collision diagnostics
+    // Electrical turn ordinal this primitive belongs to (entrance lead = first turn's,
+    // exit lead = last turn's). A continuous wire legitimately contacts itself only
+    // between CONSECUTIVE turns (spring wraps resting on each other, crossovers riding
+    // the wrap below); the gate exempts same-conductor pairs with |ordinal diff| <= 1
+    // and checks everything farther apart.
+    size_t turnOrdinal = 0;
 };
 struct ConductorPath {
     std::string name;
@@ -106,7 +130,7 @@ double segSegDistance(const gp_Pnt& p1, const gp_Pnt& q1, const gp_Pnt& p2, cons
 
 // Sample step so the polyline's chord sag keeps the capsule check honest.
 int curveSampleCount(double radius, double azSpan, double wireRadius) {
-    double maxSag = std::max(1e-6, 0.02 * wireRadius);
+    double maxSag = std::max(1e-6, kMaxSagFraction * wireRadius);
     double stepAz = (radius > 1e-12)
                         ? 2.0 * std::acos(std::clamp(1.0 - maxSag / radius, 0.0, 1.0))
                         : std::max(azSpan, 1e-3);
@@ -184,13 +208,25 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
         for (size_t cj = ci; cj < paths.size(); ++cj) {
             const auto& A = paths[ci];
             const auto& B = paths[cj];
-            double minGap = A.wireRadius + B.wireRadius - kContactTol;
+            // Grant the sampling sag back as contact allowance (each polyline can sit up
+            // to kMaxSagFraction*wireRadius inside its true curve), or exact-contact
+            // pairs — bulge plateau over a crossed turn, layers exactly one OD apart —
+            // false-positive by microns.
+            double sagAllowance = kMaxSagFraction * (A.wireRadius + B.wireRadius);
+            double minGap = A.wireRadius + B.wireRadius - sagAllowance - kContactTol;
             for (size_t i = 0; i < A.prims.size(); ++i) {
-                // Same conductor: skip self and path-adjacent primitives (shared joints).
-                size_t jStart = (ci == cj) ? i + 2 : 0;
+                size_t jStart = (ci == cj) ? i + 1 : 0;
                 for (size_t j = jStart; j < B.prims.size(); ++j) {
                     const auto& pa = A.prims[i];
                     const auto& pb = B.prims[j];
+                    // Same conductor: consecutive turns of a spring legitimately touch
+                    // (wraps resting on each other, crossovers riding the wrap below);
+                    // farther-apart turns must genuinely clear.
+                    if (ci == cj &&
+                        (pa.turnOrdinal > pb.turnOrdinal ? pa.turnOrdinal - pb.turnOrdinal
+                                                         : pb.turnOrdinal - pa.turnOrdinal) <= 1) {
+                        continue;
+                    }
                     if (pa.kind == Primitive::ARC && pb.kind == Primitive::ARC &&
                         arcsClearlyApart(pa.arc, pb.arc, minGap)) {
                         continue;
@@ -432,50 +468,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // p*w/sqrt(w^2 + (K*p)^2); solving for >= one OD gives the minimum window width.
         // Tight-packed layers (p ~ OD) admit no straight-chord crossover at any width —
         // MKF's real-mode SPREAD alignment avoids that; we throw loudly if it reaches us.
-        double pMin = std::numeric_limits<double>::max();   // axial slot pitch (intra ramps)
-        double dMin = std::numeric_limits<double>::max();   // radial layer spacing (jumps)
-        for (size_t idx : idxs) {
-            const auto& ts = conductors[idx].turns;
-            for (size_t i = 0; i + 1 < ts.size(); ++i) {
-                double dy = std::abs(ts[i + 1]->get_coordinates().at(1) -
-                                     ts[i]->get_coordinates().at(1));
-                double dr = std::abs(ts[i + 1]->get_coordinates().at(0) -
-                                     ts[i]->get_coordinates().at(0));
-                if (dr <= od / 2.0 && dy > 1e-12) pMin = std::min(pMin, dy);
-                if (dr > od / 2.0) dMin = std::min(dMin, dr);
-            }
-        }
-        auto crossoverNeed = [&](double spacing, const char* what) {
-            if (spacing <= 1.02 * od) {
-                throw std::runtime_error(
-                    "ConductorBuilder: winding '" + windingEntry.first + "' " + what + " " +
-                    std::to_string(spacing) + " m is within 2% of the wire OD " +
-                    std::to_string(od) +
-                    " m — no straight-chord crossover clears tight packing "
-                    "(MKF real-winding SPREAD alignment avoids this; see MKF ABT #187)");
-            }
-            // A chord of run w departing a circle at offset `spacing` keeps clearance
-            // spacing*w/sqrt(spacing^2 + w^2) — solve >= od for w.
-            return od * spacing / std::sqrt(spacing * spacing - od * od);
-        };
-        double windowLen = 3.0 * od;
-        if (pMin < std::numeric_limits<double>::max()) {
-            windowLen = std::max(windowLen,
-                                 1.1 * static_cast<double>(K) * crossoverNeed(pMin, "slot pitch"));
-        }
-        if (dMin < std::numeric_limits<double>::max()) {
-            windowLen = std::max(windowLen, 1.5 * crossoverNeed(dMin, "layer spacing"));
-        }
-        // Layer jumps get their own band BEFORE the window: a jump and the landing
-        // station's final wrap legitimately touch at their junction (the real crossover
-        // contact — a shared endpoint, exempted below), which no shared-window straight
-        // chord can achieve without penetrating the landing wire's end corner.
-        const double jumpBandLen = 1.5 * od * static_cast<double>(K);
-        const double s = 1.5 * od / rMin;
-        const double windowAng = windowLen / rMin;
-        const double jumpBandAng = jumpBandLen / rMin;
-        const double delta =
-            2.0 * (static_cast<double>(K) + 1.0) * s + jumpBandAng + windowAng;
+        // Spring model: EVERY move to the next station — intra-layer advance AND layer
+        // jump — is a one-wrap SPIRAL whose pitch/radius change is spread progressively
+        // over the full 360 degrees, starting exactly at the turn's MKF station (real
+        // multi-start spring geometry; parallels are parallel starts that never converge).
+        // No crossover window is needed; the seam sector holds only the terminal stub
+        // bands: [exit stubs | entrance stubs]. Consecutive wraps touch near the seam by
+        // ~pitch*delta/2pi — the physical spring contact — as ADJACENT path primitives
+        // (exempt); everything else must genuinely clear or the gate throws.
+        const double s = kStubSpacingODs * od / rMin;
+        const double delta = 2.0 * (static_cast<double>(K) + 1.0) * s;
         if (delta > 2.0 * kPi / 3.0) {
             throw std::runtime_error(
                 "ConductorBuilder: seam sector for winding '" + windingEntry.first +
@@ -483,10 +485,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 " deg (> 120 deg) — wire too thick relative to the innermost turn radius");
         }
         double sectorStart = seamAz - delta / 2.0;   // conductor arrives here (azimuth grows)
-        double sectorEnd = seamAz + delta / 2.0;     // arcs resume here
-        double jumpBandStart = sectorStart + (static_cast<double>(K) + 1.0) * s;
-        double windowStart = jumpBandStart + jumpBandAng;
-        double windowEnd = windowStart + windowAng;
+        double sectorEnd = seamAz + delta / 2.0;     // turns start/resume here
 
         // Lead planning pre-pass. A stub crossing another parallel's slot heights must do
         // so where that parallel's coverage has already ended (exit side) or not yet begun
@@ -545,11 +544,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             leads[k].inRank = inRank;
             leads[k].outRank = outRank;
         }
-        auto exitStubAz = [&](size_t rank) {
-            return sectorStart + (static_cast<double>(rank) + 1.0) * s;
-        };
+        // Exit band directly BEFORE the entrance band (both near the sector end): the exit
+        // spiral's previous wrap then sits nearly a full pitch above the entrance runs —
+        // the widest vertical clearance the spring geometry allows.
         auto entranceStubAz = [&](size_t rank) {
             return sectorEnd - (static_cast<double>(rank) + 1.0) * s;
+        };
+        auto exitStubAz = [&](size_t rank) {
+            return sectorEnd - (static_cast<double>(K + rank) + 1.0) * s;
         };
 
         for (size_t k = 0; k < K; ++k) {
@@ -597,91 +599,127 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
             }
 
+            // Wrap phase: every turn passes its exact MKF station at azimuth `phase`.
+            // Intra-layer spirals keep the phase; each layer jump advances it by the
+            // crossover bump's arc, exactly like a real winding where the crossover
+            // consumes a little azimuth.
+            double phase = sectorEnd;
             for (size_t i = 0; i < turns.size(); ++i) {
                 auto [r, y] = station(turns[i]);
-                // The on-station arc: the exact MKF turn position, spanning everything
-                // outside the seam sector.
-                path.prims.push_back({Primitive::ARC, {r, y, sectorEnd, kTwoPi - delta}, {}, {},
-                                      "turn '" + turns[i]->get_name() + "'"});
-
-                if (i + 1 == turns.size()) break;
-                auto [rN, yN] = station(turns[i + 1]);
-
-                bool layerJump = std::abs(rN - r) > od / 2.0;
-                // Departure precedes arrival azimuthally at every station, so the wire
-                // never wraps past 360 degrees at one station. Ramps cross in the shared
-                // window; layer jumps cross in the dedicated jump band — landing at the
-                // window start, exactly where the landing station's final wrap will later
-                // end (a legitimate touching junction, exempted as a shared endpoint).
-                double a0 = layerJump ? jumpBandStart : windowStart;
-                double a1 = layerJump ? windowStart : windowEnd;
-                if (a0 - sectorStart > 1e-9) {
-                    path.prims.push_back({Primitive::ARC, {r, y, sectorStart, a0 - sectorStart},
-                                          {}, {}, "pre-connector turn " + std::to_string(i)});
-                }
-                if (layerJump && std::abs(yN - y) > od) {
-                    // Tall jump — radial-first staircase: hop to the destination radius AT
-                    // the departure height (the departure slot's own circle shares the
-                    // start point), then climb at the destination radius. Heights crossed
-                    // by the climb lie strictly between departure and landing, where the
-                    // destination layer has no slots yet (it fills away from its first
-                    // slot). The climb converges tangentially onto the landing wire at the
-                    // shared junction (real crossover contact, exempted below). Anything
-                    // else genuinely collides and throws.
-                    double aH = a0 + std::min(0.35 * (a1 - a0),
-                                              std::max(0.2 * (a1 - a0), od / rMin));
-                    Primitive hop;
-                    hop.kind = Primitive::SPIRAL;
-                    hop.spiral = {r, y, a0, rN, y, aH};
-                    hop.label = "layer jump hop " + std::to_string(i);
-                    path.prims.push_back(std::move(hop));
-                    Primitive climb;
-                    climb.kind = Primitive::SPIRAL;
-                    climb.spiral = {rN, y, aH, rN, yN, a1};
-                    climb.label = "layer jump climb " + std::to_string(i);
-                    path.prims.push_back(std::move(climb));
-                } else if (layerJump) {
-                    // Near-horizontal jump (U-turnaround): single diagonal ending exactly
-                    // at the landing point, where the landing station's final wrap will
-                    // later terminate — a touching junction (shared endpoint, exempted).
-                    Primitive jump;
-                    jump.kind = Primitive::SPIRAL;
-                    jump.spiral = {r, y, a0, rN, yN, a1};
-                    jump.label = "layer jump " + std::to_string(i);
-                    path.prims.push_back(std::move(jump));
+                if (i + 1 < turns.size()) {
+                    auto [rN, yN] = station(turns[i + 1]);
+                    bool layerJump = std::abs(rN - r) > od / 2.0;
+                    if (!layerJump) {
+                        // Intra-layer advance: one-wrap spiral from this turn's exact MKF
+                        // station to the next slot (real spring geometry). Where the wrap
+                        // crosses another parallel's LAST (flat) turn at the same radius,
+                        // it bulges radially outward by one wire OD over a short arc — the
+                        // classic multifilar crossover riding over the finished turn.
+                        struct Cross { double az; };
+                        std::vector<Cross> crossings;
+                        for (size_t j = 0; j < K; ++j) {
+                            if (j == k) continue;
+                            const auto& lj = leads[j];
+                            if (std::abs(lj.rL - r) > od / 2.0) continue;
+                            // A "crossing" nearer than half a wire to either endpoint is
+                            // the junction itself (source/destination slot), not a wire
+                            // to ride over.
+                            double lo = std::min(y, yN) + od / 2.0;
+                            double hi = std::max(y, yN) - od / 2.0;
+                            if (lj.yL <= lo || lj.yL >= hi) continue;
+                            double frac = (lj.yL - y) / (yN - y);
+                            crossings.push_back({phase + kTwoPi * frac});
+                        }
+                        std::sort(crossings.begin(), crossings.end(),
+                                  [](const Cross& a, const Cross& b) { return a.az < b.az; });
+                        // Trapezoid bulge profile: full +OD plateau while the wrap is
+                        // within one OD of the crossed turn's height (half-width
+                        // od/slope), plus short entry/exit ramps — anything narrower
+                        // leaves a sub-OD pinch at the bulge foot.
+                        double slope = std::abs(yN - y) / kTwoPi;
+                        // Plateau half-width: the wrap is within one wire envelope of the
+                        // crossed turn while |dy| < od + sampling sag; outside it the
+                        // axial gap alone clears, so any ramp width works.
+                        double clearDy = od + kMaxSagFraction * 2.0 * wireRadius;
+                        double wPlateau = (slope > 1e-12) ? clearDy / slope : kTwoPi;
+                        double wRamp = kBulgeRampFraction * wPlateau;
+                        auto heightAt = [&](double az) {
+                            return y + (yN - y) * (az - phase) / kTwoPi;
+                        };
+                        double azCur = phase;
+                        double rCur = r;
+                        size_t part = 0;
+                        auto pushSpiral = [&](double azTo, double rTo, const char* what) {
+                            azTo = std::min(azTo, phase + kTwoPi);
+                            if (azTo - azCur < 1e-9) { rCur = rTo; return; }
+                            Primitive pr;
+                            pr.kind = Primitive::SPIRAL;
+                            pr.spiral = {rCur, heightAt(azCur), azCur,
+                                         rTo, heightAt(azTo), azTo};
+                            pr.label = "turn '" + turns[i]->get_name() + "' (" + what +
+                                       " " + std::to_string(part++) + ")";
+                            pr.turnOrdinal = i;
+                            path.prims.push_back(std::move(pr));
+                            azCur = azTo;
+                            rCur = rTo;
+                        };
+                        for (const auto& cx : crossings) {
+                            if (cx.az - wPlateau - wRamp < azCur - 1e-9 ||
+                                cx.az + wPlateau + wRamp > phase + kTwoPi + 1e-9) {
+                                throw std::runtime_error(
+                                    "ConductorBuilder: multifilar crossover bulge for turn '" +
+                                    turns[i]->get_name() +
+                                    "' does not fit within one wrap (pitch too small "
+                                    "relative to the wire OD) — see MKF ABT #187");
+                            }
+                            pushSpiral(cx.az - wPlateau - wRamp, r, "helical");
+                            pushSpiral(cx.az - wPlateau, r + od, "crossover ramp");
+                            pushSpiral(cx.az + wPlateau, r + od, "crossover plateau");
+                            pushSpiral(cx.az + wPlateau + wRamp, r, "crossover ramp");
+                        }
+                        pushSpiral(phase + kTwoPi, rN, "helical");
+                    } else {
+                        // Layer jump: full flat wrap at the exact station, then an
+                        // azimuth-local crossover riding over the wrap's own start
+                        // (adjacent primitives — the physical crossover contact): first
+                        // ALL the radius at constant height, then the height climb at the
+                        // full destination radius — one layer clear of every slot it
+                        // crosses. The crossover advances the wrap phase.
+                        double bumpAng = std::min(kCrossoverArcODs * od / rMin, kMaxCrossoverArc);
+                        path.prims.push_back({Primitive::ARC, {r, y, phase, kTwoPi}, {}, {},
+                                              "turn '" + turns[i]->get_name() + "'", i});
+                        Primitive bumpR;
+                        bumpR.kind = Primitive::SPIRAL;
+                        bumpR.spiral = {r, y, phase, rN, y, phase + bumpAng / 2.0};
+                        bumpR.label = "turn '" + turns[i]->get_name() + "' (crossover radial)";
+                        bumpR.turnOrdinal = i;
+                        path.prims.push_back(std::move(bumpR));
+                        Primitive bumpY;
+                        bumpY.kind = Primitive::SPIRAL;
+                        bumpY.spiral = {rN, y, phase + bumpAng / 2.0, rN, yN, phase + bumpAng};
+                        bumpY.label = "turn '" + turns[i]->get_name() + "' (crossover climb)";
+                        bumpY.turnOrdinal = i;
+                        path.prims.push_back(std::move(bumpY));
+                        phase += bumpAng;
+                    }
                 } else {
-                    Primitive ramp;
-                    ramp.kind = Primitive::SPIRAL;
-                    ramp.spiral = {r, y, a0, rN, yN, a1};
-                    ramp.label = "turn ramp " + std::to_string(i);
-                    path.prims.push_back(std::move(ramp));
-                }
-                if (sectorEnd - a1 > 1e-9) {
-                    path.prims.push_back({Primitive::ARC, {rN, yN, a1, sectorEnd - a1}, {}, {},
-                                          "post-connector turn " + std::to_string(i + 1)});
+                    // Last turn: one full flat wrap at the exact station. The exit then
+                    // continues the spring from the wrap's end (see exit block below).
+                    path.prims.push_back({Primitive::ARC, {r, y, phase, kTwoPi}, {}, {},
+                                          "turn '" + turns[i]->get_name() + "'", i});
                 }
             }
 
-            // Exit: connector from the last arc end to the exit stub, vertical stub to the
-            // nearest edge, then a radial edge run out to the window border.
+            // Exit: MKF's own convention for an end that crosses nothing radially — leave
+            // straight OUTWARD at the last turn's own axial level, exactly where the
+            // final wrap ends (parallels' runs stack one slot pitch apart vertically).
+            // MKF's terminal blocking reserves the crossed-layer slots when the end is
+            // not outermost; the gate verifies.
             {
-                bool bottomOut = leads[k].outBottom;
-                double yEdge = bottomOut ? window.yBottom + wireRadius : window.yTop - wireRadius;
-                double yRun = (std::abs(yL - yEdge) < od) ? yL : yEdge;
-                double az = exitStubAz(leads[k].outRank);
                 double rBorder = window.rOuter - wireRadius;
-                if (az - sectorStart > 1e-9) {
-                    path.prims.push_back({Primitive::ARC, {rL, yL, sectorStart, az - sectorStart},
-                                          {}, {}, "exit connector"});
-                }
-                if (std::abs(yL - yRun) > 1e-9) {
-                    path.prims.push_back({Primitive::SEG, {},
-                                          {azPoint(rL, yL, az), azPoint(rL, yRun, az)}, {},
-                                          "exit stub"});
-                }
                 path.prims.push_back({Primitive::SEG, {},
-                                      {azPoint(rL, yRun, az), azPoint(rBorder, yRun, az)}, {},
-                                      "exit edge run"});
+                                      {azPoint(rL, yL, phase), azPoint(rBorder, yL, phase)},
+                                      {}, "exit run", turns.size() - 1});
             }
 
             // Window-bounds check on synthesized points (the arcs sit on exact MKF
