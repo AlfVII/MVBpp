@@ -165,10 +165,11 @@ set(_MKF_BIN "${CMAKE_BINARY_DIR}/_deps/mkf-build")
 FetchContent_Declare(
     MKF
     GIT_REPOSITORY "${_MKF_LOCAL}"
-    # Pinned to MKF main @ 028b3b9c, which is the prior main + a header-only addition
-    # exposing get_wire_insulation_relative_permittivity (used by OMFEM's electrostatic
-    # mesh). Same MAS-main compatibility as the previous main HEAD. Bump alongside MAS.
-    GIT_TAG        028b3b9c
+    # Track MKF main (in lockstep with the MAS-main pin above). The header-only
+    # get_wire_insulation_relative_permittivity that OMFEM's electrostatic mesh needs is
+    # now upstreamed on main (StrayCapacitance.h), so the old 028b3b9c pin is no longer
+    # needed; pinning it against MAS-main caused a quicktype schema-skew codegen failure.
+    GIT_TAG        main
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
