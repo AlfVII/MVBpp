@@ -430,15 +430,14 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
     if (solids == 1) REQUIRE(!hasSelfIntersections(conductor->shape));
 }
 
-TEST_CASE("Real winding: multi-layer toroidal throws on MKF's sub-OD ring packing",
-          "[realwinding]") {
-    // A spread 3-winding toroidal CMC with MULTIPLE layers per 120-degree section.
-    // MKF stacks different rings' OUTER crossings under one wire OD apart at the outer
-    // wall (0.4 mm radial for a 0.959 mm OD wire) — physically two wires in one wire's
-    // space, with no room for the corner swing into the under-core return (MKF ABT #231).
-    // The collision gate must refuse loudly; nothing is moved to "make it fit". The
-    // single-LAYER spread CMC (realwinding_cmc_3w_1layer) builds cleanly — no ring
-    // transitions, no rim packing.
+TEST_CASE("Real winding: OVER-PACKED multi-layer toroidal throws", "[realwinding]") {
+    // A spread 3-winding toroidal CMC with 38 turns of 0.9 mm wire per 120-degree
+    // section — MKF packs that many turns so tightly that the inner crossings sit under
+    // one wire OD apart (the turns physically overlap, MKF ABT #231). The collision gate
+    // must refuse loudly; nothing is moved to "make it fit". A FEASIBLE multilayer CMC
+    // (realwinding_cmc_3w_2layer, 18 turns of 1.4 mm wire = a comfortable 2 rings per
+    // section) builds cleanly — see the demo — once the outer-crossing radial stack is
+    // corrected and the ring returns are depth-staggered under the core.
     auto magneticJson = loadFixture("realwinding_cmc_3w.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
 
