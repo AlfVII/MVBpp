@@ -1,0 +1,26 @@
+{
+  "magnetic": {
+    "coil": {
+      "bobbin": "Dummy",
+      "functionalDescription": [
+        {
+          "isolationSide": "primary",
+          "name": "Primary",
+          "numberParallels": 1,
+          "numberTurns": 65,
+          "wire": "Round 2.00 - Grade 1"
+        }
+      ]
+    },
+    "core": {
+      "functionalDescription": {
+        "gapping": [],
+        "material": "HF 60",
+        "numberStacks": 1,
+        "shape": "T 40/24/16",
+        "type": "toroidal"
+      },
+      "name": "custom"
+    }
+  }
+}

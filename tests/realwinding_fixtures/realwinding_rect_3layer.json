@@ -1,0 +1,47 @@
+{
+  "magnetic": {
+    "coil": {
+      "bobbin": {
+        "processedDescription": {
+          "columnDepth": 0.005974999999999999,
+          "columnShape": "rectangular",
+          "columnThickness": 0.0013999999999999993,
+          "columnWidth": 0.005999999999999999,
+          "coordinates": [0, 0, 0],
+          "wallThickness": 0.0012499999999999994,
+          "windingWindows": [
+            {
+              "area": 0.0001148,
+              "coordinates": [0.008799999999999999, 0, 0],
+              "height": 0.0205,
+              "sectionsAlignment": "centered",
+              "sectionsOrientation": "overlapping",
+              "shape": "rectangular",
+              "width": 0.0056,
+              "windingOrder": "U"
+            }
+          ]
+        }
+      },
+      "functionalDescription": [
+        {
+          "isolationSide": "primary",
+          "name": "Primary",
+          "numberParallels": 1,
+          "numberTurns": 45,
+          "wire": "Round 0.90 - Grade 1"
+        }
+      ]
+    },
+    "core": {
+      "functionalDescription": {
+        "gapping": [],
+        "material": "3C97",
+        "numberStacks": 1,
+        "shape": "E 32/16/9",
+        "type": "twoPieceSet"
+      },
+      "name": "custom"
+    }
+  }
+}

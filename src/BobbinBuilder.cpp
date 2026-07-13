@@ -36,7 +36,6 @@ static TopoDS_Shape makeRoundedRectPrism(double w, double d, double h,
                                          double r, double zBottom) {
     const double hw = w / 2.0, hd = d / 2.0;
     const double rmax = std::min(hw, hd);
-    if (r > rmax - 1e-9) r = rmax - 1e-9;
     if (r <= 1e-9 || hw <= 0.0 || hd <= 0.0) {
         gp_Pnt corner(-hw, -hd, zBottom);
         return BRepPrimAPI_MakeBox(corner, w, d, h).Shape();
@@ -47,6 +46,32 @@ static TopoDS_Shape makeRoundedRectPrism(double w, double d, double h,
         gp_Circ c(gp_Ax2(gp_Pnt(cx, cy, 0.0), gp_Dir(0, 0, 1)), r);
         return BRepBuilderAPI_MakeEdge(c, a1, a2).Edge();
     };
+    if (r >= rmax - 1e-7) {
+        // Full rounding: a STADIUM (oblong columns) — two half-circle caps joined by
+        // two straights along the long axis — or a plain circle when square. The
+        // general path below would leave sub-tolerance straight edges.
+        r = rmax;
+        BRepBuilderAPI_MakeWire sw;
+        if (std::abs(hw - hd) < 1e-9) {
+            gp_Circ c(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), r);
+            sw.Add(BRepBuilderAPI_MakeEdge(c).Edge());
+        } else if (hd > hw) {   // long axis Y
+            double sh = hd - hw;
+            sw.Add(line(gp_Pnt(hw, -sh, 0), gp_Pnt(hw, sh, 0)));
+            sw.Add(arc(0, sh, 0.0, pi));
+            sw.Add(line(gp_Pnt(-hw, sh, 0), gp_Pnt(-hw, -sh, 0)));
+            sw.Add(arc(0, -sh, pi, 2.0 * pi));
+        } else {                // long axis X
+            double sh = hw - hd;
+            sw.Add(arc(sh, 0, -pi / 2.0, pi / 2.0));
+            sw.Add(line(gp_Pnt(sh, hd, 0), gp_Pnt(-sh, hd, 0)));
+            sw.Add(arc(-sh, 0, pi / 2.0, 3.0 * pi / 2.0));
+            sw.Add(line(gp_Pnt(-sh, -hd, 0), gp_Pnt(sh, -hd, 0)));
+        }
+        TopoDS_Face face = BRepBuilderAPI_MakeFace(sw.Wire()).Face();
+        TopoDS_Shape prism = BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, h)).Shape();
+        return translate_shape(prism, 0.0, 0.0, zBottom);
+    }
     BRepBuilderAPI_MakeWire wire;
     wire.Add(line(gp_Pnt(hw, -(hd - r), 0), gp_Pnt(hw, hd - r, 0)));    // right
     wire.Add(arc(hw - r, hd - r, 0.0, pi / 2));                          // top-right
@@ -178,8 +203,14 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         // overlap it. Only for true RECTANGULAR columns; round/oblong/irregular
         // pass r=0 (box).
         const bool roundCorners = (bobbin.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
-        const double rOuter = roundCorners ? 0.25 * std::min(outerWidth, outerDepth) : 0.0;
-        const double rInner = 0.0;  // bore matches the (square) core column
+        // OBLONG columns get a true STADIUM tube and bore (full rounding on the short
+        // axis), matching the stadium core column; rectangular keeps the moulding
+        // radius on the outside and a square bore.
+        const bool oblong = (bobbin.get_column_shape() == MAS::ColumnShape::OBLONG);
+        const double rOuter = oblong ? 0.5 * std::min(outerWidth, outerDepth)
+                              : roundCorners ? 0.25 * std::min(outerWidth, outerDepth)
+                                             : 0.0;
+        const double rInner = oblong ? 0.5 * std::min(holeWidth, holeDepth) : 0.0;
 
         TopoDS_Shape outer = makeRoundedRectPrism(outerWidth, outerDepth, height, rOuter, -height / 2.0);
         TopoDS_Shape central = makeRoundedRectPrism(holeWidth, holeDepth, height + 2.0 * eps, rInner, -height / 2.0 - eps);

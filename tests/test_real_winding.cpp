@@ -430,6 +430,53 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
     if (solids == 1) REQUIRE(!hasSelfIntersections(conductor->shape));
 }
 
+TEST_CASE("Real winding: multi-layer toroidal throws on MKF's sub-OD ring packing",
+          "[realwinding]") {
+    // A spread 3-winding toroidal CMC with MULTIPLE layers per 120-degree section.
+    // MKF stacks different rings' OUTER crossings under one wire OD apart at the outer
+    // wall (0.4 mm radial for a 0.959 mm OD wire) — physically two wires in one wire's
+    // space, with no room for the corner swing into the under-core return (MKF ABT #231).
+    // The collision gate must refuse loudly; nothing is moved to "make it fit". The
+    // single-LAYER spread CMC (realwinding_cmc_3w_1layer) builds cleanly — no ring
+    // transitions, no rim packing.
+    auto magneticJson = loadFixture("realwinding_cmc_3w.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+
+    mvb::MagneticBuilder builder;
+    REQUIRE_THROWS_WITH(
+        builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                              mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
+                              /*useRealWindingGeometry=*/true),
+        Catch::Matchers::ContainsSubstring("collision"));
+}
+
+TEST_CASE("Real winding: single-layer spread 3-winding toroidal CMC builds clean",
+          "[realwinding]") {
+    auto magneticJson = loadFixture("realwinding_cmc_3w_1layer.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, false, 0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       /*corePolygonSegments=*/0, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+
+    // One continuous conductor per winding (three windings, each spread over its own
+    // ~120-degree arc), all fully independent copper bodies.
+    const char* names[] = {"Primary parallel 0", "Secondary parallel 0",
+                           "Tertiary parallel 0"};
+    std::vector<const mvb::NamedShape*> conductors;
+    for (const char* n : names) conductors.push_back(findConductor(named, n));
+    for (size_t i = 0; i < conductors.size(); ++i)
+        for (size_t j = i + 1; j < conductors.size(); ++j) {
+            double v = commonVolume(conductors[i]->shape, conductors[j]->shape);
+            INFO("winding-winding overlap '" << names[i] << "' vs '" << names[j]
+                                             << "' = " << v);
+            REQUIRE(v <= 1e-12);
+        }
+    requireNoPairwiseOverlap(named, 1e-12);
+}
+
 TEST_CASE("Real winding: pre-enriched input with the flag on throws", "[realwinding]") {
     auto magneticJson = loadFixture("realwinding_round_U.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, false);
