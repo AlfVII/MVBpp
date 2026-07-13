@@ -17,6 +17,8 @@
 #include <gp_Dir.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
+#include <BOPAlgo_CheckerSI.hxx>
+#include <TopTools_ListOfShape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <gp_Pnt.hxx>
@@ -54,6 +56,33 @@ bool pointInsideShape(const TopoDS_Shape& shape, const gp_Pnt& p, double tol = 1
         if (cls.State() == TopAbs_IN || cls.State() == TopAbs_ON) return true;
     }
     return false;
+}
+
+// Exact OCCT self-intersection check on the emitted body. Consecutive-wrap CONTACT is by
+// design (a spring); only genuine face-face interference counts. When the conductor is a
+// fused/swept single solid, any residual self-intersection is a modelling defect.
+bool hasSelfIntersections(const TopoDS_Shape& s) {
+    BOPAlgo_CheckerSI checker;
+    TopTools_ListOfShape args;
+    args.Append(s);
+    checker.SetArguments(args);
+    checker.Perform();
+    return checker.HasErrors();
+}
+
+// All-pairs boolean interference among named bodies (skipping the bobbin, which is
+// deliberately cut to yield). Tolerance covers polygon-facet slivers of the cores.
+void requireNoPairwiseOverlap(const std::vector<mvb::NamedShape>& named, double tol) {
+    for (size_t i = 0; i < named.size(); ++i) {
+        if (named[i].name.find("Bobbin") != std::string::npos) continue;
+        for (size_t j = i + 1; j < named.size(); ++j) {
+            if (named[j].name.find("Bobbin") != std::string::npos) continue;
+            double v = commonVolume(named[i].shape, named[j].shape);
+            INFO("pairwise overlap '" << named[i].name << "' vs '" << named[j].name
+                                      << "' = " << v);
+            REQUIRE(v <= tol);
+        }
+    }
 }
 
 } // namespace
@@ -107,16 +136,20 @@ TEST_CASE("Real winding: single-parallel PQ33 becomes one continuous conductor",
         REQUIRE(dist.Value() <= 1e-9);
     }
 
-    // Conductor never intersects the core. Tolerance 1e-10 m^3: the cores are polygon-
-    // faceted approximations (the facets dip inside the true round window bore), so
-    // micron-sliver grazes at the window border are render artifacts, not collisions —
-    // same class the [battery] suite tolerates at 1e-7.
-    for (const auto& ns : named) {
-        if (&ns == conductor || ns.name.find("Bobbin") != std::string::npos) continue;
-        if (ns.name == "Primary parallel 0") continue;
-        double v = commonVolume(conductor->shape, ns.shape);
-        INFO("overlap of conductor vs " << ns.name << " = " << v);
-        REQUIRE(v <= 1e-10);
+    // "Absolutely no body collides with another or itself":
+    // (a) all-pairs boolean interference across every emitted body (tolerance 1e-10 m^3
+    //     for the cores' polygon-facet slivers — same class [battery] tolerates at 1e-7);
+    // (b) exact OCCT self-intersection check when the conductor fused to a single solid.
+    //     When OCCT's tangent-contact fuse defect forces the per-run compound fallback,
+    //     the consecutive pieces legitimately overlap at their junctions (the wire's own
+    //     crossovers) — for that case the capsule gate + station probes + (a) are the
+    //     collision guarantee.
+    requireNoPairwiseOverlap(named, 1e-10);
+    int conductorSolids = 0;
+    for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
+        ++conductorSolids;
+    if (conductorSolids == 1) {
+        REQUIRE(!hasSelfIntersections(conductor->shape));
     }
 }
 
@@ -159,10 +192,17 @@ TEST_CASE("Real winding: two parallels become two independent conductors", "[rea
     REQUIRE(shapeVolume(p0->shape) > 0.0);
     REQUIRE(shapeVolume(p1->shape) > 0.0);
 
-    // Parallel conductors are fully independent copper bodies: zero overlap (contact only).
+    // Parallel conductors are fully independent copper bodies: zero overlap (contact only),
+    // no pairwise interference anywhere, and no self-intersections when fused single.
     double v = commonVolume(p0->shape, p1->shape);
     INFO("parallel-parallel common volume = " << v);
     REQUIRE(v <= 1e-12);
+    requireNoPairwiseOverlap(named, 1e-10);
+    for (const mvb::NamedShape* c : {p0, p1}) {
+        int solids = 0;
+        for (TopExp_Explorer exp(c->shape, TopAbs_SOLID); exp.More(); exp.Next()) ++solids;
+        if (solids == 1) REQUIRE(!hasSelfIntersections(c->shape));
+    }
 }
 
 TEST_CASE("Real winding: multi-parallel LAYER JUMPS throw until MKF reserves a corridor",
