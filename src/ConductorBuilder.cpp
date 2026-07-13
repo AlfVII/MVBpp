@@ -15,6 +15,13 @@
 #include <BRepLib.hxx>
 #include <GCE2d_MakeSegment.hxx>
 #include <Geom_CylindricalSurface.hxx>
+#include <Geom_ConicalSurface.hxx>
+#include <Geom_Plane.hxx>
+#include <Geom_Surface.hxx>
+#include <Geom2dAPI_Interpolate.hxx>
+#include <Geom2d_BSplineCurve.hxx>
+#include <TColgp_HArray1OfPnt2d.hxx>
+#include <gp_Vec2d.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
 #include <GeomAPI_PointsToBSpline.hxx>
 #include <GeomAPI_Interpolate.hxx>
@@ -36,6 +43,8 @@
 #include <gp_XY.hxx>
 #include <gp_XYZ.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
 #include <BOPAlgo_GlueEnum.hxx>
@@ -369,65 +378,120 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius) {
             return TopoDS_Edge();
         }
     }
-    if (pr.kind == Primitive::SPIRAL && !pr.spiral.blend &&
-        std::abs(pr.spiral.r1 - pr.spiral.r0) < 1e-12) {
-        gp_Pnt2d p0(pr.spiral.az0, pr.spiral.y0);
-        gp_Pnt2d p1(pr.spiral.az1, pr.spiral.y1);
+    if (pr.kind == Primitive::SPIRAL) {
+        // Every spiral lives on an ANALYTIC surface of revolution about its vertical
+        // axis: a cylinder when the radius is constant, a cone otherwise (radius and
+        // height share the blend factor, so the (r, y) trace is a straight meridian).
+        // Building the edge as a 2D curve in the surface's (U = azimuth, V) parameter
+        // space (+ BRepLib::BuildCurves3d) is the one construction OCCT's pipe-shell
+        // sweeps reliably — free-form interpolated 3D splines, though positionally
+        // tight, produce unbounded surface flares when swept.
+        const Spiral& sp = pr.spiral;
+        double dr = sp.r1 - sp.r0;
+        double dy = sp.y1 - sp.y0;
+        bool constantRadius = std::abs(dr) < 1e-12;
+        if (constantRadius || std::abs(dy) > 1e-12) {
+            try {
+                // Frame with U measured from +X toward -Z — exactly the azPointC()
+                // convention: P(U,V) matches (cx + r cos U, y, cz - r sin U).
+                gp_Ax3 axis(gp_Pnt(sp.cx, sp.y0, sp.cz), gp_Dir(0, 1, 0),
+                            gp_Dir(1, 0, 0));
+                Handle(Geom_Surface) surf;
+                double v1;   // V at the end (V = 0 at the start)
+                if (constantRadius) {
+                    axis.SetLocation(gp_Pnt(sp.cx, 0, sp.cz));
+                    surf = new Geom_CylindricalSurface(axis, sp.r0);
+                    // Cylinder V is plain height.
+                    v1 = dy;
+                } else {
+                    double alpha = std::atan(dr / dy);
+                    surf = new Geom_ConicalSurface(axis, alpha, sp.r0);
+                    v1 = dy / std::cos(alpha);
+                }
+                double v0 = constantRadius ? sp.y0 : 0.0;
+                TopoDS_Edge e;
+                if (!sp.blend) {
+                    Handle(Geom2d_TrimmedCurve) seg2d =
+                        GCE2d_MakeSegment(gp_Pnt2d(sp.az0, v0),
+                                          gp_Pnt2d(sp.az1, v0 + v1)).Value();
+                    e = BRepBuilderAPI_MakeEdge(seg2d, surf).Edge();
+                } else {
+                    // Cosine blend of V over U — end tangents purely azimuthal, so the
+                    // junctions into the neighbouring on-station geometry are exact.
+                    int n = curveSampleCount(std::max(sp.r0, sp.r1),
+                                             std::abs(sp.az1 - sp.az0), wireRadius);
+                    Handle(TColgp_HArray1OfPnt2d) arr =
+                        new TColgp_HArray1OfPnt2d(1, n);
+                    for (int i = 0; i < n; ++i) {
+                        double t = static_cast<double>(i) / (n - 1);
+                        double f = 0.5 * (1.0 - std::cos(kPi * t));
+                        arr->SetValue(i + 1, gp_Pnt2d(sp.az0 + (sp.az1 - sp.az0) * t,
+                                                      v0 + v1 * f));
+                    }
+                    Geom2dAPI_Interpolate interp(arr, Standard_False, 1e-12);
+                    interp.Load(gp_Vec2d(1, 0), gp_Vec2d(1, 0), Standard_True);
+                    interp.Perform();
+                    if (!interp.IsDone() || interp.Curve().IsNull())
+                        return TopoDS_Edge();
+                    e = BRepBuilderAPI_MakeEdge(interp.Curve(), surf).Edge();
+                }
+                BRepLib::BuildCurves3d(e);
+                return e;
+            } catch (const Standard_Failure&) {
+                return TopoDS_Edge();
+            }
+        }
+        // Flat spiral (radius varies at constant height): falls through to the sampled
+        // interpolation below.
+    }
+    if (pr.kind == Primitive::BLEND) {
+        // The S-blend is PLANAR (the longitudinal direction and the offset span one
+        // plane), so it too builds as a 2D cosine in an analytic surface's parameter
+        // space — the pipe-reliable construction (see the spiral comment above).
+        const Blend& bl = pr.blendc;
+        gp_XYZ d = bl.b.XYZ() - bl.a.XYZ();
+        double L = d.Dot(bl.u);
+        gp_XYZ perp = d - bl.u * L;
+        double perpM = perp.Modulus();
+        if (L < 1e-12) return TopoDS_Edge();
+        if (perpM < 1e-12) return BRepBuilderAPI_MakeEdge(bl.a, bl.b).Edge();
         try {
-            // Cylinder about the vertical axis through (cx, cz) with U measured from +X
-            // toward -Z — exactly the azPointC() convention:
-            // P(U,V) = (cx + R cos U, V, cz - R sin U).
-            gp_Ax3 axis(gp_Pnt(pr.spiral.cx, 0, pr.spiral.cz), gp_Dir(0, 1, 0),
-                        gp_Dir(1, 0, 0));
-            Handle(Geom_CylindricalSurface) cyl =
-                new Geom_CylindricalSurface(axis, pr.spiral.r0);
-            Handle(Geom2d_TrimmedCurve) seg2d = GCE2d_MakeSegment(p0, p1).Value();
-            TopoDS_Edge e = BRepBuilderAPI_MakeEdge(seg2d, cyl).Edge();
+            gp_Ax3 frame(bl.a, gp_Dir(bl.u.Crossed(perp)), gp_Dir(bl.u));
+            Handle(Geom_Plane) plane = new Geom_Plane(frame);
+            // Plane P(U,V) = O + U*XDir + V*YDir with XDir = u, YDir = axis x XDir =
+            // unit(perp).
+            double stepL = 2.0 * std::sqrt(std::max(
+                1e-18, 4.0 * L * L / (kPi * kPi * perpM) *
+                           std::max(1e-6, kMaxSagFraction * wireRadius)));
+            int n = std::clamp(static_cast<int>(std::ceil(L / stepL)) + 1, 8, 512);
+            Handle(TColgp_HArray1OfPnt2d) arr = new TColgp_HArray1OfPnt2d(1, n);
+            for (int i = 0; i < n; ++i) {
+                double t = static_cast<double>(i) / (n - 1);
+                arr->SetValue(i + 1, gp_Pnt2d(L * t,
+                                              perpM * 0.5 * (1.0 - std::cos(kPi * t))));
+            }
+            Geom2dAPI_Interpolate interp(arr, Standard_False, 1e-12);
+            interp.Load(gp_Vec2d(1, 0), gp_Vec2d(1, 0), Standard_True);
+            interp.Perform();
+            if (!interp.IsDone() || interp.Curve().IsNull()) return TopoDS_Edge();
+            TopoDS_Edge e = BRepBuilderAPI_MakeEdge(interp.Curve(), plane).Edge();
             BRepLib::BuildCurves3d(e);
             return e;
         } catch (const Standard_Failure&) {
             return TopoDS_Edge();
         }
     }
-    if (pr.kind == Primitive::SPIRAL && pr.spiral.blend &&
-        std::abs(pr.spiral.r1 - pr.spiral.r0) < 1e-12 &&
-        std::abs(pr.spiral.y1 - pr.spiral.y0) < 1e-12) {
-        // A blend with nothing to blend is an exact helix arc.
-        Primitive plain = pr;
-        plain.spiral.blend = false;
-        return primEdge(plain, wireRadius);
-    }
-    // Radius-varying spirals and blends: interpolated BSpline through the sampled
-    // centreline WITH EXACT END TANGENTS — an approximated spline's end tangent misses
-    // by enough that OCCT's pipe-shell treats the junction as a corner and flares.
+    // Flat varying-radius spiral at constant height (no analytic surface of revolution
+    // advances there): approximated BSpline through the sampled centreline.
     auto pts = samplePrim(pr, wireRadius);
     if (pts.size() < 2) return TopoDS_Edge();
-    gp_Vec t0, t1;
-    if (pr.kind == Primitive::BLEND) {
-        t0 = gp_Vec(pr.blendc.u);
-        t1 = gp_Vec(pr.blendc.u);
-    } else {
-        // Spiral tangent d/daz at the ends; for blended spirals the radial/vertical
-        // rates vanish there, leaving the pure azimuthal direction.
-        const Spiral& sp = pr.spiral;
-        double span = sp.az1 - sp.az0;
-        double drdaz = sp.blend ? 0.0 : (sp.r1 - sp.r0) / span;
-        double dydaz = sp.blend ? 0.0 : (sp.y1 - sp.y0) / span;
-        t0 = gp_Vec(drdaz * std::cos(sp.az0) - sp.r0 * std::sin(sp.az0), dydaz,
-                    -drdaz * std::sin(sp.az0) - sp.r0 * std::cos(sp.az0));
-        t1 = gp_Vec(drdaz * std::cos(sp.az1) - sp.r1 * std::sin(sp.az1), dydaz,
-                    -drdaz * std::sin(sp.az1) - sp.r1 * std::cos(sp.az1));
-    }
     try {
-        Handle(TColgp_HArray1OfPnt) arr =
-            new TColgp_HArray1OfPnt(1, static_cast<Standard_Integer>(pts.size()));
+        TColgp_Array1OfPnt arr(1, static_cast<Standard_Integer>(pts.size()));
         for (size_t i = 0; i < pts.size(); ++i)
-            arr->SetValue(static_cast<Standard_Integer>(i + 1), pts[i]);
-        GeomAPI_Interpolate interp(arr, Standard_False, 1e-12);
-        interp.Load(t0, t1, /*Scale=*/Standard_True);
-        interp.Perform();
-        if (!interp.IsDone() || interp.Curve().IsNull()) return TopoDS_Edge();
-        return BRepBuilderAPI_MakeEdge(interp.Curve()).Edge();
+            arr.SetValue(static_cast<Standard_Integer>(i + 1), pts[i]);
+        Handle(Geom_BSplineCurve) bs = GeomAPI_PointsToBSpline(arr).Curve();
+        if (bs.IsNull()) return TopoDS_Edge();
+        return BRepBuilderAPI_MakeEdge(bs).Edge();
     } catch (const Standard_Failure&) {
         return TopoDS_Edge();
     }
