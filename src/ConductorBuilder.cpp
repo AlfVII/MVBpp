@@ -441,8 +441,8 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius) {
                 return TopoDS_Edge();
             }
         }
-        // Flat spiral (radius varies at constant height): falls through to the sampled
-        // interpolation below.
+        // Flat spiral (radius varies at exactly constant height — no cone advances
+        // there): falls through to the sampled BSpline below.
     }
     if (pr.kind == Primitive::BLEND) {
         // The S-blend is PLANAR (the longitudinal direction and the offset span one
@@ -481,8 +481,8 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius) {
             return TopoDS_Edge();
         }
     }
-    // Flat varying-radius spiral at constant height (no analytic surface of revolution
-    // advances there): approximated BSpline through the sampled centreline.
+    // Flat varying-radius spirals at exactly constant height: approximated BSpline
+    // through the sampled centreline.
     auto pts = samplePrim(pr, wireRadius);
     if (pts.size() < 2) return TopoDS_Edge();
     try {
@@ -742,6 +742,26 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
             // Per-primitive sweeps for this span (arcs revolve exactly).
             run = sweepPiecewise(ptrs.data() + b, e - b, path.wireRadius,
                                  wirePolygonSegments);
+        }
+        if (std::getenv("MVB_DEBUG_RUNS") && !run.IsNull()) {
+            Bnd_Box bb;
+            // Optimal bounds: the default Bnd_Box of a swept BSpline surface is its
+            // control-point hull, up to ~2.5x larger than the actual surface.
+            BRepBndLib::AddOptimal(run, bb, Standard_False, Standard_False);
+            double x0, y0, z0, x1, y1, z1;
+            bb.Get(x0, y0, z0, x1, y1, z1);
+            Bnd_Box sb;
+            for (size_t k = b; k < e; ++k)
+                for (const auto& q : samplePrim(*ptrs[k], path.wireRadius)) sb.Add(q);
+            double sx0, sy0, sz0, sx1, sy1, sz1;
+            sb.Get(sx0, sy0, sz0, sx1, sy1, sz1);
+            double excess = std::max({sx0 - x0, sy0 - y0, sz0 - z0,
+                                      x1 - sx1, y1 - sy1, z1 - sz1}) - path.wireRadius;
+            if (excess > 1e-4) {
+                std::cerr << "RUN FLARE [" << b << "," << e << ") first=["
+                          << ptrs[b]->label << "] last=[" << ptrs[e - 1]->label
+                          << "] excess " << excess << " m\n";
+            }
         }
         if (!run.IsNull()) builder.Add(compound, run);
     }
