@@ -1010,6 +1010,12 @@ std::pair<double, double> TurnBuilder::wireDimensions(const MAS::Wire& wire, boo
     return get_wire_dimensions(wire, contextlessTurn, paintCoating);
 }
 
+std::pair<double, double> TurnBuilder::wireDimensions(const MAS::Wire& wire,
+                                                      const MAS::Turn& turn,
+                                                      bool paintCoating) {
+    return get_wire_dimensions(wire, turn, paintCoating);
+}
+
 TopoDS_Shape TurnBuilder::fuseSolids(const TopoDS_Shape& compound) {
     return fuse_turn_solids(compound);
 }

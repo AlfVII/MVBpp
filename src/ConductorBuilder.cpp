@@ -17,8 +17,11 @@
 #include <Geom_CylindricalSurface.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
 #include <GeomAPI_PointsToBSpline.hxx>
+#include <GeomAPI_Interpolate.hxx>
 #include <Geom_BSplineCurve.hxx>
 #include <TColgp_Array1OfPnt.hxx>
+#include <TColgp_HArray1OfPnt.hxx>
+#include <gp_Vec.hxx>
 #include <BRep_Builder.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Wire.hxx>
@@ -30,6 +33,8 @@
 #include <gp_Pnt.hxx>
 #include <gp_Pnt2d.hxx>
 #include <gp_Dir.hxx>
+#include <gp_XY.hxx>
+#include <gp_XYZ.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
@@ -41,9 +46,11 @@
 #include <Standard_Failure.hxx>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <numbers>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -62,47 +69,77 @@ constexpr double kContactTol = 1e-7;
 // bound is granted back as contact allowance in the gate.
 constexpr double kMaxSagFraction = 0.02;
 // The connection plane ("connections radial, 90 degrees from the turns, in the YZ
-// plane"). MKF's 2D winding-window cross-section maps into 3D at this azimuth:
-// 2D (x = radial, y = axial) -> 3D (0, y, -x). Every turn starts/ends here; every drawn
-// ConnectionReservedSpace rectangle (the pink/blue boxes of the Painter SVG) is replayed
-// here verbatim — nothing is invented.
+// plane"). MKF's 2D winding-window cross-section maps into 3D on the -Z side of the
+// column: 2D (x = radial, y = axial) -> 3D (0, y, -(x + zoff)), where zoff = 0 for round
+// columns and columnDepth - columnWidth for rectangular/oblong ones (the same clearance
+// past the column lands the wire deeper on the Z faces than on the X faces). Every
+// crossing sits on this plane; every drawn ConnectionReservedSpace rectangle (the
+// pink/blue boxes of the Painter SVG) is replayed here verbatim — nothing is invented.
 constexpr double kPlaneAz = kPi / 2.0;
 
-// Azimuth convention (OCCT right-handed rotation about +Y, the column axis):
-//   pos(r, y, az) = (r cos az, y, -r sin az)
-gp_Pnt azPoint(double r, double y, double az) {
-    return gp_Pnt(r * std::cos(az), y, -r * std::sin(az));
+// Azimuth convention (OCCT right-handed rotation about +Y, the column axis), generalised
+// to a vertical axis through the horizontal point (cx, cz):
+//   pos(r, y, az) = (cx + r cos az, y, cz - r sin az)
+gp_Pnt azPointC(double cx, double cz, double r, double y, double az) {
+    return gp_Pnt(cx + r * std::cos(az), y, cz - r * std::sin(az));
 }
-gp_Pnt planePoint(double radial, double axial) {
-    return azPoint(radial, axial, kPlaneAz);
+
+// Rodrigues rotation of v about the unit axis by ang.
+gp_XYZ rotateXYZ(const gp_XYZ& v, const gp_XYZ& axisUnit, double ang) {
+    return v * std::cos(ang) + axisUnit.Crossed(v) * std::sin(ang) +
+           axisUnit * (axisUnit.Dot(v) * (1.0 - std::cos(ang)));
 }
 
 // ---------------------------------------------------------------------------------------
-// Path model. ARC = open ring at a station (full wrap, no height change); SPIRAL = helical
-// wrap or bulge piece; SEG = straight connection segment in the YZ plane (from MKF's
-// drawn reserved-space rectangles).
-struct Arc {
-    double r = 0, y = 0;
-    double azStart = 0, azSweep = 0;
-};
+// Path model.
+//   SEG    — straight segment (leads, racetrack faces, toroidal tubes and chords).
+//   ARC3   — exact circular arc about an arbitrary axis: P(t) = c + rot(axis, t)·v0 for
+//            t in [0, sweep] (racetrack corners, oblong caps, toroidal elbows).
+//   SPIRAL — spiral about a VERTICAL axis through (cx, cz): azimuth linear in the
+//            parameter, radius/height linear (round-column wraps) or cosine-blended
+//            (blend=true, oblong cap ramps) so the end tangents are purely azimuthal.
+//   BLEND  — S-curve between two points whose tangent is parallel to a common direction
+//            at BOTH ends (the rectangular-column transition ramp): the lateral offset
+//            follows a cosine blend, so the chain stays tangent-continuous through the
+//            crossings while passing EXACTLY through them. (A straight ramp leaves
+//            ~15-degree kinks at its junctions; OCCT's pipe-shell corner transitions
+//            flare unboundedly on such kinks — observed: 9 mm spikes.)
 struct Seg {
     gp_Pnt a, b;
 };
+struct Arc3 {
+    gp_Pnt c;            // arc centre
+    gp_XYZ axis{0, 1, 0};  // unit rotation axis (right-handed sweep)
+    gp_XYZ v0{0, 0, 0};    // centre -> start vector, |v0| = bend radius
+    double sweep = 0;
+};
 struct Spiral {
+    double cx = 0, cz = 0;   // vertical axis position
     double r0 = 0, y0 = 0, az0 = 0;
     double r1 = 0, y1 = 0, az1 = 0;
+    bool blend = false;      // cosine-blend r/y (end tangents purely azimuthal)
+};
+struct Blend {
+    gp_Pnt a, b;
+    gp_XYZ u{1, 0, 0};       // unit tangent direction at both ends
 };
 struct Primitive {
-    enum Kind { ARC, SEG, SPIRAL } kind = ARC;
-    Arc arc{};
+    enum Kind { SEG, ARC3, SPIRAL, BLEND } kind = SEG;
     Seg seg{};
+    Arc3 arc{};
     Spiral spiral{};
+    Blend blendc{};
     std::string label;
     // Electrical turn ordinal this primitive belongs to (entrance lead = first turn's,
-    // exit lead = last turn's, links = the source turn's). A continuous wire legitimately
-    // contacts itself only between CONSECUTIVE turns; the gate exempts same-conductor
-    // pairs with |ordinal diff| <= 1 and checks everything farther apart.
+    // exit lead = last turn's). A continuous wire legitimately contacts itself only
+    // between CONSECUTIVE turns; the gate exempts same-conductor pairs with
+    // |ordinal diff| <= 1 and checks everything farther apart.
     size_t turnOrdinal = 0;
+    // Lead primitives are the replayed MKF connection routes. Emission splits runs at
+    // lead<->wrap boundaries: those junctions are the only 90-degree corners of the path
+    // (wrap chains are tangent-continuous), and OCCT's pipe-shell mitre flares unboundedly
+    // across them, while lead chains sweep robustly as exact cylinders + sphere elbows.
+    bool isLead = false;
 };
 struct ConductorPath {
     std::string name;
@@ -150,14 +187,38 @@ int curveSampleCount(double radius, double azSpan, double wireRadius) {
 
 std::vector<gp_Pnt> samplePrim(const Primitive& p, double wireRadius) {
     if (p.kind == Primitive::SEG) return {p.seg.a, p.seg.b};
-    if (p.kind == Primitive::ARC) {
-        const Arc& a = p.arc;
-        int n = curveSampleCount(a.r, a.azSweep, wireRadius);
+    if (p.kind == Primitive::ARC3) {
+        const Arc3& a = p.arc;
+        double radius = a.v0.Modulus();
+        int n = curveSampleCount(radius, std::abs(a.sweep), wireRadius);
         std::vector<gp_Pnt> pts;
         pts.reserve(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
-            double az = a.azStart + a.azSweep * i / (n - 1);
-            pts.push_back(azPoint(a.r, a.y, az));
+            double t = a.sweep * i / (n - 1);
+            pts.push_back(gp_Pnt(a.c.XYZ() + rotateXYZ(a.v0, a.axis, t)));
+        }
+        return pts;
+    }
+    if (p.kind == Primitive::BLEND) {
+        const Blend& bl = p.blendc;
+        gp_XYZ d = bl.b.XYZ() - bl.a.XYZ();
+        double L = d.Dot(bl.u);
+        gp_XYZ perp = d - bl.u * L;
+        double perpM = perp.Modulus();
+        if (perpM < 1e-12) return {bl.a, bl.b};
+        // Peak curvature of the cosine blend: kappa = perp * pi^2 / (2 L^2); sample with
+        // the same sag rule as the arcs, on the tightest osculating radius.
+        double rMin = 2.0 * L * L / (kPi * kPi * perpM);
+        double maxSag = std::max(1e-6, kMaxSagFraction * wireRadius);
+        double step = 2.0 * std::sqrt(std::max(1e-18, 2.0 * rMin * maxSag));
+        double arcLen = std::sqrt(L * L + perpM * perpM) * 1.1;
+        int n = std::clamp(static_cast<int>(std::ceil(arcLen / step)) + 1, 8, 512);
+        std::vector<gp_Pnt> pts;
+        pts.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            double t = static_cast<double>(i) / (n - 1);
+            pts.push_back(gp_Pnt(bl.a.XYZ() + bl.u * (L * t) +
+                                 perp * (0.5 * (1.0 - std::cos(kPi * t)))));
         }
         return pts;
     }
@@ -167,15 +228,14 @@ std::vector<gp_Pnt> samplePrim(const Primitive& p, double wireRadius) {
     pts.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
         double t = static_cast<double>(i) / (n - 1);
-        pts.push_back(azPoint(sp.r0 + (sp.r1 - sp.r0) * t, sp.y0 + (sp.y1 - sp.y0) * t,
-                              sp.az0 + (sp.az1 - sp.az0) * t));
+        double f = sp.blend ? 0.5 * (1.0 - std::cos(kPi * t)) : t;
+        pts.push_back(azPointC(sp.cx, sp.cz, sp.r0 + (sp.r1 - sp.r0) * f,
+                               sp.y0 + (sp.y1 - sp.y0) * f, sp.az0 + (sp.az1 - sp.az0) * t));
     }
     return pts;
 }
 
-double primDistance(const Primitive& pa, double ra, const Primitive& pb, double rb) {
-    auto polyA = samplePrim(pa, ra);
-    auto polyB = samplePrim(pb, rb);
+double polyPolyDistance(const std::vector<gp_Pnt>& polyA, const std::vector<gp_Pnt>& polyB) {
     double best = std::numeric_limits<double>::max();
     for (size_t i = 0; i + 1 < polyA.size(); ++i)
         for (size_t j = 0; j + 1 < polyB.size(); ++j)
@@ -183,19 +243,16 @@ double primDistance(const Primitive& pa, double ra, const Primitive& pb, double 
     return best;
 }
 
-bool arcsClearlyApart(const Arc& a, const Arc& b, double minGap) {
-    return std::hypot(a.y - b.y, a.r - b.r) >= minGap;
-}
-
 std::pair<gp_Pnt, gp_Pnt> primEndpoints(const Primitive& p) {
-    if (p.kind == Primitive::ARC) {
-        return {azPoint(p.arc.r, p.arc.y, p.arc.azStart),
-                azPoint(p.arc.r, p.arc.y, p.arc.azStart + p.arc.azSweep)};
+    if (p.kind == Primitive::ARC3) {
+        return {gp_Pnt(p.arc.c.XYZ() + p.arc.v0),
+                gp_Pnt(p.arc.c.XYZ() + rotateXYZ(p.arc.v0, p.arc.axis, p.arc.sweep))};
     }
     if (p.kind == Primitive::SPIRAL) {
-        return {azPoint(p.spiral.r0, p.spiral.y0, p.spiral.az0),
-                azPoint(p.spiral.r1, p.spiral.y1, p.spiral.az1)};
+        return {azPointC(p.spiral.cx, p.spiral.cz, p.spiral.r0, p.spiral.y0, p.spiral.az0),
+                azPointC(p.spiral.cx, p.spiral.cz, p.spiral.r1, p.spiral.y1, p.spiral.az1)};
     }
+    if (p.kind == Primitive::BLEND) return {p.blendc.a, p.blendc.b};
     return {p.seg.a, p.seg.b};
 }
 
@@ -210,6 +267,14 @@ bool shareEndpoint(const Primitive& a, const Primitive& b) {
 // The user-mandated hard gate: any wire-envelope overlap anywhere throws. Nothing is
 // ever moved to resolve a collision — the winding data (or MKF's blocking) must change.
 void checkCollisions(const std::vector<ConductorPath>& paths) {
+    // Pre-sample every primitive once (rect/toroidal wraps are 9-10 primitives per turn;
+    // re-sampling per pair would dominate the gate).
+    std::vector<std::vector<std::vector<gp_Pnt>>> polys(paths.size());
+    for (size_t ci = 0; ci < paths.size(); ++ci) {
+        polys[ci].reserve(paths[ci].prims.size());
+        for (const auto& pr : paths[ci].prims)
+            polys[ci].push_back(samplePrim(pr, paths[ci].wireRadius));
+    }
     for (size_t ci = 0; ci < paths.size(); ++ci) {
         for (size_t cj = ci; cj < paths.size(); ++cj) {
             const auto& A = paths[ci];
@@ -226,12 +291,8 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                                                          : pb.turnOrdinal - pa.turnOrdinal) <= 1) {
                         continue;
                     }
-                    if (pa.kind == Primitive::ARC && pb.kind == Primitive::ARC &&
-                        arcsClearlyApart(pa.arc, pb.arc, minGap)) {
-                        continue;
-                    }
                     if (ci == cj && shareEndpoint(pa, pb)) continue;
-                    double d = primDistance(pa, A.wireRadius, pb, B.wireRadius);
+                    double d = polyPolyDistance(polys[ci][i], polys[cj][j]);
                     if (d < minGap) {
                         auto [aa, ab] = primEndpoints(pa);
                         auto [ba, bb] = primEndpoints(pb);
@@ -284,35 +345,42 @@ TopoDS_Face wireProfile(const gp_Pnt& center, const gp_Dir& normal, double radiu
 
 // One analytic edge per primitive, so the whole conductor is ONE path:
 //  - SEG: straight edge.
-//  - SPIRAL at constant radius and ARC rings: TRUE HELIX — a 2D line in the
-//    (U = azimuth, V = height) parametric space of a cylinder about the column axis
-//    (the canonical OCCT construction: Geom2d line on Geom_CylindricalSurface +
-//    BRepLib::BuildCurves3d).
-//  - SPIRAL with varying radius (crossover bulges): BSpline through the sampled
-//    centreline.
+//  - ARC3: exact circle edge trimmed to [0, sweep].
+//  - SPIRAL at constant radius: TRUE HELIX — a 2D line in the (U = azimuth, V = height)
+//    parametric space of a cylinder about its vertical axis (the canonical OCCT
+//    construction: Geom2d line on Geom_CylindricalSurface + BRepLib::BuildCurves3d).
+//  - SPIRAL with varying radius (conical wraps, oblong cap ramps): BSpline through the
+//    sampled centreline.
 TopoDS_Edge primEdge(const Primitive& pr, double wireRadius) {
     if (pr.kind == Primitive::SEG) {
         if (pr.seg.a.Distance(pr.seg.b) < 1e-12) return TopoDS_Edge();
         return BRepBuilderAPI_MakeEdge(pr.seg.a, pr.seg.b).Edge();
     }
-    bool constantRadius =
-        pr.kind == Primitive::ARC ||
-        (pr.kind == Primitive::SPIRAL && std::abs(pr.spiral.r1 - pr.spiral.r0) < 1e-12);
-    if (constantRadius) {
-        double r = (pr.kind == Primitive::ARC) ? pr.arc.r : pr.spiral.r0;
-        gp_Pnt2d p0, p1;
-        if (pr.kind == Primitive::ARC) {
-            p0 = gp_Pnt2d(pr.arc.azStart, pr.arc.y);
-            p1 = gp_Pnt2d(pr.arc.azStart + pr.arc.azSweep, pr.arc.y);
-        } else {
-            p0 = gp_Pnt2d(pr.spiral.az0, pr.spiral.y0);
-            p1 = gp_Pnt2d(pr.spiral.az1, pr.spiral.y1);
-        }
+    if (pr.kind == Primitive::ARC3) {
+        double radius = pr.arc.v0.Modulus();
+        if (radius < 1e-12 || std::abs(pr.arc.sweep) < 1e-12) return TopoDS_Edge();
         try {
-            // Cylinder about +Y through the origin with U measured from +X toward -Z —
-            // exactly the azPoint() convention: P(U,V) = (R cos U, V, -R sin U).
-            gp_Ax3 axis(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0), gp_Dir(1, 0, 0));
-            Handle(Geom_CylindricalSurface) cyl = new Geom_CylindricalSurface(axis, r);
+            // gp_Circ parametrisation P(u) = c + r (cos u XDir + sin u YDir) with
+            // YDir = axis x XDir matches rotateXYZ (axis is perpendicular to v0).
+            gp_Ax2 ax2(pr.arc.c, gp_Dir(pr.arc.axis), gp_Dir(pr.arc.v0));
+            gp_Circ circ(ax2, radius);
+            return BRepBuilderAPI_MakeEdge(circ, 0.0, pr.arc.sweep).Edge();
+        } catch (const Standard_Failure&) {
+            return TopoDS_Edge();
+        }
+    }
+    if (pr.kind == Primitive::SPIRAL && !pr.spiral.blend &&
+        std::abs(pr.spiral.r1 - pr.spiral.r0) < 1e-12) {
+        gp_Pnt2d p0(pr.spiral.az0, pr.spiral.y0);
+        gp_Pnt2d p1(pr.spiral.az1, pr.spiral.y1);
+        try {
+            // Cylinder about the vertical axis through (cx, cz) with U measured from +X
+            // toward -Z — exactly the azPointC() convention:
+            // P(U,V) = (cx + R cos U, V, cz - R sin U).
+            gp_Ax3 axis(gp_Pnt(pr.spiral.cx, 0, pr.spiral.cz), gp_Dir(0, 1, 0),
+                        gp_Dir(1, 0, 0));
+            Handle(Geom_CylindricalSurface) cyl =
+                new Geom_CylindricalSurface(axis, pr.spiral.r0);
             Handle(Geom2d_TrimmedCurve) seg2d = GCE2d_MakeSegment(p0, p1).Value();
             TopoDS_Edge e = BRepBuilderAPI_MakeEdge(seg2d, cyl).Edge();
             BRepLib::BuildCurves3d(e);
@@ -321,16 +389,45 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius) {
             return TopoDS_Edge();
         }
     }
-    // Radius-varying spiral: BSpline through the sampled centreline.
+    if (pr.kind == Primitive::SPIRAL && pr.spiral.blend &&
+        std::abs(pr.spiral.r1 - pr.spiral.r0) < 1e-12 &&
+        std::abs(pr.spiral.y1 - pr.spiral.y0) < 1e-12) {
+        // A blend with nothing to blend is an exact helix arc.
+        Primitive plain = pr;
+        plain.spiral.blend = false;
+        return primEdge(plain, wireRadius);
+    }
+    // Radius-varying spirals and blends: interpolated BSpline through the sampled
+    // centreline WITH EXACT END TANGENTS — an approximated spline's end tangent misses
+    // by enough that OCCT's pipe-shell treats the junction as a corner and flares.
     auto pts = samplePrim(pr, wireRadius);
     if (pts.size() < 2) return TopoDS_Edge();
+    gp_Vec t0, t1;
+    if (pr.kind == Primitive::BLEND) {
+        t0 = gp_Vec(pr.blendc.u);
+        t1 = gp_Vec(pr.blendc.u);
+    } else {
+        // Spiral tangent d/daz at the ends; for blended spirals the radial/vertical
+        // rates vanish there, leaving the pure azimuthal direction.
+        const Spiral& sp = pr.spiral;
+        double span = sp.az1 - sp.az0;
+        double drdaz = sp.blend ? 0.0 : (sp.r1 - sp.r0) / span;
+        double dydaz = sp.blend ? 0.0 : (sp.y1 - sp.y0) / span;
+        t0 = gp_Vec(drdaz * std::cos(sp.az0) - sp.r0 * std::sin(sp.az0), dydaz,
+                    -drdaz * std::sin(sp.az0) - sp.r0 * std::cos(sp.az0));
+        t1 = gp_Vec(drdaz * std::cos(sp.az1) - sp.r1 * std::sin(sp.az1), dydaz,
+                    -drdaz * std::sin(sp.az1) - sp.r1 * std::cos(sp.az1));
+    }
     try {
-        TColgp_Array1OfPnt arr(1, static_cast<Standard_Integer>(pts.size()));
+        Handle(TColgp_HArray1OfPnt) arr =
+            new TColgp_HArray1OfPnt(1, static_cast<Standard_Integer>(pts.size()));
         for (size_t i = 0; i < pts.size(); ++i)
-            arr.SetValue(static_cast<Standard_Integer>(i + 1), pts[i]);
-        Handle(Geom_BSplineCurve) bs = GeomAPI_PointsToBSpline(arr).Curve();
-        if (bs.IsNull()) return TopoDS_Edge();
-        return BRepBuilderAPI_MakeEdge(bs).Edge();
+            arr->SetValue(static_cast<Standard_Integer>(i + 1), pts[i]);
+        GeomAPI_Interpolate interp(arr, Standard_False, 1e-12);
+        interp.Load(t0, t1, /*Scale=*/Standard_True);
+        interp.Perform();
+        if (!interp.IsDone() || interp.Curve().IsNull()) return TopoDS_Edge();
+        return BRepBuilderAPI_MakeEdge(interp.Curve()).Edge();
     } catch (const Standard_Failure&) {
         return TopoDS_Edge();
     }
@@ -379,9 +476,10 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
     }
 }
 
-// Split the path into maximal continuous runs at revisited points (the wire crossing
-// itself at ring junctions). Everything within a run sweeps as one pipe; runs meet only
-// at the crossover points and are fused afterwards.
+// Split the path into maximal continuous runs: at revisited points (the wire crossing
+// itself), at closed rings, and at lead<->wrap boundaries (the only non-tangent,
+// 90-degree junctions of the path — a pipe swept across them grows an unbounded mitre
+// spike, while wrap chains are tangent-continuous by construction and sweep as one pipe).
 std::vector<std::pair<size_t, size_t>> continuousRuns(const ConductorPath& path) {
     auto quantize = [](const gp_Pnt& p) {
         return std::make_tuple(static_cast<long long>(std::llround(p.X() * 1e9)),
@@ -395,10 +493,6 @@ std::vector<std::pair<size_t, size_t>> continuousRuns(const ConductorPath& path)
         ++visits[quantize(b)];
     }
     // A junction between consecutive primitives counts twice; more visits = crossover.
-    // Closed rings (start == end) are isolated into their own single-primitive runs:
-    // a spine containing a closed loop is self-touching by construction, and OCCT's
-    // pipe-shell segfaults on it — the isolated ring is swept by the exact revolve in
-    // the piecewise fallback instead.
     std::vector<std::pair<size_t, size_t>> runs;
     auto isClosedRing = [&](const Primitive& pr) {
         auto [a, b] = primEndpoints(pr);
@@ -408,19 +502,22 @@ std::vector<std::pair<size_t, size_t>> continuousRuns(const ConductorPath& path)
     for (size_t i = 0; i < path.prims.size(); ++i) {
         auto [a, b] = primEndpoints(path.prims[i]);
         if (isClosedRing(path.prims[i])) {
+            // A closed spine segfaults OCCT's pipe-shell; isolate it (swept by the exact
+            // revolve in the piecewise fallback).
             if (i > start) runs.push_back({start, i});
             runs.push_back({i, i + 1});
             start = i + 1;
             continue;
         }
-        // Split at crossover junctions AND at SEG<->SPIRAL kind changes: a pipe swept
-        // across the 90-degree lead-to-wrap corner grows an unbounded mitre spike
-        // (observed: centimetre-scale flare). Pure-spiral chains are tangent-continuous
-        // (no corners), and pure-SEG chains emit as exact cylinders with sphere elbows.
-        bool kindChange = (i + 1 < path.prims.size()) &&
-                          (path.prims[i].kind == Primitive::SEG) !=
-                              (path.prims[i + 1].kind == Primitive::SEG);
-        if (i + 1 < path.prims.size() && (visits[quantize(b)] > 2 || kindChange)) {
+        bool leadBoundary = (i + 1 < path.prims.size()) &&
+                            (path.prims[i].isLead != path.prims[i + 1].isLead);
+        if (i + 1 < path.prims.size() && (visits[quantize(b)] > 2 || leadBoundary)) {
+            if (std::getenv("MVB_DEBUG_RUNS")) {
+                std::cerr << "SPLIT after prim " << i << " [" << path.prims[i].label
+                          << "] visits=" << visits[quantize(b)] << " leadBoundary="
+                          << leadBoundary << " at (" << b.X() << "," << b.Y() << ","
+                          << b.Z() << ")\n";
+            }
             runs.push_back({start, i + 1});
             start = i + 1;
         }
@@ -429,8 +526,8 @@ std::vector<std::pair<size_t, size_t>> continuousRuns(const ConductorPath& path)
     return runs;
 }
 
-// Per-piece fallback: sweep each primitive on its own (pipe along its single edge,
-// revolve for rings), then fuse everything into one solid.
+// Per-piece fallback: sweep each primitive on its own (exact revolve for arcs, exact
+// cylinder + sphere elbows for segments, pipe for spirals), then fuse.
 TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double wireRadius,
                             int wirePolygonSegments) {
     BRep_Builder builder;
@@ -439,14 +536,16 @@ TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double 
 
     for (size_t pi = 0; pi < count; ++pi) {
         const auto& pr = *prims[pi];
-        if (pr.kind == Primitive::ARC) {
-            gp_Pnt c = azPoint(pr.arc.r, pr.arc.y, pr.arc.azStart);
-            gp_Dir tangent(-std::sin(pr.arc.azStart), 0.0, -std::cos(pr.arc.azStart));
-            TopoDS_Face prof = wireProfile(c, tangent, wireRadius, 0);
-            BRepPrimAPI_MakeRevol rev(prof, gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)),
-                                      pr.arc.azSweep);
+        if (pr.kind == Primitive::ARC3) {
+            double radius = pr.arc.v0.Modulus();
+            if (radius < 1e-12 || std::abs(pr.arc.sweep) < 1e-12) continue;
+            gp_Pnt start(pr.arc.c.XYZ() + pr.arc.v0);
+            gp_XYZ tangent = pr.arc.axis.Crossed(pr.arc.v0);
+            TopoDS_Face prof = wireProfile(start, gp_Dir(tangent), wireRadius, 0);
+            BRepPrimAPI_MakeRevol rev(prof, gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)),
+                                      pr.arc.sweep);
             if (!rev.IsDone() || rev.Shape().IsNull()) {
-                throw std::runtime_error("ConductorBuilder: ring revolve failed for [" +
+                throw std::runtime_error("ConductorBuilder: arc revolve failed for [" +
                                          pr.label + "]");
             }
             builder.Add(compound, rev.Shape());
@@ -501,22 +600,18 @@ TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double 
     return compound;
 }
 
-// Fuse all solids of a compound in ONE boolean operation (arguments + tools, parallel
-// mode) — the sequential pairwise accumulator is O(n^2) in faces and grinds for a
-// 34-wrap conductor. Returns the compound unchanged (with a warning) on failure.
+// Fuse all solids of a compound — the sequential accumulator with a VOLUME GUARD.
+// Adjacent layers of a winding touch along helical curves at exactly one wire OD — the
+// most degenerate configuration for OCCT booleans, and fuses have been observed to
+// silently EAT whole bodies on such inputs. A fuse is only accepted when its volume
+// matches the summed piece volume (junction overlaps are well under 1%); otherwise the
+// per-run compound is returned — geometrically exact, one PRODUCT in STEP.
 TopoDS_Shape fuseAllSolids(const TopoDS_Shape& compound) {
     TopTools_ListOfShape solids;
     for (TopExp_Explorer exp(compound, TopAbs_SOLID); exp.More(); exp.Next()) {
         solids.Append(exp.Current());
     }
     if (solids.Extent() <= 1) return compound;
-    // VOLUME-GUARDED fuse. Adjacent layers of a winding touch along helical curves at
-    // exactly one wire OD — the most degenerate configuration for OCCT booleans, and
-    // both the multi-tool and the sequential fuse have been observed to silently EAT
-    // whole bodies (rings, layers) on such inputs. A fuse is only accepted when its
-    // volume matches the summed piece volume (junction overlaps are well under 1%);
-    // otherwise the per-run compound is returned — geometrically exact, one PRODUCT in
-    // STEP, a dozen meaningful solids instead of one.
     auto volumeOf = [](const TopoDS_Shape& s) {
         GProp_GProps props;
         BRepGProp::VolumeProperties(s, props);
@@ -554,9 +649,9 @@ TopoDS_Shape fuseAllSolids(const TopoDS_Shape& compound) {
 }
 
 TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
-    // Sweep each maximal continuous run as ONE pipe (the whole conductor when the wire
-    // never crosses itself); runs meet only at the crossover points. Fuse the handful of
-    // pieces into a single solid in one boolean.
+    // Sweep each maximal continuous run as ONE pipe (the whole wrap chain when the wire
+    // never crosses itself); lead runs emit as exact cylinders + sphere elbows. Fuse the
+    // handful of pieces into a single solid.
     std::vector<const Primitive*> ptrs;
     ptrs.reserve(path.prims.size());
     for (const auto& pr : path.prims) ptrs.push_back(&pr);
@@ -565,16 +660,22 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     TopoDS_Compound compound;
     builder.MakeCompound(compound);
     for (auto [b, e] : continuousRuns(path)) {
-        // Single-primitive closed rings go straight to the exact revolve (a closed spine
-        // segfaults OCCT's pipe-shell); everything else sweeps as one pipe.
-        bool closedRing = (e - b == 1) && ptrs[b]->kind == Primitive::ARC;
-        bool segChain = ptrs[b]->kind == Primitive::SEG;   // runs are kind-homogeneous
+        bool closedRing = (e - b == 1) && ptrs[b]->kind != Primitive::SEG &&
+                          [&] {
+                              auto [pa, pb] = primEndpoints(*ptrs[b]);
+                              return pa.Distance(pb) < 1e-9;
+                          }();
+        bool leadRun = ptrs[b]->isLead;   // runs never mix lead and wrap primitives
         TopoDS_Shape run;
-        if (!closedRing && !segChain) {
+        if (!closedRing && !leadRun) {
             run = sweepRun(ptrs.data() + b, e - b, path.wireRadius, wirePolygonSegments);
         }
+        if (std::getenv("MVB_DEBUG_RUNS") && run.IsNull() && !leadRun) {
+            std::cerr << "PIPE FAILED for run of " << (e - b) << " prims starting ["
+                      << ptrs[b]->label << "]\n";
+        }
         if (run.IsNull()) {
-            // Per-primitive sweeps for this span (rings revolve exactly).
+            // Per-primitive sweeps for this span (arcs revolve exactly).
             run = sweepPiecewise(ptrs.data() + b, e - b, path.wireRadius,
                                  wirePolygonSegments);
         }
@@ -586,7 +687,6 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
 // ---------------------------------------------------------------------------------------
 // Connection replay: MKF's drawn ConnectionReservedSpace rectangles (layer == "") are the
 // authoritative routes — the pink (terminal) and blue (link) boxes of the Painter SVG.
-// Each rect maps to centreline waypoints in the YZ plane.
 using RSpace = OpenMagnetics::ConnectionReservedSpace;
 
 struct PlanePt {
@@ -604,9 +704,8 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
                                  " in MKF's connection reserved spaces");
     }
     const RSpace* run = nullptr;
-    const RSpace* stub = nullptr;
     for (const RSpace* s : group) {
-        if (rectIsVertical(*s)) stub = s; else run = s;
+        if (!rectIsVertical(*s)) run = s;
     }
     if (!run) {
         throw std::runtime_error("ConductorBuilder: terminal lead group for " + who +
@@ -624,6 +723,281 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
     return {{station.x, station.y}, {station.x, edgeY}, {borderX, edgeY}};
 }
 
+// ---------------------------------------------------------------------------------------
+// Wrap planners. Each appends the connecting geometry of ONE wrap — crossing k-1 to
+// crossing k — for its column shape. Under MKF's real-winding model the turnsDescription
+// holds the N+1 window crossings of an N-turn winding (the first entry is the beginning
+// of the first turn), so no closed loops exist anywhere.
+
+// ROUND column: one full 360-degree spiral about the column axis — cylindrical within a
+// layer, conical across a layer transition (radius and height both linear in azimuth).
+void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
+                     const std::string& label, size_t ordinal) {
+    Primitive wrap;
+    wrap.kind = Primitive::SPIRAL;
+    wrap.spiral = {0, 0, s.x, s.y, kPlaneAz, n.x, n.y, kPlaneAz + kTwoPi};
+    wrap.label = label;
+    wrap.turnOrdinal = ordinal;
+    path.prims.push_back(std::move(wrap));
+}
+
+// RECTANGULAR column: the racetrack of build_concentric_rect_column_turn — straights at
+// exactly the MAS radial clearance on all four faces, corner arcs of radius = clearance
+// (grown to the wire's minimum bend radius with the arc axis pulled inward when the wire
+// sits closer than that; identical rule and throw as TurnBuilder). The whole racetrack
+// runs at the SOURCE crossing's station; the transition to the next crossing is the
+// final straight of the -Z face (the user-approved rectangular-face zigzag: three sides
+// and the corners stay on-station, one face carries the move).
+struct RectStation {
+    double y = 0, zPos = 0, xPos = 0, cornerR = 0, segX = 0, segZ = 0;
+};
+RectStation rectStation(const PlanePt& p, double halfW, double halfD, double minBend,
+                        const std::string& who) {
+    double clearance = p.x - halfW;
+    if (clearance <= 0.0) {
+        throw std::runtime_error(
+            "ConductorBuilder: crossing radial position " + std::to_string(p.x) +
+            " m lies inside the column (half-width " + std::to_string(halfW) +
+            " m) for " + who + " — inconsistent MAS turn/bobbin data");
+    }
+    double cornerR = clearance;
+    double inset = 0.0;
+    if (cornerR < minBend) {
+        inset = minBend - clearance;
+        cornerR = minBend;
+        if (inset > std::min(halfW, halfD)) {
+            throw std::runtime_error(
+                "ConductorBuilder: minimum bend radius " + std::to_string(minBend) +
+                " m cannot be accommodated (clearance " + std::to_string(clearance) +
+                " m, column half-dims " + std::to_string(halfW) + "/" +
+                std::to_string(halfD) + " m) for " + who +
+                " — adjacent corner arcs would cross");
+    }
+    }
+    return {p.y, halfD + clearance, halfW + clearance, cornerR, halfW - inset,
+            halfD - inset};
+}
+
+void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStation& s1,
+                    const std::string& label, size_t ordinal) {
+    auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
+        if (a.Distance(b) < 1e-12) return;
+        Primitive pr;
+        pr.kind = Primitive::SEG;
+        pr.seg = {a, b};
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    auto pushCorner = [&](double cxx, double czz, double azStart, const char* what) {
+        Primitive pr;
+        pr.kind = Primitive::ARC3;
+        pr.arc.c = gp_Pnt(cxx, s0.y, czz);
+        pr.arc.axis = gp_XYZ(0, 1, 0);
+        pr.arc.v0 = gp_XYZ(s0.cornerR * std::cos(azStart), 0,
+                           -s0.cornerR * std::sin(azStart));
+        pr.arc.sweep = kPi / 2.0;
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    const double y = s0.y;
+    // Crossing k-1 at the -Z face centre, moving -X (same chirality as the round wrap:
+    // increasing azimuth from kPlaneAz).
+    pushSeg(gp_Pnt(0, y, -s0.zPos), gp_Pnt(-s0.segX, y, -s0.zPos), "face -Z out");
+    pushCorner(-s0.segX, -s0.segZ, kPi / 2.0, "corner -X-Z");
+    pushSeg(gp_Pnt(-s0.xPos, y, -s0.segZ), gp_Pnt(-s0.xPos, y, +s0.segZ), "face -X");
+    pushCorner(-s0.segX, +s0.segZ, kPi, "corner -X+Z");
+    pushSeg(gp_Pnt(-s0.segX, y, +s0.zPos), gp_Pnt(+s0.segX, y, +s0.zPos), "face +Z");
+    pushCorner(+s0.segX, +s0.segZ, 3.0 * kPi / 2.0, "corner +X+Z");
+    pushSeg(gp_Pnt(+s0.xPos, y, +s0.segZ), gp_Pnt(+s0.xPos, y, -s0.segZ), "face +X");
+    pushCorner(+s0.segX, -s0.segZ, 0.0, "corner +X-Z");
+    // The transition: the final stretch of the -Z face carries the move to the next
+    // crossing as an S-blend whose tangent is -X at BOTH ends — tangent-continuous into
+    // the corner behind it and into the next wrap ahead, and passing exactly through the
+    // crossing (a straight ramp would kink at both junctions).
+    if (s0.segX < 1e-9) {
+        throw std::runtime_error(
+            "ConductorBuilder: corner bends consumed the whole -Z transition face for " +
+            label + " — no room for the crossing ramp");
+    }
+    Primitive ramp;
+    ramp.kind = Primitive::BLEND;
+    ramp.blendc = {gp_Pnt(+s0.segX, y, -s0.zPos), gp_Pnt(0, s1.y, -s1.zPos),
+                   gp_XYZ(-1, 0, 0)};
+    ramp.label = label + " ramp -Z";
+    ramp.turnOrdinal = ordinal;
+    path.prims.push_back(std::move(ramp));
+}
+
+// OBLONG column (stadium): straights on the two flat +-X faces at x = +-radial, half caps
+// of radius = radial about the end centres (0, +-straightHalf) — the same decomposition
+// as build_concentric_oblong_turn. The -Z cap's second quarter is the transition: a
+// spiral about the cap centre from az 0 to the crossing apex at az pi/2 (the flat faces
+// stay on-station; the round end carries the move).
+void appendOblongWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
+                      double straightHalf, const std::string& label, size_t ordinal) {
+    auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
+        if (a.Distance(b) < 1e-12) return;
+        Primitive pr;
+        pr.kind = Primitive::SEG;
+        pr.seg = {a, b};
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    auto pushCap = [&](double cz, double azStart, double sweep, const char* what) {
+        Primitive pr;
+        pr.kind = Primitive::ARC3;
+        pr.arc.c = gp_Pnt(0, s.y, cz);
+        pr.arc.axis = gp_XYZ(0, 1, 0);
+        pr.arc.v0 = gp_XYZ(s.x * std::cos(azStart), 0, -s.x * std::sin(azStart));
+        pr.arc.sweep = sweep;
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    const double sh = straightHalf;
+    pushCap(-sh, kPi / 2.0, kPi / 2.0, "cap -Z out");
+    pushSeg(gp_Pnt(-s.x, s.y, -sh), gp_Pnt(-s.x, s.y, +sh), "face -X");
+    pushCap(+sh, kPi, kPi, "cap +Z");
+    pushSeg(gp_Pnt(+s.x, s.y, +sh), gp_Pnt(+s.x, s.y, -sh), "face +X");
+    Primitive ramp;
+    ramp.kind = Primitive::SPIRAL;
+    ramp.spiral = {0, -sh, s.x, s.y, 0.0, n.x, n.y, kPi / 2.0, /*blend=*/true};
+    ramp.label = label + " cap -Z ramp";
+    ramp.turnOrdinal = ordinal;
+    path.prims.push_back(std::move(ramp));
+}
+
+// ---------------------------------------------------------------------------------------
+// TOROIDAL wraps. Build frame: toroid hole axis along +Y, hole plane at y = 0 (the
+// assembly is later counter-rotated by -pi/2 about X, mapping build (x,y,z) to final
+// (x,z,-y), so a MAS hole-plane point (cx, cy, 0) is build (cx, 0, cy)). One wrap is a
+// poloidal loop around the core cross-section: up the inner tube at the inner crossing,
+// over the top face along the straight chord between corner exits (the exact
+// construction of build_toroidal_turn), down the outer tube through the OUTER crossing
+// (additionalCoordinates — MAS data, hit exactly), back under the bottom face to the
+// NEXT inner crossing. Tube lengths mirror TurnBuilder's derived clearances:
+// tube = halfDepth + layerOffset, layerOffset = max(0, wwRadialHeight - innerRadial -
+// wireRadius) — the transition run uses the deeper of the two adjacent crossings'
+// clearances so it clears the intervening rings.
+struct ToroCross {
+    gp_XY pin;    // inner crossing, build-frame horizontal (x, z) = MAS (x, y)
+    gp_XY pout;   // outer crossing
+    double tube;  // vertical tube length above/below the hole plane
+};
+
+void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c1,
+                    double bend, const std::string& label, size_t ordinal) {
+    auto P = [](const gp_XY& h, double y) { return gp_Pnt(h.X(), y, h.Y()); };
+    auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
+        if (a.Distance(b) < 1e-12) return;
+        Primitive pr;
+        pr.kind = Primitive::SEG;
+        pr.seg = {a, b};
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    auto pushArc = [&](const gp_Pnt& center, const gp_XYZ& axis, const gp_XYZ& v0,
+                       const char* what) {
+        Primitive pr;
+        pr.kind = Primitive::ARC3;
+        pr.arc.c = center;
+        pr.arc.axis = axis;
+        pr.arc.v0 = v0;
+        pr.arc.sweep = kPi / 2.0;
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    const gp_XYZ yHat(0, 1, 0);
+    const double b = bend;
+
+    // Top half: turn k-1's inner leg to its outer leg.
+    gp_XY dH = c0.pout - c0.pin;
+    double lTop = dH.Modulus();
+    if (lTop <= 2.0 * b) {
+        throw std::runtime_error("ConductorBuilder: toroidal crossings of " + label +
+                                 " are closer than two bend radii (" + std::to_string(lTop) +
+                                 " m) — no room for the face run");
+    }
+    dH.Divide(lTop);
+    gp_XYZ d3(dH.X(), 0, dH.Y());
+    double t0 = c0.tube, rh0 = t0 + b;
+
+    pushSeg(P(c0.pin, 0), P(c0.pin, t0), "inner tube up");
+    pushArc(P(c0.pin + dH * b, t0), yHat.Crossed(d3), d3 * (-b), "top inner corner");
+    pushSeg(P(c0.pin + dH * b, rh0), P(c0.pout - dH * b, rh0), "top chord");
+    pushArc(P(c0.pout - dH * b, t0), yHat.Crossed(d3), yHat * b, "top outer corner");
+
+    // Bottom half: turn k-1's outer leg to turn k's inner leg. The deeper of the two
+    // adjacent clearances keeps the run clear of the intervening rings.
+    double tb = std::max(c0.tube, c1.tube), rhb = tb + b;
+    gp_XY eH = c1.pin - c0.pout;
+    double lBot = eH.Modulus();
+    if (lBot <= 2.0 * b) {
+        throw std::runtime_error("ConductorBuilder: toroidal return crossings of " + label +
+                                 " are closer than two bend radii (" + std::to_string(lBot) +
+                                 " m) — no room for the face run");
+    }
+    eH.Divide(lBot);
+    gp_XYZ e3(eH.X(), 0, eH.Y());
+
+    // Outer tube: one straight through the outer crossing at y = 0 (hit exactly).
+    pushSeg(P(c0.pout, t0), P(c0.pout, -tb), "outer tube down");
+    pushArc(P(c0.pout + eH * b, -tb), e3.Crossed(yHat), e3 * (-b), "bottom outer corner");
+    pushSeg(P(c0.pout + eH * b, -rhb), P(c1.pin - eH * b, -rhb), "bottom chord");
+    pushArc(P(c1.pin - eH * b, -tb), e3.Crossed(yHat), yHat * (-b), "bottom inner corner");
+    pushSeg(P(c1.pin, -tb), P(c1.pin, 0), "inner tube up to crossing");
+}
+
+// Toroidal terminal lead: MKF draws ONE radial rect per lead in the hole plane, spanning
+// [crossing radius, radialBorder] along the crossing's angle — its near edge IS the
+// crossing (up to MKF's 1e-9 serialisation rounding, snapped back to the exact MAS
+// crossing). The rect is a reserved ENVELOPE, and MKF's radialBorder
+// (maxTurnRadius + 1.5 wire ODs) can overrun the winding-window bore — a wall-adjacent
+// ring leaves NO in-plane room at all (the physical lead exits the toroid axially at the
+// crossing). The replayed centreline therefore stops one wire radius short of both the
+// rect's far edge and the window bore (both MKF data; MKF ABT #230 tracks the 2D overrun),
+// and the lead is omitted entirely when nothing remains.
+std::optional<gp_Pnt> toroLeadFarPoint(const RSpace& s, const gp_XY& crossing,
+                                       double wireRadius, double wwRadialHeight,
+                                       const std::string& who) {
+    double th = s.rotation * kPi / 180.0;
+    gp_XY u(std::cos(th), std::sin(th));
+    gp_XY cen(s.coordinates.at(0), s.coordinates.at(1));
+    gp_XY e1 = cen - u * (s.dimensions.at(0) / 2.0);
+    gp_XY e2 = cen + u * (s.dimensions.at(0) / 2.0);
+    double d1 = (e1 - crossing).Modulus();
+    double d2 = (e2 - crossing).Modulus();
+    // MKF rounds rect coordinates to 1e-9 and the rotation to 1e-6 deg; anything beyond
+    // 1e-7 m means the rect does not belong to this crossing.
+    if (std::min(d1, d2) > 1e-7) {
+        throw std::runtime_error(
+            "ConductorBuilder: toroidal terminal rect for " + who +
+            " does not touch its crossing (nearest end " +
+            std::to_string(std::min(d1, d2)) + " m away) — MKF reserved-space mismatch");
+    }
+    gp_XY farEdge = (d1 < d2) ? e2 : e1;
+    gp_XY dir = farEdge - crossing;
+    double rectLen = dir.Modulus();
+    if (rectLen < 1e-12) return std::nullopt;
+    dir.Divide(rectLen);
+    double crossR = crossing.Modulus();
+    if (crossR < 1e-12 || std::abs(dir.Dot(crossing) / crossR - 1.0) > 1e-6) {
+        throw std::runtime_error(
+            "ConductorBuilder: toroidal terminal rect for " + who +
+            " is not radial from its crossing — unexpected MKF reserved-space layout");
+    }
+    double t = std::min(rectLen - wireRadius,
+                        (wwRadialHeight - wireRadius) - crossR);
+    if (t <= 1e-12) return std::nullopt;   // no in-plane room: the lead exits axially
+    gp_XY far = crossing + dir * t;
+    return gp_Pnt(far.X(), 0, far.Y());
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------------------
@@ -638,14 +1012,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         throw std::runtime_error(
             "ConductorBuilder: coil has no turnsDescription — the magnetic must be wound "
             "by MKF before building real-winding conductors");
-    }
-    if (isToroidal) {
-        throw std::runtime_error("ConductorBuilder: toroidal cores are not supported yet "
-                                 "(real-winding milestone 3)");
-    }
-    if (bobbinPd.get_column_shape() != MAS::ColumnShape::ROUND) {
-        throw std::runtime_error("ConductorBuilder: only ROUND columns are supported yet "
-                                 "(rectangular/oblong arrive in real-winding milestone 2)");
     }
 
     // Drawn connection routes only (layer == ""): the pink/blue boxes of the SVG.
@@ -699,6 +1065,55 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
     }
 
+    // Column geometry (concentric) / toroidal window data.
+    const MAS::ColumnShape columnShape = bobbinPd.get_column_shape();
+    const double halfD = bobbinPd.get_column_depth();
+    double halfW = 0.0;
+    if (!isToroidal &&
+        (columnShape == MAS::ColumnShape::RECTANGULAR ||
+         columnShape == MAS::ColumnShape::OBLONG)) {
+        auto wOpt = bobbinPd.get_column_width();
+        if (!wOpt) {
+            throw std::runtime_error(
+                "ConductorBuilder: bobbin processedDescription has no columnWidth "
+                "(required for rectangular/oblong column racetracks)");
+        }
+        halfW = *wOpt;
+    }
+    if (!isToroidal && columnShape != MAS::ColumnShape::ROUND &&
+        columnShape != MAS::ColumnShape::RECTANGULAR &&
+        columnShape != MAS::ColumnShape::OBLONG) {
+        throw std::runtime_error(
+            "ConductorBuilder: unsupported column shape for real-winding conductors "
+            "(only round/rectangular/oblong concentric columns and toroids are modelled)");
+    }
+    // Oblong with no straight section degenerates to a round column (same rule as
+    // build_concentric_oblong_turn).
+    const double oblongHalf = halfD - halfW;
+    const bool effectivelyRound =
+        columnShape == MAS::ColumnShape::ROUND ||
+        (columnShape == MAS::ColumnShape::OBLONG && oblongHalf <= 0.0);
+    // MKF's 2D window x maps to the connection plane at z = -(x + zoff): the crossing
+    // sits one clearance past the column on the -Z side, which for rectangular/oblong
+    // columns is columnDepth - columnWidth deeper than the radial position itself.
+    const double zoff =
+        (isToroidal || effectivelyRound) ? 0.0 : (halfD - halfW);
+
+    double wwRadialHeight = 0.0;
+    if (isToroidal) {
+        const auto& wws = bobbinPd.get_winding_windows();
+        if (wws.empty() || !wws[0].get_radial_height()) {
+            throw std::runtime_error(
+                "ConductorBuilder: toroidal bobbin has no winding-window radialHeight "
+                "(required for the conductor's face-run clearance)");
+        }
+        wwRadialHeight = wws[0].get_radial_height().value();
+    }
+
+    auto planePoint = [&](double x2d, double y2d) {
+        return azPointC(0, 0, x2d + zoff, y2d, kPlaneAz);
+    };
+
     auto station = [](const MAS::Turn* t) -> PlanePt {
         const auto& c = t->get_coordinates();
         if (c.size() < 2) {
@@ -713,34 +1128,117 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     for (size_t ci = 0; ci < conductors.size(); ++ci) {
         const auto& ct = conductors[ci];
+        const MAS::Wire& wire = wireMap.at(ct.winding);
+        if (wire.get_type() == MAS::WireType::RECTANGULAR ||
+            wire.get_type() == MAS::WireType::PLANAR ||
+            wire.get_type() == MAS::WireType::FOIL) {
+            throw std::runtime_error(
+                "ConductorBuilder: rectangular/planar/foil wire is not supported for "
+                "real-winding conductors yet (the lead cross-section orientation through "
+                "the exit bends is undefined) — winding '" + ct.winding + "'");
+        }
+        // Resolve through the first turn: turn.dimensions carries the OUTER footprint
+        // (the context-less overload would fall back to the round wire's CONDUCTING
+        // diameter for paintCoating=true).
         auto [wireW, wireH] =
-            TurnBuilder::wireDimensions(wireMap.at(ct.winding), opts.paintCoating);
+            TurnBuilder::wireDimensions(wire, *ct.turns.front(), opts.paintCoating);
         double wireRadius = std::min(wireW, wireH) / 2.0;
-        double od = 2.0 * wireRadius;
+        // Same minimum-bend rule as build_concentric_rect_column_turn: a swept corner
+        // self-intersects when the arc radius is below the profile's radial half-extent.
+        double minBend = wireRadius * 1.02;
 
         ConductorPath path;
         path.name = ct.winding + " parallel " + std::to_string(ct.parallel);
         path.wireRadius = wireRadius;
 
         const auto& turns = ct.turns;
-        PlanePt first = station(turns.front());
-        PlanePt last = station(turns.back());
 
-        // This conductor's drawn rects: terminals split entrance/exit by which station
-        // the group touches; links matched per jump geometrically.
+        // This conductor's drawn terminal rects, in MKF emission order (verified in
+        // get_connection_reserved_spaces): the ENTRANCE lead's rects first, then the
+        // EXIT lead's. Non-terminal (blue) link rects stay 2D documentation: the wrap
+        // between the crossings IS the 3D transition.
         std::vector<const RSpace*> terminalRects;
         for (const auto& s : drawn) {
             if (s.winding != ct.winding || s.parallel != ct.parallel) continue;
             if (s.isTerminal) terminalRects.push_back(&s);
-            // Non-terminal (blue) link rects stay 2D documentation: the conical wrap
-            // between the crossings IS the 3D transition.
         }
-        // Terminal grouping follows MKF's emission order (verified in
-        // get_connection_reserved_spaces): per (winding, parallel) the ENTRANCE lead's
-        // rects are pushed first, then the EXIT lead's, each as [vertical stub?,
-        // horizontal run] — the run closes its group. Proximity-based grouping is
-        // ambiguous when a crossing sits within a wire of the window edge (the entrance
-        // edge run then "touches" the exit station too).
+
+        if (isToroidal) {
+            // Derived crossing data (TurnBuilder's clearance rules, hole plane at y=0).
+            auto toroCross = [&](const MAS::Turn* t) -> ToroCross {
+                const auto& c = t->get_coordinates();
+                if (c.size() < 2) {
+                    throw std::runtime_error("ConductorBuilder: turn '" + t->get_name() +
+                                             "' has fewer than 2 coordinates");
+                }
+                auto add = t->get_additional_coordinates();
+                if (!(add && !add->empty() && (*add)[0].size() >= 2)) {
+                    throw std::runtime_error(
+                        "ConductorBuilder: toroidal turn '" + t->get_name() +
+                        "' has no additionalCoordinates (outer XY-plane crossing); "
+                        "refusing to invent the outer crossing");
+                }
+                gp_XY pin(c[0], c[1]);
+                gp_XY pout((*add)[0][0], (*add)[0][1]);
+                double innerRadial = pin.Modulus();
+                double layerOffset =
+                    std::max(0.0, (wwRadialHeight - innerRadial) - wireRadius);
+                return {pin, pout, halfD + layerOffset};
+            };
+
+            if (terminalRects.size() != 2) {
+                throw std::runtime_error(
+                    "ConductorBuilder: expected 2 toroidal terminal lead rects "
+                    "(entrance, exit) for " + path.name + ", got " +
+                    std::to_string(terminalRects.size()));
+            }
+            ToroCross first = toroCross(turns.front());
+            ToroCross last = toroCross(turns.back());
+
+            if (auto far = toroLeadFarPoint(*terminalRects[0], first.pin, wireRadius,
+                                            wwRadialHeight, path.name + " entrance")) {
+                // Entrance: border -> first inner crossing, in the hole plane.
+                Primitive pr;
+                pr.kind = Primitive::SEG;
+                pr.seg = {*far, gp_Pnt(first.pin.X(), 0, first.pin.Y())};
+                pr.label = "entrance lead";
+                pr.turnOrdinal = 0;
+                pr.isLead = true;
+                path.prims.push_back(std::move(pr));
+            }
+
+            for (size_t i = 0; i + 1 < turns.size(); ++i) {
+                appendToroWrap(path, toroCross(turns[i]), toroCross(turns[i + 1]),
+                               wireRadius,
+                               "wrap '" + turns[i]->get_name() + "' -> '" +
+                                   turns[i + 1]->get_name() + "'",
+                               i);
+            }
+
+            if (auto far = toroLeadFarPoint(*terminalRects[1], last.pin, wireRadius,
+                                            wwRadialHeight, path.name + " exit")) {
+                // Exit: last inner crossing -> border.
+                Primitive pr;
+                pr.kind = Primitive::SEG;
+                pr.seg = {gp_Pnt(last.pin.X(), 0, last.pin.Y()), *far};
+                pr.label = "exit lead";
+                pr.turnOrdinal = turns.size() - 1;
+                pr.isLead = true;
+                path.prims.push_back(std::move(pr));
+            }
+
+            paths.push_back(std::move(path));
+            continue;
+        }
+
+        // ---- concentric columns -------------------------------------------------------
+        PlanePt first = station(turns.front());
+        PlanePt last = station(turns.back());
+
+        // Terminal grouping follows MKF's emission order: per (winding, parallel) the
+        // ENTRANCE lead's rects are pushed first, then the EXIT lead's, each as
+        // [vertical stub?, horizontal run] — the run closes its group. Proximity-based
+        // grouping is ambiguous when a crossing sits within a wire of the window edge.
         std::vector<const RSpace*> entranceGroup, exitGroup;
         {
             std::vector<std::vector<const RSpace*>> groups(1);
@@ -787,6 +1285,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                           planePoint(kept[i + 1].x, kept[i + 1].y)};
                 pr.label = what + " seg " + std::to_string(i);
                 pr.turnOrdinal = ordinal;
+                pr.isLead = true;
                 path.prims.push_back(std::move(pr));
             }
         };
@@ -798,24 +1297,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             pushPlaneSegs(wp, "entrance lead", 0);
         }
 
-        // Wraps between consecutive CROSSINGS. Under MKF's real-winding model the
-        // turnsDescription holds the N+1 window crossings of an N-turn winding (the
-        // first entry is the beginning of the first turn), so wrap k sweeps one full
-        // 360-degree spiral from crossing k-1 to crossing k: a cylindrical helix within
-        // a layer, a conical spiral across a layer transition (radius and height both
-        // linear in azimuth). No closed rings exist anywhere and consecutive parallels
-        // advance in lockstep, so the whole conductor is one continuous, never
-        // self-touching path from entrance lead to exit lead.
+        // Wraps between consecutive crossings.
         for (size_t i = 0; i + 1 < turns.size(); ++i) {
             PlanePt s = station(turns[i]);
             PlanePt nxt = station(turns[i + 1]);
-            Primitive wrap;
-            wrap.kind = Primitive::SPIRAL;
-            wrap.spiral = {s.x, s.y, kPlaneAz, nxt.x, nxt.y, kPlaneAz + kTwoPi};
-            wrap.label = "wrap '" + turns[i]->get_name() + "' -> '" +
-                         turns[i + 1]->get_name() + "'";
-            wrap.turnOrdinal = i;
-            path.prims.push_back(std::move(wrap));
+            std::string label = "wrap '" + turns[i]->get_name() + "' -> '" +
+                                turns[i + 1]->get_name() + "'";
+            if (effectivelyRound) {
+                appendRoundWrap(path, s, nxt, label, i);
+            } else if (columnShape == MAS::ColumnShape::RECTANGULAR) {
+                appendRectWrap(path,
+                               rectStation(s, halfW, halfD, minBend, path.name),
+                               rectStation(nxt, halfW, halfD, minBend, path.name),
+                               label, i);
+            } else {   // OBLONG with a real straight section
+                appendOblongWrap(path, s, nxt, oblongHalf, label, i);
+            }
         }
 
         // Exit: MKF's drawn route from the last station out to the border.

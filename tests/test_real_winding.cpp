@@ -10,6 +10,8 @@
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <TopoDS_Edge.hxx>
 #include <gp_Ax2.hxx>
@@ -25,6 +27,7 @@
 #include <cmath>
 #include <fstream>
 #include <numbers>
+#include <variant>
 
 using json = nlohmann::json;
 
@@ -233,6 +236,198 @@ TEST_CASE("Real winding: multi-parallel throws on MKF's overlapping lead rows",
                               mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
                               /*useRealWindingGeometry=*/true),
         Catch::Matchers::ContainsSubstring("collision"));
+}
+
+namespace {
+
+// Test-side mirror of MagneticBuilder's bobbin resolution (getBobbinProcessed +
+// patchBobbinDimensions) so probes use the same column dimensions as the builder.
+MAS::CoreBobbinProcessedDescription bobbinPdOf(const OpenMagnetics::Magnetic& m) {
+    auto bobbinVar = m.get_coil().get_bobbin();
+    auto* b = std::get_if<OpenMagnetics::Bobbin>(&bobbinVar);
+    REQUIRE(b != nullptr);
+    auto pd = b->get_processed_description();
+    REQUIRE(pd.has_value());
+    MAS::CoreBobbinProcessedDescription bobbinPd = *pd;
+    if (bobbinPd.get_column_width().value_or(0.0) <= 0.0) {
+        auto corePd = m.get_core().get_processed_description();
+        REQUIRE(corePd.has_value());
+        REQUIRE(!corePd->get_columns().empty());
+        const auto& col = corePd->get_columns()[0];
+        double wall = bobbinPd.get_wall_thickness();
+        if (std::isnan(wall) || wall < 0.0) wall = 0.0;
+        bobbinPd.set_column_width(col.get_width() / 2.0 + wall);
+        bobbinPd.set_column_depth(col.get_depth() / 2.0 + wall);
+        bobbinPd.set_column_shape(col.get_shape());
+    }
+    return bobbinPd;
+}
+
+// A crossing must lie ON THE CENTERLINE of the copper: the crossing itself and four
+// probes at ±0.99·wireRadius along the two directions perpendicular to the wire's travel
+// must all be inside the solid. If the centerline missed the crossing by more than
+// 0.01·wireRadius, the probe opposite the offset would fall outside the pipe. (A
+// boundary-distance check is unsound here: at the conductor's free ends and at run
+// junctions internal cap faces pass exactly through the crossing.)
+void requireCrossingOnCenterline(const TopoDS_Shape& conductor, const gp_Pnt& crossing,
+                                 double wireRadius, const gp_Dir& perpA, const gp_Dir& perpB,
+                                 const std::string& what) {
+    INFO(what << " at (" << crossing.X() << "," << crossing.Y() << "," << crossing.Z()
+              << "), wire radius " << wireRadius);
+    REQUIRE(pointInsideShape(conductor, crossing, 1e-9));
+    for (const gp_Dir* d : {&perpA, &perpB}) {
+        for (double sgn : {1.0, -1.0}) {
+            gp_Pnt probe(crossing.XYZ() + d->XYZ() * (sgn * 0.99 * wireRadius));
+            INFO("perpendicular probe at (" << probe.X() << "," << probe.Y() << ","
+                                            << probe.Z() << ")");
+            REQUIRE(pointInsideShape(conductor, probe, 1e-9));
+        }
+    }
+}
+
+// Outer-footprint wire radius of an MKF-enriched turn (turn.dimensions = outer w/h).
+double turnWireRadius(const MAS::Turn& turn) {
+    auto dims = turn.get_dimensions();
+    REQUIRE(dims.has_value());
+    REQUIRE(dims->size() >= 2);
+    return std::min((*dims)[0], (*dims)[1]) / 2.0;
+}
+
+const mvb::NamedShape* findConductor(const std::vector<mvb::NamedShape>& named,
+                                     const std::string& name) {
+    const mvb::NamedShape* found = nullptr;
+    for (const auto& ns : named) {
+        REQUIRE_THAT(ns.name, !Catch::Matchers::ContainsSubstring(" turn "));
+        if (ns.name == name) {
+            REQUIRE(found == nullptr);
+            found = &ns;
+        }
+    }
+    REQUIRE(found != nullptr);
+    REQUIRE(!found->shape.IsNull());
+    REQUIRE(shapeVolume(found->shape) > 0.0);
+    return found;
+}
+
+} // namespace
+
+TEST_CASE("Real winding: rectangular-column E core zigzag racetrack conductor",
+          "[realwinding]") {
+    auto magneticJson = loadFixture("realwinding_rect_U.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, true, 0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+
+    // Every MKF crossing must lie ON the copper. For a rectangular column the crossing
+    // sits at the -Z transition-face centre: (0, y, -(x + columnDepth - columnWidth)).
+    auto bobbinPd = bobbinPdOf(enriched);
+    REQUIRE(bobbinPd.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
+    double zoff = bobbinPd.get_column_depth() - bobbinPd.get_column_width().value();
+    auto turnsOpt = enriched.get_coil().get_turns_description();
+    REQUIRE(turnsOpt.has_value());
+    for (const auto& turn : *turnsOpt) {
+        const auto& c = turn.get_coordinates();
+        REQUIRE(c.size() >= 2);
+        requireCrossingOnCenterline(conductor->shape, gp_Pnt(0.0, c[1], -(c[0] + zoff)),
+                                    turnWireRadius(turn), gp_Dir(0, 1, 0), gp_Dir(0, 0, 1),
+                                    "crossing " + turn.get_name());
+    }
+
+    // E-core window walls are planar (no facet sag): tangent contact only.
+    requireNoPairwiseOverlap(named, 1e-10);
+    int solids = 0;
+    for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
+        ++solids;
+    if (solids == 1) REQUIRE(!hasSelfIntersections(conductor->shape));
+}
+
+TEST_CASE("Real winding: oblong-column EP core stadium conductor", "[realwinding]") {
+    auto magneticJson = loadFixture("realwinding_oblong_U.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, true, 0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+
+    // Oblong crossing sits at the -Z cap apex: same z = -(x + D - W) mapping.
+    auto bobbinPd = bobbinPdOf(enriched);
+    REQUIRE(bobbinPd.get_column_shape() == MAS::ColumnShape::OBLONG);
+    double zoff = std::max(0.0, bobbinPd.get_column_depth() -
+                                    bobbinPd.get_column_width().value());
+    auto turnsOpt = enriched.get_coil().get_turns_description();
+    REQUIRE(turnsOpt.has_value());
+    for (const auto& turn : *turnsOpt) {
+        const auto& c = turn.get_coordinates();
+        REQUIRE(c.size() >= 2);
+        requireCrossingOnCenterline(conductor->shape, gp_Pnt(0.0, c[1], -(c[0] + zoff)),
+                                    turnWireRadius(turn), gp_Dir(0, 1, 0), gp_Dir(0, 0, 1),
+                                    "crossing " + turn.get_name());
+    }
+
+    requireNoPairwiseOverlap(named, coreFacetWedgeBound(0.00028, 0.0089, 16));
+    int solids = 0;
+    for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
+        ++solids;
+    if (solids == 1) REQUIRE(!hasSelfIntersections(conductor->shape));
+}
+
+TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer crossings",
+          "[realwinding]") {
+    auto magneticJson = loadFixture("realwinding_toroid.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    // Exact core (segments=0): the wall-adjacent ring's tubes touch the bore tangentially
+    // along their whole length, so any polygon-faceted bore would interpenetrate them by
+    // its facet sag; the exact annulus makes true tangency testable at boolean tolerance.
+    auto named = builder.buildAllNamed(enriched, true, 0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       /*corePolygonSegments=*/0,
+                                       true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+
+    // The assembly is counter-rotated to the MAS frame (ring in XY, hole axis Z), so a
+    // hole-plane crossing (cx, cy) must lie on the copper at (cx, cy, 0) — the inner
+    // crossing of every turn, the outer (additionalCoordinates) of every wrapped turn
+    // (the last crossing entry's outer is not wrapped through).
+    auto turnsOpt = enriched.get_coil().get_turns_description();
+    REQUIRE(turnsOpt.has_value());
+    const auto& turns = *turnsOpt;
+    for (size_t i = 0; i < turns.size(); ++i) {
+        const auto& c = turns[i].get_coordinates();
+        REQUIRE(c.size() >= 2);
+        double wr = turnWireRadius(turns[i]);
+        requireCrossingOnCenterline(conductor->shape, gp_Pnt(c[0], c[1], 0.0), wr,
+                                    gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+                                    "turn " + turns[i].get_name() + " inner crossing");
+        if (i + 1 < turns.size()) {
+            auto add = turns[i].get_additional_coordinates();
+            REQUIRE(add.has_value());
+            REQUIRE(!add->empty());
+            requireCrossingOnCenterline(conductor->shape,
+                                        gp_Pnt((*add)[0][0], (*add)[0][1], 0.0), wr,
+                                        gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+                                        "turn " + turns[i].get_name() + " outer crossing");
+        }
+    }
+
+    // Exact bore: wall contact is true tangency, zero interference within OCCT booleans.
+    requireNoPairwiseOverlap(named, 1e-12);
+    int solids = 0;
+    for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
+        ++solids;
+    if (solids == 1) REQUIRE(!hasSelfIntersections(conductor->shape));
 }
 
 TEST_CASE("Real winding: pre-enriched input with the flag on throws", "[realwinding]") {

@@ -50,10 +50,16 @@ public:
                                             int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                             bool paintCoating = true);
 
-    // Resolve the wire cross-section {width, height} without a Turn context (outer
-    // footprint or copper per paintCoating). Used by ConductorBuilder, which sweeps whole
-    // conductors instead of per-turn solids. Throws on missing wire data (no fallbacks).
+    // Resolve the wire cross-section {width, height} (outer footprint or copper per
+    // paintCoating). Used by ConductorBuilder, which sweeps whole conductors instead of
+    // per-turn solids. Prefer the Turn overload: turn.dimensions carries the OUTER
+    // footprint, whereas the context-less overload can only fall back to the wire's own
+    // diameters (a bare round wire then resolves to its CONDUCTING diameter — too thin
+    // for paintCoating=true). Throws on missing wire data (no fallbacks).
     static std::pair<double, double> wireDimensions(const MAS::Wire& wire, bool paintCoating);
+    static std::pair<double, double> wireDimensions(const MAS::Wire& wire,
+                                                    const MAS::Turn& turn,
+                                                    bool paintCoating);
 
     // Fuse all SOLIDs of a compound into one — the same routine the per-turn fuse toggle
     // uses; exposed for ConductorBuilder's per-conductor compounds.

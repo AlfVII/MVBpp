@@ -23,8 +23,9 @@ namespace mvb {
 //     conductors and the winding-window bounds, and THROWS on any overlap beyond contact;
 //     nothing is ever moved to "make it fit".
 //
-// Milestone 1 scope: concentric ROUND columns with round/litz wire. Rectangular/oblong
-// columns and toroids throw (milestones 2 and 3).
+// Scope: concentric ROUND, RECTANGULAR and OBLONG columns and TOROIDS, with round/litz
+// wire. Rectangular/planar/foil wire throws (the lead cross-section orientation through
+// the exit bends is undefined until specified).
 class ConductorBuilder {
 public:
     struct Options {
