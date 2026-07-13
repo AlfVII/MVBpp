@@ -70,6 +70,15 @@ bool hasSelfIntersections(const TopoDS_Shape& s) {
     return checker.HasErrors();
 }
 
+// Facet-wedge bound: the cores are polygon-faceted (n-gon) approximations whose flats dip
+// inside the true round window bore by sag = r*(1-cos(pi/n)); a lead legitimately ending
+// at the true window border can therefore interpenetrate a facet by up to a wedge of
+// volume ~ pi*wireRadius^2 * sag, at each of the two lead ends.
+double coreFacetWedgeBound(double wireRadius, double borderRadius, int coreSegments) {
+    double sag = borderRadius * (1.0 - std::cos(std::numbers::pi / coreSegments));
+    return 2.0 * std::numbers::pi * wireRadius * wireRadius * sag;
+}
+
 // All-pairs boolean interference among named bodies (skipping the bobbin, which is
 // deliberately cut to yield). Tolerance covers polygon-facet slivers of the cores.
 void requireNoPairwiseOverlap(const std::vector<mvb::NamedShape>& named, double tol) {
@@ -144,7 +153,9 @@ TEST_CASE("Real winding: single-parallel PQ33 becomes one continuous conductor",
     //     the consecutive pieces legitimately overlap at their junctions (the wire's own
     //     crossovers) — for that case the capsule gate + station probes + (a) are the
     //     collision guarantee.
-    requireNoPairwiseOverlap(named, 1e-10);
+    // Tolerance: the facet-wedge bound for this fixture (wire radius 0.4795 mm, window
+    // border ~13.75 mm, 16-gon cores).
+    requireNoPairwiseOverlap(named, coreFacetWedgeBound(0.0004795, 0.01375, 16));
     int conductorSolids = 0;
     for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
         ++conductorSolids;
@@ -205,12 +216,14 @@ TEST_CASE("Real winding: two parallels become two independent conductors", "[rea
     }
 }
 
-TEST_CASE("Real winding: multi-parallel LAYER JUMPS throw until MKF reserves a corridor",
+TEST_CASE("Real winding: multi-parallel throws on MKF's overlapping lead rows",
           "[realwinding]") {
-    // Known, documented limitation: parallels jump layers in lockstep and their crossing
-    // jump chords cannot be routed collision-free while every turn stays at its exact MKF
-    // position — MKF must first reserve an angular crossover corridor (MKF ABT #187). The
-    // collision gate must refuse loudly, never bend the geometry.
+    // Under the N+1-crossing model every wrap (including layer transitions) is a spiral
+    // between consecutive crossings, so parallel conductors advance in lockstep and the
+    // former corridor problem is gone. What still blocks multi-parallel builds is that
+    // MKF draws every parallel's terminal lead at the SAME edge row (identical
+    // rectangles) — two physical wires on one line. The collision gate must refuse
+    // loudly until MKF allocates one row per lead (MKF ABT #229).
     auto magneticJson = loadFixture("realwinding_round_2p.json");   // 8t x 2p -> multi-layer
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
 
@@ -219,7 +232,7 @@ TEST_CASE("Real winding: multi-parallel LAYER JUMPS throw until MKF reserves a c
         builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                               mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
                               /*useRealWindingGeometry=*/true),
-        Catch::Matchers::ContainsSubstring("ABT #187"));
+        Catch::Matchers::ContainsSubstring("collision"));
 }
 
 TEST_CASE("Real winding: pre-enriched input with the flag on throws", "[realwinding]") {

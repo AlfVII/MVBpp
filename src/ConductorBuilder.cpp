@@ -61,11 +61,6 @@ constexpr double kContactTol = 1e-7;
 // chosen so each chord sags inward by at most this fraction of the wire radius. The same
 // bound is granted back as contact allowance in the gate.
 constexpr double kMaxSagFraction = 0.02;
-// The bulge ramps outside the plateau re-approach the layer radius; their width is a
-// shape choice (any positive width clears, since the wrap is already one OD away
-// axially by the plateau edge — see the bulge derivation at the call site).
-constexpr double kBulgeRampFraction = 0.3;
-
 // The connection plane ("connections radial, 90 degrees from the turns, in the YZ
 // plane"). MKF's 2D winding-window cross-section maps into 3D at this azimuth:
 // 2D (x = radial, y = axial) -> 3D (0, y, -x). Every turn starts/ends here; every drawn
@@ -629,31 +624,6 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
     return {{station.x, station.y}, {station.x, edgeY}, {borderX, edgeY}};
 }
 
-// Link waypoints between two stations from MKF's link rect group:
-//   any rect rotated          -> Z diagonal, straight station-to-station;
-//   edge run at neither level -> U interleaved: stub / edge run / stub;
-//   otherwise                 -> U adjacent elbow: horizontal then vertical.
-std::vector<PlanePt> linkWaypoints(const std::vector<const RSpace*>& group,
-                                   const PlanePt& src, const PlanePt& dst) {
-    for (const RSpace* s : group) {
-        if (std::abs(s->rotation) > 1e-9) return {src, dst};
-    }
-    const RSpace* edgeRun = nullptr;
-    for (const RSpace* s : group) {
-        if (!rectIsVertical(*s) &&
-            std::abs(s->coordinates.at(1) - src.y) > 1e-12 &&
-            std::abs(s->coordinates.at(1) - dst.y) > 1e-12) {
-            edgeRun = s;
-        }
-    }
-    if (edgeRun) {
-        double edgeY = edgeRun->coordinates.at(1);
-        return {src, {src.x, edgeY}, {dst.x, edgeY}, dst};
-    }
-    if (std::abs(dst.y - src.y) < 1e-12) return {src, dst};
-    return {src, {dst.x, src.y}, dst};
-}
-
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------------------
@@ -738,27 +708,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         return {c[0], c[1]};
     };
 
-    // Ring stations per winding: every turn whose wrap is an open RING (the turn before a
-    // layer jump and the last turn) — stations other parallels' spirals may cross and
-    // must bulge over.
-    std::map<std::string, std::vector<std::pair<size_t, PlanePt>>> ringStationsByWinding;
-    for (size_t ci = 0; ci < conductors.size(); ++ci) {
-        const auto& ct = conductors[ci];
-        auto wIt = wireMap.find(ct.winding);
-        if (wIt == wireMap.end()) {
-            throw std::runtime_error("ConductorBuilder: winding '" + ct.winding +
-                                     "' has no wire in coil.functionalDescription");
-        }
-        auto [wireW, wireH] = TurnBuilder::wireDimensions(wIt->second, opts.paintCoating);
-        double od = std::min(wireW, wireH);
-        for (size_t i = 0; i < ct.turns.size(); ++i) {
-            PlanePt s = station(ct.turns[i]);
-            bool ring = (i + 1 == ct.turns.size()) ||
-                        std::abs(station(ct.turns[i + 1]).x - s.x) > od / 2.0;
-            if (ring) ringStationsByWinding[ct.winding].push_back({ci, s});
-        }
-    }
-
     std::vector<ConductorPath> paths;
     paths.reserve(conductors.size());
 
@@ -780,28 +729,33 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // This conductor's drawn rects: terminals split entrance/exit by which station
         // the group touches; links matched per jump geometrically.
         std::vector<const RSpace*> terminalRects;
-        std::vector<const RSpace*> linkRects;
         for (const auto& s : drawn) {
             if (s.winding != ct.winding || s.parallel != ct.parallel) continue;
-            (s.isTerminal ? terminalRects : linkRects).push_back(&s);
+            if (s.isTerminal) terminalRects.push_back(&s);
+            // Non-terminal (blue) link rects stay 2D documentation: the conical wrap
+            // between the crossings IS the 3D transition.
         }
-        auto rectTouches = [&](const RSpace* s, const PlanePt& p) {
-            return std::abs(s->coordinates.at(0) - p.x) <=
-                       s->dimensions.at(0) / 2.0 + kContactTol &&
-                   std::abs(s->coordinates.at(1) - p.y) <=
-                       s->dimensions.at(1) / 2.0 + kContactTol;
-        };
+        // Terminal grouping follows MKF's emission order (verified in
+        // get_connection_reserved_spaces): per (winding, parallel) the ENTRANCE lead's
+        // rects are pushed first, then the EXIT lead's, each as [vertical stub?,
+        // horizontal run] — the run closes its group. Proximity-based grouping is
+        // ambiguous when a crossing sits within a wire of the window edge (the entrance
+        // edge run then "touches" the exit station too).
         std::vector<const RSpace*> entranceGroup, exitGroup;
-        for (const RSpace* s : terminalRects) {
-            bool nearFirst = rectTouches(s, first);
-            bool nearLast = rectTouches(s, last);
-            if (nearFirst && !nearLast) { entranceGroup.push_back(s); continue; }
-            if (nearLast && !nearFirst) { exitGroup.push_back(s); continue; }
-            double dFirst = std::hypot(s->coordinates.at(0) - first.x,
-                                       s->coordinates.at(1) - first.y);
-            double dLast = std::hypot(s->coordinates.at(0) - last.x,
-                                      s->coordinates.at(1) - last.y);
-            (dFirst <= dLast ? entranceGroup : exitGroup).push_back(s);
+        {
+            std::vector<std::vector<const RSpace*>> groups(1);
+            for (const RSpace* s : terminalRects) {
+                groups.back().push_back(s);
+                if (!rectIsVertical(*s)) groups.emplace_back();   // run closes the group
+            }
+            if (!groups.empty() && groups.back().empty()) groups.pop_back();
+            if (groups.size() != 2) {
+                throw std::runtime_error(
+                    "ConductorBuilder: expected 2 terminal lead groups (entrance, exit) "
+                    "for " + path.name + ", got " + std::to_string(groups.size()));
+            }
+            entranceGroup = groups[0];
+            exitGroup = groups[1];
         }
 
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
@@ -844,92 +798,24 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             pushPlaneSegs(wp, "entrance lead", 0);
         }
 
-        // Turns: spirals to the next station; open rings before jumps and at the end;
-        // links replay MKF's drawn route between the jump's stations.
-        for (size_t i = 0; i < turns.size(); ++i) {
+        // Wraps between consecutive CROSSINGS. Under MKF's real-winding model the
+        // turnsDescription holds the N+1 window crossings of an N-turn winding (the
+        // first entry is the beginning of the first turn), so wrap k sweeps one full
+        // 360-degree spiral from crossing k-1 to crossing k: a cylindrical helix within
+        // a layer, a conical spiral across a layer transition (radius and height both
+        // linear in azimuth). No closed rings exist anywhere and consecutive parallels
+        // advance in lockstep, so the whole conductor is one continuous, never
+        // self-touching path from entrance lead to exit lead.
+        for (size_t i = 0; i + 1 < turns.size(); ++i) {
             PlanePt s = station(turns[i]);
-            bool isLast = (i + 1 == turns.size());
-            PlanePt nxt = isLast ? s : station(turns[i + 1]);
-            bool layerJump = !isLast && std::abs(nxt.x - s.x) > od / 2.0;
-
-            if (!isLast && !layerJump) {
-                // Intra-layer advance: one-wrap spiral, bulging over other parallels'
-                // rings it crosses (trapezoid profile: +OD plateau while within one wire
-                // envelope of the crossed ring, entry/exit ramps outside).
-                struct Cross { double az; };
-                std::vector<Cross> crossings;
-                for (const auto& [cj, ringSt] : ringStationsByWinding[ct.winding]) {
-                    if (cj == ci) continue;
-                    if (std::abs(ringSt.x - s.x) > od / 2.0) continue;
-                    double lo = std::min(s.y, nxt.y) + od / 2.0;
-                    double hi = std::max(s.y, nxt.y) - od / 2.0;
-                    if (ringSt.y <= lo || ringSt.y >= hi) continue;
-                    double frac = (ringSt.y - s.y) / (nxt.y - s.y);
-                    crossings.push_back({kPlaneAz + kTwoPi * frac});
-                }
-                std::sort(crossings.begin(), crossings.end(),
-                          [](const Cross& a, const Cross& b) { return a.az < b.az; });
-                double slope = std::abs(nxt.y - s.y) / kTwoPi;
-                double clearDy = od + kMaxSagFraction * 2.0 * wireRadius;
-                double wPlateau = (slope > 1e-12) ? clearDy / slope : kTwoPi;
-                double wRamp = kBulgeRampFraction * wPlateau;
-                auto heightAt = [&](double az) {
-                    return s.y + (nxt.y - s.y) * (az - kPlaneAz) / kTwoPi;
-                };
-                double azCur = kPlaneAz;
-                double rCur = s.x;
-                size_t part = 0;
-                auto pushSpiral = [&](double azTo, double rTo, const char* what) {
-                    azTo = std::min(azTo, kPlaneAz + kTwoPi);
-                    if (azTo - azCur < 1e-9) { rCur = rTo; return; }
-                    Primitive pr;
-                    pr.kind = Primitive::SPIRAL;
-                    pr.spiral = {rCur, heightAt(azCur), azCur, rTo, heightAt(azTo), azTo};
-                    pr.label = "turn '" + turns[i]->get_name() + "' (" + what + " " +
-                               std::to_string(part++) + ")";
-                    pr.turnOrdinal = i;
-                    path.prims.push_back(std::move(pr));
-                    azCur = azTo;
-                    rCur = rTo;
-                };
-                for (const auto& cx : crossings) {
-                    if (cx.az - wPlateau - wRamp < azCur - 1e-9 ||
-                        cx.az + wPlateau + wRamp > kPlaneAz + kTwoPi + 1e-9) {
-                        throw std::runtime_error(
-                            "ConductorBuilder: multifilar crossover bulge for turn '" +
-                            turns[i]->get_name() +
-                            "' does not fit within one wrap (pitch too small relative to "
-                            "the wire OD) — see MKF ABT #187");
-                    }
-                    pushSpiral(cx.az - wPlateau - wRamp, s.x, "helical");
-                    pushSpiral(cx.az - wPlateau, s.x + od, "crossover ramp");
-                    pushSpiral(cx.az + wPlateau, s.x + od, "crossover plateau");
-                    pushSpiral(cx.az + wPlateau + wRamp, s.x, "crossover ramp");
-                }
-                pushSpiral(kPlaneAz + kTwoPi, nxt.x, "helical");
-                continue;
-            }
-
-            // Open ring at the exact station (turn before a jump, or the last turn).
-            path.prims.push_back({Primitive::ARC, {s.x, s.y, kPlaneAz, kTwoPi}, {}, {},
-                                  "turn '" + turns[i]->get_name() + "' (open ring)", i});
-
-            if (layerJump) {
-                // The blue-box route for this jump, matched geometrically.
-                std::vector<const RSpace*> group;
-                double loX = std::min(s.x, nxt.x) - od;
-                double hiX = std::max(s.x, nxt.x) + od;
-                for (const RSpace* r : linkRects) {
-                    double cx = r->coordinates.at(0);
-                    if (cx >= loX && cx <= hiX &&
-                        (rectTouches(r, s) || rectTouches(r, nxt) ||
-                         std::abs(r->rotation) > 1e-9)) {
-                        group.push_back(r);
-                    }
-                }
-                auto wp = linkWaypoints(group, s, nxt);
-                pushPlaneSegs(wp, "layer link " + std::to_string(i), i);
-            }
+            PlanePt nxt = station(turns[i + 1]);
+            Primitive wrap;
+            wrap.kind = Primitive::SPIRAL;
+            wrap.spiral = {s.x, s.y, kPlaneAz, nxt.x, nxt.y, kPlaneAz + kTwoPi};
+            wrap.label = "wrap '" + turns[i]->get_name() + "' -> '" +
+                         turns[i + 1]->get_name() + "'";
+            wrap.turnOrdinal = i;
+            path.prims.push_back(std::move(wrap));
         }
 
         // Exit: MKF's drawn route from the last station out to the border.
