@@ -149,6 +149,11 @@ struct Primitive {
     // (wrap chains are tangent-continuous), and OCCT's pipe-shell mitre flares unboundedly
     // across them, while lead chains sweep robustly as exact cylinders + sphere elbows.
     bool isLead = false;
+    // An inter-layer link (MKF's blue ConnectionReservedSpace box): the straight radial
+    // step that carries the wire from one concentric layer out to the next. Like a lead it
+    // meets its neighbouring wraps at 90-degree corners, so it is isolated into its own run
+    // and swept piecewise (cylinder + sphere elbows) rather than through the pipe-shell.
+    bool isConnection = false;
 };
 struct ConductorPath {
     std::string name;
@@ -628,8 +633,12 @@ std::vector<std::pair<size_t, size_t>> continuousRuns(const ConductorPath& path)
             start = i + 1;
             continue;
         }
+        // Split at lead<->wrap and inter-layer-link<->wrap boundaries alike: both meet the
+        // wrap chain at 90-degree corners that would flare the pipe-shell, and both sweep
+        // robustly as cylinders + sphere elbows on their own.
         bool leadBoundary = (i + 1 < path.prims.size()) &&
-                            (path.prims[i].isLead != path.prims[i + 1].isLead);
+                            ((path.prims[i].isLead != path.prims[i + 1].isLead) ||
+                             (path.prims[i].isConnection != path.prims[i + 1].isConnection));
         if (i + 1 < path.prims.size() && (visits[quantize(b)] > 2 || leadBoundary)) {
             if (std::getenv("MVB_DEBUG_RUNS")) {
                 std::cerr << "SPLIT after prim " << i << " [" << path.prims[i].label
@@ -808,7 +817,8 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                               auto [pa, pb] = primEndpoints(*ptrs[b]);
                               return pa.Distance(pb) < 1e-9;
                           }();
-        bool leadRun = ptrs[b]->isLead;   // runs never mix lead and wrap primitives
+        // runs never mix lead/link and wrap primitives (continuousRuns splits at both)
+        bool leadRun = ptrs[b]->isLead || ptrs[b]->isConnection;
         TopoDS_Shape run;
         if (!closedRing && !leadRun) {
             run = sweepRun(ptrs.data() + b, e - b, path.wireRadius, wirePolygonSegments);
@@ -892,10 +902,29 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
 // holds the N+1 window crossings of an N-turn winding (the first entry is the beginning
 // of the first turn), so no closed loops exist anywhere.
 
-// ROUND column: one full 360-degree spiral about the column axis — cylindrical within a
-// layer, conical across a layer transition (radius and height both linear in azimuth).
+// ROUND column: within a layer, one full 360-degree cylindrical spiral about the column
+// axis. A SERPENTINE (U) layer transition connects the same end of two adjacent layers, so
+// the two crossings share the connection-plane azimuth and axial height but sit at different
+// radii — the wire does not wrap around again, it steps straight out radially to the next
+// layer. That radial step is exactly MKF's blue inter-layer link box: a short straight wire
+// leaving along -Z until it reaches the layer it connects to, rather than a full conical
+// wrap around the whole top of the winding. Detect it as a predominantly-radial move (radius
+// change over one wire radius, and larger than the axial change). A Z-style transition
+// instead flies back from the top of one layer to the bottom of the next (axial change
+// dominates); that stays a conical spiral, the true diagonal return path.
 void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
-                     const std::string& label, size_t ordinal) {
+                     double wireRadius, const std::string& label, size_t ordinal) {
+    if (std::abs(n.x - s.x) > wireRadius && std::abs(n.y - s.y) <= std::abs(n.x - s.x)) {
+        Primitive step;
+        step.kind = Primitive::SEG;
+        step.seg = {azPointC(0, 0, s.x, s.y, kPlaneAz),
+                    azPointC(0, 0, n.x, n.y, kPlaneAz)};
+        step.label = label + " (layer link)";
+        step.turnOrdinal = ordinal;
+        step.isConnection = true;
+        path.prims.push_back(std::move(step));
+        return;
+    }
     Primitive wrap;
     wrap.kind = Primitive::SPIRAL;
     wrap.spiral = {0, 0, s.x, s.y, kPlaneAz, n.x, n.y, kPlaneAz + kTwoPi};
@@ -1676,7 +1705,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             std::string label = "wrap '" + turns[i]->get_name() + "' -> '" +
                                 turns[i + 1]->get_name() + "'";
             if (effectivelyRound) {
-                appendRoundWrap(path, s, nxt, label, i);
+                appendRoundWrap(path, s, nxt, wireRadius, label, i);
             } else if (columnShape == MAS::ColumnShape::RECTANGULAR) {
                 appendRectWrap(path,
                                rectStation(s, halfW, halfD, minBend, path.name),
