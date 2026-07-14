@@ -182,7 +182,7 @@ TEST_CASE("Real winding: flag off keeps the per-turn loops unchanged", "[realwin
         if (ns.name.find(" turn ") != std::string::npos) ++turnSolids;
         if (ns.name == "Primary parallel 0") sawConductor = true;
     }
-    REQUIRE(turnSolids == 34);   // 34 turns x 1 parallel, one closed loop each
+    REQUIRE(turnSolids == 16);   // 16 turns x 1 parallel, one closed loop each (2 layers)
     REQUIRE(!sawConductor);
 }
 
