@@ -1644,9 +1644,27 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
         };
 
-        // Entrance: MKF's drawn route, walked from the border TO the first station.
+        // How far the terminal leads stick OUT past the winding, in the connection
+        // plane's radial (-Z) direction — the winding-window opening side. Like the
+        // toroidal lead ("radially outward, past the outer diameter and beyond"), the
+        // concentric lead runs out past the outermost turn so the flat terminal face sits
+        // clear of the coil for FEM. maxTurnRadius is the outermost crossing.
+        double maxTurnRadius = 0.0;
+        for (const MAS::Turn* t : turns)
+            maxTurnRadius = std::max(maxTurnRadius, station(t).x);
+        const double leadTipRadius = maxTurnRadius + 4.0 * (2.0 * wireRadius);
+        auto extendBorder = [&](std::vector<PlanePt>& wp) {
+            // The border waypoint is the one farthest out radially; push it to leadTipRadius.
+            PlanePt* outer = &wp.front();
+            for (auto& p : wp) if (p.x > outer->x) outer = &p;
+            outer->x = std::max(outer->x, leadTipRadius);
+        };
+
+        // Entrance: MKF's drawn route, walked from the border TO the first station, then
+        // extended straight out so the terminal sticks clear of the coil.
         {
             auto wp = terminalWaypoints(entranceGroup, first, path.name + " entrance");
+            extendBorder(wp);
             std::reverse(wp.begin(), wp.end());
             pushPlaneSegs(wp, "entrance lead", 0);
         }
@@ -1669,9 +1687,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
         }
 
-        // Exit: MKF's drawn route from the last station out to the border.
+        // Exit: MKF's drawn route from the last station out to the border, extended out.
         {
             auto wp = terminalWaypoints(exitGroup, last, path.name + " exit");
+            extendBorder(wp);
             pushPlaneSegs(wp, "exit lead", turns.size() - 1);
         }
 
