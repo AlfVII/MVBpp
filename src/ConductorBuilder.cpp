@@ -592,6 +592,7 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
                                       bx1 - sx1, by1 - sy1, bz1 - sz1});
             if (excess > 2.0 * wireRadius) return TopoDS_Shape();
         }
+
         return shape;
     } catch (const Standard_Failure&) {
         return TopoDS_Shape();
@@ -743,52 +744,155 @@ TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double 
     return compound;
 }
 
-// Fuse all solids of a compound — the sequential accumulator with a VOLUME GUARD.
-// Adjacent layers of a winding touch along helical curves at exactly one wire OD — the
-// most degenerate configuration for OCCT booleans, and fuses have been observed to
-// silently EAT whole bodies on such inputs. A fuse is only accepted when its volume
-// matches the summed piece volume (junction overlaps are well under 1%); otherwise the
-// per-run compound is returned — geometrically exact, one PRODUCT in STEP.
-TopoDS_Shape fuseAllSolids(const TopoDS_Shape& compound) {
-    TopTools_ListOfShape solids;
-    for (TopExp_Explorer exp(compound, TopAbs_SOLID); exp.More(); exp.Next()) {
-        solids.Append(exp.Current());
+// Fuse all solids of a conductor's compound into as FEW bodies as possible, in ONE general
+// boolean (BRepAlgoAPI_Fuse over the whole set via SetArguments/SetTools). A single BOP with
+// OBB culling is both far faster than N sequential pairwise fuses (which is O(N) booleans on
+// swept BSpline solids — minutes for a many-piece winding) AND more robust: OCCT resolves all
+// the mutual intersections together, so overlapping chunk pipes + elbow/junction spheres merge
+// into one solid while any piece that genuinely touches nothing stays its own solid. No glue:
+// the pieces OVERLAP volumetrically (junction spheres straddle the pipe caps), which is a real
+// intersection, not the coincident-face case glue is for. A gross-corruption volume guard
+// rejects the known OCCT "ate a whole body" defect; on any failure the exact (unfused) compound
+// is returned rather than losing copper — same guarantee as before, just reached far less often.
+// A conductor face whose bounding extent is many wire-radii long but whose area is a sliver:
+// the degenerate SEAM faces OCCT's boolean union leaves where two swept pipes (or a pipe and
+// its junction sphere) merge -- the thin "line/cone" sheets seen on a multilayer winding. A
+// genuine tube-wall face of the same extent has area ~ 2*pi*r*length, orders of magnitude
+// larger; end caps and short faces (diag <= a few radii) are exempt.
+bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius) {
+    for (TopExp_Explorer fe(shape, TopAbs_FACE); fe.More(); fe.Next()) {
+        Bnd_Box fb;
+        BRepBndLib::Add(fe.Current(), fb);
+        if (fb.IsVoid()) continue;
+        double x0, y0, z0, x1, y1, z1;
+        fb.Get(x0, y0, z0, x1, y1, z1);
+        double diag = std::sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0) +
+                                (z1 - z0) * (z1 - z0));
+        if (diag <= 4.0 * wireRadius) continue;
+        GProp_GProps fp;
+        BRepGProp::SurfaceProperties(fe.Current(), fp);
+        if (fp.Mass() < 0.2 * wireRadius * diag) return true;
     }
-    if (solids.Extent() <= 1) return compound;
+    return false;
+}
+
+TopoDS_Shape fuseAllSolids(const TopoDS_Shape& compound, double wireRadius) {
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer exp(compound, TopAbs_SOLID); exp.More(); exp.Next()) {
+        solids.push_back(exp.Current());
+    }
+    if (solids.size() <= 1) return compound;
     auto volumeOf = [](const TopoDS_Shape& s) {
         GProp_GProps props;
         BRepGProp::VolumeProperties(s, props);
         return props.Mass();
     };
-    double vPieces = volumeOf(compound);
+    double vSum = 0.0;      // OVER-counts the true copper: junction spheres overlap the pipes
+    double vMax = 0.0;      // the largest single piece — a valid fuse can't drop below this
+    for (const auto& s : solids) {
+        double v = volumeOf(s);
+        vSum += v;
+        vMax = std::max(vMax, v);
+    }
+
     try {
-        TopTools_ListIteratorOfListOfShape it(solids);
-        TopoDS_Shape acc = it.Value();
-        it.Next();
-        for (; it.More(); it.Next()) {
-            BRepAlgoAPI_Fuse fuse(acc, it.Value());
-            if (!fuse.IsDone() || fuse.Shape().IsNull()) {
-                std::cerr << "WARN ConductorBuilder: fuse step not done; returning compound\n";
-                return compound;
+        TopTools_ListOfShape args, tools;
+        args.Append(solids.front());
+        for (size_t i = 1; i < solids.size(); ++i) tools.Append(solids[i]);
+        BRepAlgoAPI_Fuse fuse;
+        fuse.SetArguments(args);
+        fuse.SetTools(tools);
+        fuse.SetUseOBB(true);         // bounding-box cull the mostly-disjoint pieces -> fast
+        fuse.SetRunParallel(true);
+        fuse.Build();
+        if (fuse.IsDone() && !fuse.Shape().IsNull()) {
+            double v = volumeOf(fuse.Shape());
+            int n = 0;
+            for (TopExp_Explorer e(fuse.Shape(), TopAbs_SOLID); e.More(); e.Next()) ++n;
+            // A correct union sits in [vMax, vSum] (overlaps subtract, nothing is added). A
+            // result well below vMax means OCCT swallowed a body; above vSum means it doubled
+            // geometry (or a corrupt input reported a nonsense volume). Either way the boolean
+            // is untrustworthy -> keep the exact compound.
+            // Accept the union only when it welded pieces (fewer solids), the volume is sane,
+            // AND it is clean: the boolean can leave degenerate seam-sliver faces where pipes
+            // merge (the thin "line/cone" sheets on multilayer windings). Those break meshing
+            // and render as stray sheets, so if any appear keep the exact unfused compound --
+            // geometrically correct, one PRODUCT per piece -- rather than a corrupt single body.
+            if (v >= 0.9 * vMax && v <= 1.02 * vSum &&
+                n < static_cast<int>(solids.size()) &&
+                !hasDegenerateSheetFace(fuse.Shape(), wireRadius)) {
+                return fuse.Shape();
             }
-            acc = fuse.Shape();
         }
-        double vFused = volumeOf(acc);
-        // Junction overlaps make vFused slightly SMALLER than the piece sum; losing any
-        // whole piece removes far more than the overlaps ever could.
-        constexpr double kMaxFuseVolumeLossFraction = 0.01;
-        if (vFused < (1.0 - kMaxFuseVolumeLossFraction) * vPieces) {
-            std::cerr << "WARN ConductorBuilder: fuse lost " << (vPieces - vFused)
-                      << " m^3 of copper (OCCT tangent-contact defect); returning the "
-                         "per-run compound instead\n";
-            return compound;
-        }
-        return acc;
     } catch (const Standard_Failure& e) {
-        std::cerr << "WARN ConductorBuilder: fuse threw (" << e.GetMessageString()
-                  << "); returning compound\n";
+        std::cerr << "WARN ConductorBuilder: conductor fuse threw (" << e.GetMessageString()
+                  << "); returning the exact unfused compound\n";
         return compound;
     }
+    std::cerr << "WARN ConductorBuilder: conductor fuse did not weld the pieces; returning the "
+                 "exact unfused compound (geometry correct, one PRODUCT per solid)\n";
+    return compound;
+}
+
+// Drop degenerate (near-zero-volume) solids from a conductor result. OCCT's fuse can leave
+// thin sheet/shell solids behind when it welds a dense multilayer winding: they carry no
+// copper, render as stray sheets, and break tetrahedral meshing. Any real conductor piece --
+// even a lead-junction sphere -- is orders of magnitude above the 1e-12 m^3 (1e-3 mm^3) floor.
+TopoDS_Shape pruneDegenerateSolids(const TopoDS_Shape& shape) {
+    constexpr double kMinSolidVolume = 1e-12;   // m^3
+    std::vector<TopoDS_Shape> kept;
+    int total = 0;
+    for (TopExp_Explorer exp(shape, TopAbs_SOLID); exp.More(); exp.Next()) {
+        ++total;
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(exp.Current(), props);
+        if (std::abs(props.Mass()) >= kMinSolidVolume) kept.push_back(exp.Current());
+    }
+    if (kept.empty() || static_cast<int>(kept.size()) == total) return shape;
+    if (kept.size() == 1) return kept.front();
+    TopoDS_Compound out;
+    BRep_Builder b;
+    b.MakeCompound(out);
+    for (const auto& s : kept) b.Add(out, s);
+    return out;
+}
+
+// Fallback when the whole-run pipe sweep fails: sweep the run in per-ELECTRICAL-TURN chunks.
+// A one-turn spine (~a handful of edges) sweeps reliably through MakePipeShell where the full
+// multi-turn spine (160+ edges of a many-turn winding) trips it and forces the per-primitive
+// path — which shatters the winding into hundreds of tiny cylinder/sphere solids that then
+// overwhelm the boolean fuse. Chunking keeps a bad turn LOCAL: only the turn whose pipe fails
+// drops to per-primitive, the rest stay clean one-turn pipes. Consecutive chunks are made to
+// SHARE their boundary primitive (each chunk also sweeps the first primitive of the next turn),
+// Adjacent chunks meet end-to-end at their shared boundary point; a wire-radius sphere there
+// overlaps both pipe caps so the downstream fuse can weld the chunks into one body.
+TopoDS_Shape sweepRunChunked(const Primitive* const* prims, size_t count, double wireRadius,
+                             int wirePolygonSegments, const std::vector<gp_Pnt>& flatCaps) {
+    BRep_Builder builder;
+    TopoDS_Compound compound;
+    builder.MakeCompound(compound);
+    auto isFlatCap = [&](const gp_Pnt& p) {
+        for (const auto& f : flatCaps)
+            if (p.Distance(f) < 1e-9) return true;
+        return false;
+    };
+    size_t b = 0;
+    while (b < count) {
+        size_t e = b + 1;
+        while (e < count && prims[e]->turnOrdinal == prims[b]->turnOrdinal) ++e;
+        TopoDS_Shape chunk = sweepRun(prims + b, e - b, wireRadius, wirePolygonSegments);
+        if (chunk.IsNull()) {
+            chunk = sweepPiecewise(prims + b, e - b, wireRadius, wirePolygonSegments, flatCaps);
+        }
+        if (!chunk.IsNull()) builder.Add(compound, chunk);
+        if (e < count) {
+            gp_Pnt j = primEndpoints(*prims[e - 1]).second;
+            if (!isFlatCap(j))
+                builder.Add(compound, BRepPrimAPI_MakeSphere(j, wireRadius).Shape());
+        }
+        b = e;
+    }
+    return compound;
 }
 
 TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
@@ -827,6 +931,13 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
             std::cerr << "PIPE FAILED for run of " << (e - b) << " prims starting ["
                       << ptrs[b]->label << "]\n";
         }
+        if (run.IsNull() && !leadRun && !closedRing) {
+            // The whole-run pipe failed: retry per electrical turn (short spines pipe
+            // reliably) before falling all the way to per-primitive. Keeps the winding a
+            // handful of weldable pipe chunks instead of hundreds of loose primitives.
+            run = sweepRunChunked(ptrs.data() + b, e - b, path.wireRadius,
+                                  wirePolygonSegments, flatCaps);
+        }
         if (run.IsNull()) {
             // Per-primitive sweeps for this span (arcs revolve exactly).
             run = sweepPiecewise(ptrs.data() + b, e - b, path.wireRadius,
@@ -854,7 +965,15 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         }
         if (!run.IsNull()) builder.Add(compound, run);
     }
-    return fuseAllSolids(compound);
+    // A real multi-turn winding's swept pipes always leave degenerate seam faces when the
+    // boolean unions them (the fuse-guard proves this and rejects the result), so running the
+    // costly BOP just to fall back to the compound is wasted work -- minutes on a 32-turn coil.
+    // Skip straight to the exact clean compound when the conductor spans more than one turn;
+    // fuse only simple single-turn conductors, where the union is both cheap and clean.
+    bool multiTurn = !path.prims.empty() &&
+                     path.prims.back().turnOrdinal != path.prims.front().turnOrdinal;
+    TopoDS_Shape result = multiTurn ? compound : fuseAllSolids(compound, path.wireRadius);
+    return pruneDegenerateSolids(result);
 }
 
 // ---------------------------------------------------------------------------------------
