@@ -430,23 +430,49 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
     if (solids == 1) REQUIRE(!hasSelfIntersections(conductor->shape));
 }
 
-TEST_CASE("Real winding: OVER-PACKED multi-layer toroidal throws", "[realwinding]") {
-    // A spread 3-winding toroidal CMC with 38 turns of 0.9 mm wire per 120-degree
-    // section — MKF packs that many turns so tightly that the inner crossings sit under
-    // one wire OD apart (the turns physically overlap, MKF ABT #231). The collision gate
-    // must refuse loudly; nothing is moved to "make it fit". A FEASIBLE multilayer CMC
-    // (realwinding_cmc_3w_2layer, 18 turns of 1.4 mm wire = a comfortable 2 rings per
-    // section) builds cleanly — see the demo — once the outer-crossing radial stack is
-    // corrected and the ring returns are depth-staggered under the core.
-    auto magneticJson = loadFixture("realwinding_cmc_3w.json");
+TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean",
+          "[realwinding]") {
+    // A spread 3-winding toroidal CMC with TWO rings per 120-degree section
+    // (realwinding_cmc_3w_2layer: 18 turns of 1.4 mm wire per winding). Multilayer
+    // toroidal builds once MKF's non-physical outer crossings are corrected on the
+    // builder side (MKF ABT #231): each outer ring's outer crossing is re-placed at the
+    // physical radial stack (ring 0 outer + ring*OD) AND at the inner crossing's azimuth
+    // — MKF staggers outer-ring outer angles out of sequence, which would cross
+    // consecutive turns' top chords (and the gate exempts consecutive wraps, so it slips
+    // through). Ring returns are depth-staggered under the core. The three windings must
+    // be fully independent bodies with two layers each.
+    auto magneticJson = loadFixture("realwinding_cmc_3w_2layer.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+    // Confirm the fixture really is 2 rings per section (else the test is vacuous).
+    {
+        auto layers = enriched.get_coil().get_layers_description();
+        REQUIRE(layers.has_value());
+        int primaryConductionLayers = 0;
+        for (const auto& L : *layers)
+            if (L.get_type() == MAS::ElectricalType::CONDUCTION &&
+                !L.get_partial_windings().empty() &&
+                L.get_partial_windings()[0].get_winding() == "Primary")
+                ++primaryConductionLayers;
+        REQUIRE(primaryConductionLayers == 2);
+    }
 
     mvb::MagneticBuilder builder;
-    REQUIRE_THROWS_WITH(
-        builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
-                              mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
-                              /*useRealWindingGeometry=*/true),
-        Catch::Matchers::ContainsSubstring("collision"));
+    auto named = builder.buildAllNamed(enriched, false, 0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       /*corePolygonSegments=*/0, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+    const char* names[] = {"Primary parallel 0", "Secondary parallel 0",
+                           "Tertiary parallel 0"};
+    std::vector<const mvb::NamedShape*> conductors;
+    for (const char* n : names) conductors.push_back(findConductor(named, n));
+    for (size_t i = 0; i < conductors.size(); ++i)
+        for (size_t j = i + 1; j < conductors.size(); ++j) {
+            double v = commonVolume(conductors[i]->shape, conductors[j]->shape);
+            INFO("winding-winding overlap '" << names[i] << "' vs '" << names[j]
+                                             << "' = " << v);
+            REQUIRE(v <= 1e-12);
+        }
+    requireNoPairwiseOverlap(named, 1e-12);
 }
 
 TEST_CASE("Real winding: single-layer spread 3-winding toroidal CMC builds clean",

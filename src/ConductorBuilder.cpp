@@ -1423,17 +1423,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             };
 
             // Corrected crossing: an OUTER ring's outer crossing is re-placed at the
-            // physical radial stack (ring 0's outer radius + ringIndex ODs), keeping
-            // MKF's outer ANGLE — the inner crossing (the turn's real position) and ring 0
-            // are untouched, so single-ring and single-layer builds are identical to
-            // before. This is the ONE deviation from MKF's toroidal geometry, and only
-            // because MKF's outer radius is self-overlapping (ABT #231); without it a
-            // multilayer toroid cannot be realized in 3D without the wires intersecting.
+            // physical radial stack (ring 0's outer radius + ringIndex ODs) AND at the
+            // INNER crossing's azimuth — a toroidal turn wraps the core poloidally at one
+            // fixed azimuth, so its outer crossing must share the inner's angle. MKF's
+            // collision-avoidance staggers outer-ring outer angles OUT OF SEQUENCE (ring 1
+            // outers can step backwards while the inners step forward, MKF ABT #231), which
+            // makes consecutive turns' top chords cross — and the collision gate exempts
+            // consecutive wraps, so it slips through. The inner crossing (the turn's real
+            // position) and ring 0 are untouched, so single-ring and single-layer builds
+            // are identical to before. This is the deviation from MKF's toroidal
+            // geometry, forced because MKF's outer crossings are non-physical for outer
+            // rings (self-overlapping radius + non-sequential angle).
             auto toroCross = [&](const MAS::Turn* t) -> ToroCross {
                 ToroCross rc = toroCrossRaw(t);
                 int k = ringIndexOfInner(rc.pin);
                 if (k > 0) {
-                    double ang = std::atan2(rc.pout.Y(), rc.pout.X());
+                    double ang = std::atan2(rc.pin.Y(), rc.pin.X());
                     double R = minRawOuter + k * od;
                     rc.pout = gp_XY(R * std::cos(ang), R * std::sin(ang));
                 }
