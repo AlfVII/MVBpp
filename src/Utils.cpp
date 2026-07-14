@@ -464,13 +464,25 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
             continue;
         }
 
+        // Validate the cut before accepting it. The winding sits AGAINST the bobbin -- the
+        // wire's inner radius equals the column's outer radius and the turns fit between the
+        // flanges -- so a correct cut removes at most thin tangent slivers, never a large
+        // fraction of a solid. OCCT's boolean (especially on an analytic exact-cylinder flange,
+        // and non-deterministically under the parallel path) can instead COLLAPSE a solid to a
+        // degenerate/inverted sheet. Detect either failure by volume and keep the ORIGINAL
+        // solid uncut rather than emit the corrupt result.
+        GProp_GProps origProps;
+        BRepGProp::VolumeProperties(solidScaled, origProps);
+        const double origVol = std::abs(origProps.Mass());
+        double resultVol = 0.0;
         bool inverted = false;
         for (TopExp_Explorer exp(current, TopAbs_SOLID); exp.More(); exp.Next()) {
             GProp_GProps props;
             BRepGProp::VolumeProperties(exp.Current(), props);
-            if (props.Mass() < 0) { inverted = true; break; }
+            if (props.Mass() < 0) inverted = true;
+            resultVol += props.Mass();
         }
-        if (inverted) {
+        if (inverted || resultVol < 0.5 * origVol) {
             cbld.Add(resultComp, solid);
             continue;
         }
