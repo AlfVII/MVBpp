@@ -25,11 +25,12 @@ static void printUsage(const char* prog) {
               << "  -d, --output-dir <dir> Output directory (batch mode)\n"
               << "  --no-mkf              Skip MKF enrichment\n"
               << "  --real                Real winding: continuous conductor per (winding, parallel)\n"
+              << "  --segments <N>        Wire+core polygon segments (0 = exact analytic curves)\n"
               << "  -h, --help            Show this help\n";
 }
 
 static bool processFile(const fs::path& inputPath, const fs::path& outputPath, bool useMkf,
-                        bool useRealWinding) {
+                        bool useRealWinding, int segments) {
     try {
         // Read JSON
         std::ifstream f(inputPath);
@@ -65,6 +66,7 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
             auto enriched = mvb::magnetic_autocomplete_safe(magnetic, true);
             mvb::DrawConfig cfg{format, includeBobbin, scale, symmetryPlanes};
             cfg.useRealWindingGeometry = true;
+            if (segments >= 0) { cfg.wirePolygonSegments = segments; cfg.corePolygonSegments = segments; }
             result = builder.drawMagnetic(enriched, outputPath.parent_path().string(), cfg);
         } else if (useMkf) {
             try {
@@ -113,6 +115,7 @@ int main(int argc, char* argv[]) {
     fs::path outputDir;
     bool useMkf = true;
     bool useRealWinding = false;
+    int segments = -1;  // -1 = builder default; 0 = exact analytic curves
     
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
@@ -129,6 +132,8 @@ int main(int argc, char* argv[]) {
             useMkf = false;
         } else if (arg == "--real") {
             useRealWinding = true;
+        } else if (arg == "--segments") {
+            if (++i < argc) segments = std::stoi(argv[i]);
         } else if (arg[0] != '-') {
             inputPath = arg;
         }
@@ -147,6 +152,6 @@ int main(int argc, char* argv[]) {
         outputPath = dir / (inputPath.stem().string() + "_mvbpp.step");
     }
     
-    bool success = processFile(inputPath, outputPath, useMkf, useRealWinding);
+    bool success = processFile(inputPath, outputPath, useMkf, useRealWinding, segments);
     return success ? 0 : 1;
 }

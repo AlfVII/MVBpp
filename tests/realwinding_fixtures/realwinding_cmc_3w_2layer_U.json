@@ -1,0 +1,47 @@
+{
+  "magnetic": {
+    "coil": {
+      "bobbin": {
+        "processedDescription": {
+          "columnDepth": 0.008,
+          "columnShape": "rectangular",
+          "columnThickness": 0.0,
+          "columnWidth": 0.004,
+          "coordinates": [0.0, 0.0, 0.0],
+          "pins": null,
+          "wallThickness": 0.0,
+          "windingWindows": [
+            {
+              "angle": 360.0,
+              "area": 0.0004523893421169302,
+              "column": null,
+              "coordinates": [0.012, 0.0, 0.0],
+              "height": null,
+              "radialHeight": 0.012,
+              "sectionsAlignment": "spread",
+              "sectionsOrientation": "contiguous",
+              "shape": "round",
+              "width": null,
+              "windingOrder": "U"
+            }
+          ]
+        }
+      },
+      "functionalDescription": [
+        {"isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 18, "wire": "Round 1.40 - Grade 1"},
+        {"isolationSide": "secondary", "name": "Secondary", "numberParallels": 1, "numberTurns": 18, "wire": "Round 1.40 - Grade 1"},
+        {"isolationSide": "tertiary", "name": "Tertiary", "numberParallels": 1, "numberTurns": 18, "wire": "Round 1.40 - Grade 1"}
+      ]
+    },
+    "core": {
+      "functionalDescription": {
+        "gapping": [],
+        "material": "HF 60",
+        "numberStacks": 1,
+        "shape": "T 40/24/16",
+        "type": "toroidal"
+      },
+      "name": "custom"
+    }
+  }
+}

@@ -648,10 +648,20 @@ std::vector<std::pair<size_t, size_t>> continuousRuns(const ConductorPath& path)
 // Per-piece fallback: sweep each primitive on its own (exact revolve for arcs, exact
 // cylinder + sphere elbows for segments, pipe for spirals), then fuse.
 TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double wireRadius,
-                            int wirePolygonSegments) {
+                            int wirePolygonSegments, const std::vector<gp_Pnt>& flatCaps) {
     BRep_Builder builder;
     TopoDS_Compound compound;
     builder.MakeCompound(compound);
+
+    // A terminal end (a free end of the whole conductor) gets NO sphere cap: the swept
+    // cylinder's flat end face is left exposed, so downstream FEM (Ansys, MFEM, ...) has a
+    // planar surface to assign the current boundary condition on. Interior joints keep
+    // their sphere so the wire envelope stays continuous across the elbows.
+    auto isFlatCap = [&](const gp_Pnt& p) {
+        for (const auto& f : flatCaps)
+            if (p.Distance(f) < 1e-9) return true;
+        return false;
+    };
 
     for (size_t pi = 0; pi < count; ++pi) {
         const auto& pr = *prims[pi];
@@ -677,9 +687,12 @@ TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double 
             builder.Add(compound,
                         BRepPrimAPI_MakeCylinder(gp_Ax2(pr.seg.a, dir), wireRadius, len)
                             .Shape());
-            // Sphere joints keep the wire envelope continuous across the plane elbows.
-            builder.Add(compound, BRepPrimAPI_MakeSphere(pr.seg.a, wireRadius).Shape());
-            builder.Add(compound, BRepPrimAPI_MakeSphere(pr.seg.b, wireRadius).Shape());
+            // Sphere joints keep the wire envelope continuous across the plane elbows —
+            // except at a terminal end, which stays a flat cylinder cap (FEM surface).
+            if (!isFlatCap(pr.seg.a))
+                builder.Add(compound, BRepPrimAPI_MakeSphere(pr.seg.a, wireRadius).Shape());
+            if (!isFlatCap(pr.seg.b))
+                builder.Add(compound, BRepPrimAPI_MakeSphere(pr.seg.b, wireRadius).Shape());
             continue;
         }
         TopoDS_Edge e = primEdge(pr, wireRadius);
@@ -711,9 +724,11 @@ TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double 
                 builder.Add(compound,
                             BRepPrimAPI_MakeCylinder(gp_Ax2(pts[j], dir), wireRadius, len)
                                 .Shape());
-                builder.Add(compound, BRepPrimAPI_MakeSphere(pts[j], wireRadius).Shape());
+                if (!isFlatCap(pts[j]))
+                    builder.Add(compound, BRepPrimAPI_MakeSphere(pts[j], wireRadius).Shape());
             }
-            builder.Add(compound, BRepPrimAPI_MakeSphere(pts.back(), wireRadius).Shape());
+            if (!isFlatCap(pts.back()))
+                builder.Add(compound, BRepPrimAPI_MakeSphere(pts.back(), wireRadius).Shape());
         }
     }
     return compound;
@@ -775,6 +790,15 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     ptrs.reserve(path.prims.size());
     for (const auto& pr : path.prims) ptrs.push_back(&pr);
 
+    // The conductor's two free ends (the terminal faces): the start of the first
+    // primitive (the entrance lead's outboard end) and the end of the last (the exit
+    // lead's) — swept with a flat cap for FEM current-injection surfaces.
+    std::vector<gp_Pnt> flatCaps;
+    if (!path.prims.empty()) {
+        flatCaps.push_back(primEndpoints(path.prims.front()).first);
+        flatCaps.push_back(primEndpoints(path.prims.back()).second);
+    }
+
     BRep_Builder builder;
     TopoDS_Compound compound;
     builder.MakeCompound(compound);
@@ -796,7 +820,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         if (run.IsNull()) {
             // Per-primitive sweeps for this span (arcs revolve exactly).
             run = sweepPiecewise(ptrs.data() + b, e - b, path.wireRadius,
-                                 wirePolygonSegments);
+                                 wirePolygonSegments, flatCaps);
         }
         if (std::getenv("MVB_DEBUG_RUNS") && !run.IsNull()) {
             Bnd_Box bb;

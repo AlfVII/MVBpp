@@ -13,6 +13,8 @@
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
+#include <BRepAdaptor_Surface.hxx>
+#include <GeomAbs_SurfaceType.hxx>
 #include <TopoDS_Edge.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
@@ -428,6 +430,18 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
     for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
         ++solids;
     if (solids == 1) REQUIRE(!hasSelfIntersections(conductor->shape));
+
+    // FEM terminal faces: the two free ends of the conductor are flat PLANAR discs (the
+    // swept lead cylinder's end cap, no sphere), so downstream FEM can assign a current
+    // BC on a planar surface. The wire is round and the whole conductor is otherwise
+    // cylinders/tori/revolves/spheres, so the only planar faces are the two terminals.
+    int planarFaces = 0;
+    for (TopExp_Explorer exp(conductor->shape, TopAbs_FACE); exp.More(); exp.Next()) {
+        BRepAdaptor_Surface sa(TopoDS::Face(exp.Current()));
+        if (sa.GetType() == GeomAbs_Plane) ++planarFaces;
+    }
+    INFO("planar (terminal) faces on the conductor = " << planarFaces);
+    REQUIRE(planarFaces >= 2);
 }
 
 TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean",
