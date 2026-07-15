@@ -696,8 +696,11 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
         // Exact circular profile: one swept surface per edge instead of one per polygon
         // facet (a 16-gon profile makes multi-wrap sweeps take minutes), and the true
         // wire cross-section is round anyway.
-        TopoDS_Wire prof = wireProfileWire(firstPts.front(), gp_Dir(t0), wireRadius,
-                                           wirePolygonSegments);
+        // The conductor cross-section stays an EXACT circle regardless of --segments (which
+        // facets only the core/bobbin): a faceted swept conductor multiplies the face count,
+        // which slows the sweep, makes the single-body self-intersection check intractable, and
+        // buys nothing -- the FEM mesher tessellates the analytic wire at its own facet density.
+        TopoDS_Wire prof = wireProfileWire(firstPts.front(), gp_Dir(t0), wireRadius, 0);
 
         BRepOffsetAPI_MakePipeShell ps(spine);
         // Mitre corners: RoundCorner's trim machinery needs edges longer than its
@@ -1069,7 +1072,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                          (p0pts[1].XYZ() - p0pts[0].XYZ()).Modulus() > 1e-12)
                             ? gp_Dir(p0pts[1].XYZ() - p0pts[0].XYZ())
                             : gp_Dir(1, 0, 0);
-            whole = sweepWire(spine, p0pts.front(), t0, path.wireRadius, wirePolygonSegments);
+            whole = sweepWire(spine, p0pts.front(), t0, path.wireRadius, /*exact profile*/ 0);
         }
         if (!whole.IsNull()) {
             int nsol = 0;
