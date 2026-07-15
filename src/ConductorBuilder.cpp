@@ -172,6 +172,13 @@ struct ConductorPath {
     //     stable frame, which shifts the section ~1-2% off the spine at the lead-adjacent crossings.
     // Both keep the EXACT per-run compound, which places every crossing exactly.
     bool singleBodyCapable = false;
+    // Rectangular / planar / foil wire: the swept profile is an oriented RECTANGLE, not a circle.
+    // width = radial extent, height = axial extent (matches TurnBuilder::build_rect_profile). The
+    // section is kept flat-faced-axial by sweeping with a fixed binormal along the column axis;
+    // supported for ROUND columns only so far (no axial-jump primitives to make that frame flip).
+    bool isRectangular = false;
+    double wireWidth = 0.0;   // radial extent [m]
+    double wireHeight = 0.0;  // axial extent [m]
 };
 
 // --- capsule distance helpers ----------------------------------------------------------
@@ -306,6 +313,7 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
         for (size_t cj = ci; cj < paths.size(); ++cj) {
             const auto& A = paths[ci];
             const auto& B = paths[cj];
+            const bool rectPair = A.isRectangular || B.isRectangular;
             double sagAllowance = kMaxSagFraction * (A.wireRadius + B.wireRadius);
             double minGap = A.wireRadius + B.wireRadius - sagAllowance - kContactTol;
             for (size_t i = 0; i < A.prims.size(); ++i) {
@@ -320,7 +328,39 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                     }
                     if (ci == cj && shareEndpoint(pa, pb)) continue;
                     double d = polyPolyDistance(polys[ci][i], polys[cj][j]);
-                    if (d < minGap) {
+                    // Rectangular wire (round columns): the round capsule is wrong -- the section is
+                    // width(radial) x height(axial). Decompose the closest-approach vector into its
+                    // AXIAL (column-axis Y) and in-plane (radial/tangential) parts and require the
+                    // section boxes to overlap in BOTH. (Approximate: the in-plane part lumps radial
+                    // with tangential; exact rect-vs-rect is future work. Round pairs keep the exact
+                    // capsule test above unchanged.)
+                    if (rectPair && d < 0.5 * std::hypot(A.wireWidth + A.wireHeight,
+                                                         B.wireWidth + B.wireHeight)) {
+                        gp_Pnt ca, cb;
+                        double best = std::numeric_limits<double>::max();
+                        for (const auto& va : polys[ci][i])
+                            for (const auto& vb : polys[cj][j]) {
+                                double dd = va.SquareDistance(vb);
+                                if (dd < best) { best = dd; ca = va; cb = vb; }
+                            }
+                        gp_XYZ sep = cb.XYZ() - ca.XYZ();
+                        double axialSep = std::abs(sep.Y());
+                        double inPlaneSep =
+                            std::sqrt(std::max(0.0, sep.SquareModulus() - axialSep * axialSep));
+                        double axA = A.isRectangular ? A.wireHeight / 2.0 : A.wireRadius;
+                        double axB = B.isRectangular ? B.wireHeight / 2.0 : B.wireRadius;
+                        double ipA = A.isRectangular ? A.wireWidth / 2.0 : A.wireRadius;
+                        double ipB = B.isRectangular ? B.wireWidth / 2.0 : B.wireRadius;
+                        bool overlap = axialSep < (axA + axB - kContactTol) &&
+                                       inPlaneSep < (ipA + ipB - kContactTol);
+                        if (!overlap) continue;
+                        d = std::min(axialSep, inPlaneSep);  // report the tighter gap
+                    } else if (rectPair) {
+                        continue;  // beyond the loosest rectangle reach -> no overlap
+                    } else if (d >= minGap) {
+                        continue;
+                    }
+                    {
                         auto [aa, ab] = primEndpoints(pa);
                         auto [ba, bb] = primEndpoints(pb);
                         auto pt = [](const gp_Pnt& p) {
@@ -368,6 +408,31 @@ TopoDS_Wire wireProfileWire(const gp_Pnt& center, const gp_Dir& normal, double r
 TopoDS_Face wireProfile(const gp_Pnt& center, const gp_Dir& normal, double radius,
                         int segments) {
     return BRepBuilderAPI_MakeFace(wireProfileWire(center, normal, radius, segments)).Face();
+}
+
+// Oriented RECTANGLE profile for rectangular/planar wire, in the plane perpendicular to the wire's
+// travel (tangent). The AXIAL in-plane axis is the column axis projected perpendicular to the
+// tangent; the RADIAL axis is tangent x axial. width spans radial, height spans axial -- matching
+// TurnBuilder::build_rect_profile so the real-winding section is consistent with the per-turn one.
+TopoDS_Wire rectProfileWire(const gp_Pnt& center, const gp_Dir& tangent, const gp_Dir& axialAxis,
+                            double width, double height) {
+    gp_XYZ t = tangent.XYZ();
+    gp_XYZ a = axialAxis.XYZ() - t * (axialAxis.XYZ().Dot(t));  // axial, ⊥ tangent
+    if (a.Modulus() < 1e-9) {                                   // tangent ∥ axial: pick any ⊥ axis
+        gp_XYZ ref = std::abs(t.X()) < 0.9 ? gp_XYZ(1, 0, 0) : gp_XYZ(0, 0, 1);
+        a = ref - t * (ref.Dot(t));
+    }
+    a.Normalize();
+    gp_XYZ w = t.Crossed(a);                                    // radial
+    w.Normalize();
+    double hw = width / 2.0, hh = height / 2.0;
+    BRepBuilderAPI_MakePolygon poly;
+    poly.Add(gp_Pnt(center.XYZ() - w * hw - a * hh));
+    poly.Add(gp_Pnt(center.XYZ() + w * hw - a * hh));
+    poly.Add(gp_Pnt(center.XYZ() + w * hw + a * hh));
+    poly.Add(gp_Pnt(center.XYZ() - w * hw + a * hh));
+    poly.Close();
+    return poly.Wire();
 }
 
 // One analytic edge per primitive, so the whole conductor is ONE path:
@@ -724,15 +789,33 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
     return wireMaker.Wire();
 }
 
-// Sweep an already-built (G1) spine wire into a solid: the exact round profile, one MakePipeShell.
+// Sweep an already-built (G1) spine wire into a solid.
+//  - Round wire: an exact circle profile. Frenet framing keeps the round section centered exactly
+//    on the spine but cannot close a spine with inflection points; corrected Frenet parallel-
+//    transports the frame and closes those, discrete is the last resort. (Round-section sweeps are
+//    rotation-invariant, so any frame that closes keeps the section on the spine.)
+//  - Rectangular wire: an ORIENTED rectangle profile, swept with a FIXED BINORMAL along the column
+//    axis so the section's flat faces stay axial/radial the whole way round (round columns only, so
+//    no primitive travels axially to make that frame flip). The section is NOT rotation-invariant,
+//    so exactly one frame is correct -- no fallback ladder.
 TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir& t0,
-                       double wireRadius, int profileSegments) {
-    // Frenet framing keeps the round section centered exactly on the spine but cannot close a
-    // spine with inflection points; corrected Frenet (SetMode(false)) parallel-transports the frame
-    // and closes those, and the discrete mode is the robust last resort. Only round and oblong
-    // windings reach here (singleBodyCapable) -- their spines stay low-torsion, so whichever frame
-    // closes them keeps the section on the spine. Try the frames in order and take the first that
-    // yields a valid watertight solid.
+                       double wireRadius, int profileSegments, bool rectangular = false,
+                       double rectWidth = 0.0, double rectHeight = 0.0,
+                       const gp_Dir& axialAxis = gp_Dir(0, 1, 0)) {
+    if (rectangular) {
+        try {
+            TopoDS_Wire prof = rectProfileWire(p0, t0, axialAxis, rectWidth, rectHeight);
+            BRepOffsetAPI_MakePipeShell ps(spine);
+            ps.SetMode(axialAxis);   // fixed binormal = column axis: section stays axial/radial
+            ps.Add(prof);
+            ps.Build();
+            if (!ps.IsDone() || !ps.MakeSolid()) return TopoDS_Shape();
+            TopoDS_Shape s = ps.Shape();
+            if (BRepCheck_Analyzer(s).IsValid()) return s;
+        } catch (const Standard_Failure&) {
+        }
+        return TopoDS_Shape();
+    }
     for (int mode = 0; mode < 3; ++mode) {
         try {
             TopoDS_Wire prof = wireProfileWire(p0, t0, wireRadius, profileSegments);
@@ -1153,7 +1236,9 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                          (p0pts[1].XYZ() - p0pts[0].XYZ()).Modulus() > 1e-12)
                             ? gp_Dir(p0pts[1].XYZ() - p0pts[0].XYZ())
                             : gp_Dir(1, 0, 0);
-            whole = sweepWire(spine, p0pts.front(), t0, path.wireRadius, /*exact profile*/ 0);
+            whole = sweepWire(spine, p0pts.front(), t0, path.wireRadius, /*exact profile*/ 0,
+                              path.isRectangular, path.wireWidth, path.wireHeight,
+                              /*axialAxis=*/gp_Dir(0, 1, 0));
         }
         if (!whole.IsNull()) {
             int nsol = 0;
@@ -1163,12 +1248,18 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                 auto pts = samplePrim(*ptrs[i], path.wireRadius);
                 for (size_t k = 1; k < pts.size(); ++k) spineLen += pts[k].Distance(pts[k - 1]);
             }
-            double expected = kPi * path.wireRadius * path.wireRadius * spineLen;
+            // Swept copper cross-section area: rectangle width*height, else circle.
+            double area = path.isRectangular ? path.wireWidth * path.wireHeight
+                                             : kPi * path.wireRadius * path.wireRadius;
+            double expected = area * spineLen;
             GProp_GProps gp;
             BRepGProp::VolumeProperties(whole, gp);
             double v = gp.Mass();
             bool okVol = expected > 0.0 && v > 0.9 * expected && v < 1.1 * expected;
-            bool okDeg = !hasDegenerateSheetFace(whole, path.wireRadius);
+            // The degenerate-sheet-face heuristic keys on the round wireRadius to catch boolean-fuse
+            // slivers; a rectangular wire has legitimately thin flat faces and never fuses, so it is
+            // guarded by BRepCheck validity + the exact volume match instead.
+            bool okDeg = path.isRectangular || !hasDegenerateSheetFace(whole, path.wireRadius);
             bool okChk = BRepCheck_Analyzer(whole).IsValid();
             if (nsol == 1 && okVol && okDeg && okChk) {
                 if (diag) std::cerr << "[single-body] ACCEPTED v=" << v << " exp=" << expected
@@ -1181,6 +1272,15 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         } else if (diag && !spine.IsNull()) {
             std::cerr << "[single-body] sweep NULL (MakePipeShell failed on the G1 spine)\n";
         }
+    }
+
+    // The per-run compound below sweeps ROUND profiles; a rectangular winding must come out of the
+    // single-body path or not at all -- never a silently round-profiled body. Surface the failure.
+    if (path.isRectangular) {
+        throw std::runtime_error(
+            "ConductorBuilder: rectangular-wire single-body sweep failed for '" + path.name +
+            "' (fixed-binormal MakePipeShell did not close a valid solid); refusing to fall back to "
+            "a round-profile compound");
     }
 
     BRep_Builder builder;
@@ -1783,20 +1883,36 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     for (size_t ci = 0; ci < conductors.size(); ++ci) {
         const auto& ct = conductors[ci];
         const MAS::Wire& wire = wireMap.at(ct.winding);
-        if (wire.get_type() == MAS::WireType::RECTANGULAR ||
-            wire.get_type() == MAS::WireType::PLANAR ||
-            wire.get_type() == MAS::WireType::FOIL) {
+        const MAS::WireType wireType = wire.get_type();
+        const bool rectWire = wireType == MAS::WireType::RECTANGULAR ||
+                              wireType == MAS::WireType::PLANAR;
+        // Rectangular/planar wire is swept as an oriented rectangle, kept flat-faced-axial by a
+        // fixed binormal along the column axis -- that frame stays well-defined only where NO
+        // primitive travels axially. ROUND columns have no axial-jump primitives (wraps are
+        // spirals, layer links are radial), so they are supported; rect/oblong columns zig-zag
+        // axially across the -Z face and toroids thread the hole, so a rect section there would
+        // flip. FOIL (a single wide sheet turn) is a different construction entirely. Those all
+        // still throw -- loudly and specifically -- rather than emit a mis-oriented section.
+        if ((rectWire && columnShape != MAS::ColumnShape::ROUND) ||
+            wireType == MAS::WireType::FOIL) {
             throw std::runtime_error(
-                "ConductorBuilder: rectangular/planar/foil wire is not supported for "
-                "real-winding conductors yet (the lead cross-section orientation through "
-                "the exit bends is undefined) — winding '" + ct.winding + "'");
+                "ConductorBuilder: real-winding conductors support rectangular/planar wire only on "
+                "ROUND columns so far (rect/oblong/toroid columns zig-zag or thread axially, where "
+                "the swept rectangle's orientation flips), and FOIL wire not at all — winding '" +
+                ct.winding + "' (" + std::string(rectWire ? "rect/planar on non-round column"
+                                                          : "foil") + ")");
         }
         // Resolve through the first turn: turn.dimensions carries the OUTER footprint
         // (the context-less overload would fall back to the round wire's CONDUCTING
-        // diameter for paintCoating=true).
+        // diameter for paintCoating=true). For rectangular wire dimensions[0]=width=RADIAL,
+        // dimensions[1]=height=AXIAL (matches TurnBuilder::build_rect_profile).
         auto [wireW, wireH] =
             TurnBuilder::wireDimensions(wire, *ct.turns.front(), opts.paintCoating);
-        double wireRadius = std::min(wireW, wireH) / 2.0;
+        // Envelope/bend radius: the round wire's is its radius; a rectangle's is its half-DIAGONAL
+        // (the largest centre-to-corner reach, so the collision corridor and minimum bend stay
+        // conservative for the rotated section).
+        double wireRadius = rectWire ? 0.5 * std::hypot(wireW, wireH)
+                                     : std::min(wireW, wireH) / 2.0;
         // Same minimum-bend rule as build_concentric_rect_column_turn: a swept corner
         // self-intersects when the arc radius is below the profile's radial half-extent.
         double minBend = wireRadius * 1.02;
@@ -1804,6 +1920,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         ConductorPath path;
         path.name = ct.winding + " parallel " + std::to_string(ct.parallel);
         path.wireRadius = wireRadius;
+        path.isRectangular = rectWire;
+        path.wireWidth = wireW;
+        path.wireHeight = wireH;
+        // Round-column rect wire IS single-body-capable (fixed-binormal sweep, below).
         path.singleBodyCapable = !isToroidal && (columnShape == MAS::ColumnShape::ROUND ||
                                                  columnShape == MAS::ColumnShape::OBLONG);
 

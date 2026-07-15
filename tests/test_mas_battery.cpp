@@ -760,7 +760,8 @@ CaseResult run_one_realwinding(const fs::path& path) {
 // failure (returns "UNRECOGNISED") so a new fault mode cannot hide.
 const char* realwinding_category(const std::string& msg) {
     if (msg.find("collision between") != std::string::npos)        return "collision (ABT #240/#187)";
-    if (msg.find("rectangular/planar/foil wire") != std::string::npos) return "foil/planar wire (unsupported)";
+    if (msg.find("rectangular/planar wire only on ROUND") != std::string::npos ||
+        msg.find("rectangular/planar/foil wire") != std::string::npos) return "rect/foil wire on non-round column (unsupported)";
     if (msg.find("produced 0 turns") != std::string::npos)         return "MKF 0 turns (doesn't fit window)";
     if (msg.find("unsupported column shape") != std::string::npos) return "unsupported column shape";
     if (msg.find("lies inside the column") != std::string::npos ||
@@ -870,10 +871,10 @@ TEST_CASE("MAS battery: complete examples", "[battery][complete]") {
 }
 
 TEST_CASE("MAS battery: real-winding sweep", "[realwinding-battery]") {
-    // Floor from the 2026-07-15 sweep of the 37 non-debug battery fixtures: 11 build a continuous
-    // conductor (round/oblong single solids + rect/toroid compounds); the other 26 throw recognised
-    // upstream categories (collision ABT #240/#187 ×14, MKF-fit 0-turns ×5, foil wire ×4,
-    // inconsistent MAS data ×2, unsupported column ×1). Raise this floor as MKF closes ABT
-    // #240/#187 and more parts wind clean.
-    run_realwinding_battery(/*minCleanBuilds=*/11);
+    // Floor from the 2026-07-15 sweep of the 37 non-debug battery fixtures: 12 build a continuous
+    // conductor (round/oblong single solids incl. round-column rectangular wire + rect/toroid
+    // compounds); the rest throw recognised upstream categories (collision ABT #240/#187 ×15,
+    // MKF-fit 0-turns ×5, rect/foil wire on non-round column ×2, inconsistent MAS data ×2,
+    // unsupported column ×1). Raise this floor as MKF closes ABT #240/#187 and more parts wind clean.
+    run_realwinding_battery(/*minCleanBuilds=*/12);
 }
