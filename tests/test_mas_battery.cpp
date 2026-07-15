@@ -760,8 +760,10 @@ CaseResult run_one_realwinding(const fs::path& path) {
 // failure (returns "UNRECOGNISED") so a new fault mode cannot hide.
 const char* realwinding_category(const std::string& msg) {
     if (msg.find("collision between") != std::string::npos)        return "collision (ABT #240/#187)";
-    if (msg.find("rectangular/planar wire only on ROUND") != std::string::npos ||
-        msg.find("rectangular/planar/foil wire") != std::string::npos) return "rect/foil wire on non-round column (unsupported)";
+    if (msg.find("FOIL wire not at all") != std::string::npos ||
+        msg.find("rectangular/planar/foil wire") != std::string::npos) return "foil wire (unsupported)";
+    if (msg.find("not toroids") != std::string::npos ||
+        msg.find("rectangular/planar wire only on ROUND") != std::string::npos) return "rect/planar wire on toroid (unsupported)";
     if (msg.find("produced 0 turns") != std::string::npos)         return "MKF 0 turns (doesn't fit window)";
     if (msg.find("unsupported column shape") != std::string::npos) return "unsupported column shape";
     if (msg.find("lies inside the column") != std::string::npos ||
@@ -871,10 +873,10 @@ TEST_CASE("MAS battery: complete examples", "[battery][complete]") {
 }
 
 TEST_CASE("MAS battery: real-winding sweep", "[realwinding-battery]") {
-    // Floor from the 2026-07-15 sweep of the 37 non-debug battery fixtures: 12 build a continuous
-    // conductor (round/oblong single solids incl. round-column rectangular wire + rect/toroid
-    // compounds); the rest throw recognised upstream categories (collision ABT #240/#187 ×15,
-    // MKF-fit 0-turns ×5, rect/foil wire on non-round column ×2, inconsistent MAS data ×2,
-    // unsupported column ×1). Raise this floor as MKF closes ABT #240/#187 and more parts wind clean.
-    run_realwinding_battery(/*minCleanBuilds=*/12);
+    // Floor from the 2026-07-15 sweep of the 37 non-debug battery fixtures: 13 build a continuous
+    // conductor (round/oblong single solids incl. round-column rect wire, rect/toroid round-wire
+    // compounds, and rect-column rect-wire per-turn solids); the rest throw recognised upstream
+    // categories (collision ABT #240/#187 ×15, MKF-fit 0-turns ×5, inconsistent MAS data ×2,
+    // foil wire ×1, unsupported column ×1). Raise this floor as MKF closes ABT #240/#187.
+    run_realwinding_battery(/*minCleanBuilds=*/13);
 }

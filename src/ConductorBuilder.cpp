@@ -12,6 +12,7 @@
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
+#include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
@@ -53,6 +54,7 @@
 #include <GProp_GProps.hxx>
 #include <BOPAlgo_GlueEnum.hxx>
 #include <TopTools_ListOfShape.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <iostream>
@@ -172,11 +174,14 @@ struct ConductorPath {
     //     stable frame, which shifts the section ~1-2% off the spine at the lead-adjacent crossings.
     // Both keep the EXACT per-run compound, which places every crossing exactly.
     bool singleBodyCapable = false;
-    // Rectangular / planar / foil wire: the swept profile is an oriented RECTANGLE, not a circle.
-    // width = radial extent, height = axial extent (matches TurnBuilder::build_rect_profile). The
-    // section is kept flat-faced-axial by sweeping with a fixed binormal along the column axis;
-    // supported for ROUND columns only so far (no axial-jump primitives to make that frame flip).
+    // Rectangular / planar wire: the swept profile is an oriented RECTANGLE (width = radial,
+    // height = axial, matching TurnBuilder::build_rect_profile). On a ROUND column it sweeps as one
+    // body with a fixed binormal (singleBodyCapable). On a RECT/OBLONG column the wide flat section
+    // cannot be swept around the racetrack corners (its inner edge would collapse), so instead each
+    // primitive is built as its own rect solid -- straights as prisms, corners as REVOLVED rect
+    // (annular wedges, clean at any corner radius) -- and the solids fused (useRectSolids).
     bool isRectangular = false;
+    bool useRectSolids = false;
     double wireWidth = 0.0;   // radial extent [m]
     double wireHeight = 0.0;  // axial extent [m]
 };
@@ -902,6 +907,120 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
     }
 }
 
+// Build ONE rectangular-wire solid for a single primitive, cross-section width(radial) x
+// height(axial). Corners are REVOLVED (an annular wedge about the corner axis -- turns a corner
+// tighter than the wire's half-width cleanly, exactly where a swept flat section would collapse);
+// straights are prisms; gentle -Z transitions are piped (corrected Frenet). Used for rect/oblong
+// columns, whose racetrack corners defeat a single swept pipe.
+TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir& axial) {
+    try {
+        if (pr.kind == Primitive::SEG) {
+            gp_XYZ dir = pr.seg.b.XYZ() - pr.seg.a.XYZ();
+            if (dir.Modulus() < 1e-12) return TopoDS_Shape();
+            TopoDS_Face face =
+                BRepBuilderAPI_MakeFace(rectProfileWire(pr.seg.a, gp_Dir(dir), axial, w, h)).Face();
+            return BRepPrimAPI_MakePrism(face, gp_Vec(dir)).Shape();
+        }
+        if (pr.kind == Primitive::ARC3) {
+            double radius = pr.arc.v0.Modulus();
+            if (radius < 1e-12 || std::abs(pr.arc.sweep) < 1e-12) return TopoDS_Shape();
+            gp_Pnt start(pr.arc.c.XYZ() + pr.arc.v0);
+            gp_XYZ tan = pr.arc.axis.Crossed(pr.arc.v0);  // start tangent (d/dt of the arc at t=0)
+            if (tan.Modulus() < 1e-12) return TopoDS_Shape();
+            TopoDS_Face face =
+                BRepBuilderAPI_MakeFace(rectProfileWire(start, gp_Dir(tan), axial, w, h)).Face();
+            // Revolve the (radial x axial) profile about the corner axis: right-hand about +axis
+            // for a positive sweep, about -axis for a negative one; angle is |sweep|.
+            gp_Dir revDir = pr.arc.sweep > 0 ? gp_Dir(pr.arc.axis) : gp_Dir(pr.arc.axis).Reversed();
+            return BRepPrimAPI_MakeRevol(face, gp_Ax1(pr.arc.c, revDir), std::abs(pr.arc.sweep))
+                .Shape();
+        }
+        // BLEND / SPIRAL (gentle -Z transitions): pipe the rect over the analytic edge.
+        double r = std::min(w, h) / 2.0;
+        TopoDS_Edge e = primEdge(pr, r);
+        if (e.IsNull()) return TopoDS_Shape();
+        auto pts = samplePrim(pr, r);
+        if (pts.size() < 2) return TopoDS_Shape();
+        gp_Dir t0 = (pts[1].XYZ() - pts[0].XYZ()).Modulus() > 1e-12
+                        ? gp_Dir(pts[1].XYZ() - pts[0].XYZ())
+                        : gp_Dir(1, 0, 0);
+        BRepOffsetAPI_MakePipeShell ps(BRepBuilderAPI_MakeWire(e).Wire());
+        ps.SetMode(Standard_False);  // corrected Frenet: carry the section through the gentle bend
+        ps.Add(rectProfileWire(pts.front(), t0, axial, w, h));
+        ps.Build();
+        if (!ps.IsDone() || !ps.MakeSolid()) return TopoDS_Shape();
+        return ps.Shape();
+    } catch (const Standard_Failure&) {
+        return TopoDS_Shape();
+    }
+}
+
+// Rect wire on a rect/oblong column: build every primitive as its own rect solid. When the turns
+// are SEPARATED (the conducting/copper footprint), consecutive primitives touch only along the
+// path, so fusing yields one clean spiral solid -- ideal for FEM. When the turns TOUCH (the outer/
+// insulation footprint), fusing would merge the stacked flat faces into an electrically-wrong solid
+// brick (current would short straight through instead of spiralling), so we detect the collapse (a
+// merged brick loses almost all its faces) and keep the per-primitive COMPOUND, which shows every
+// turn as its own solid and honours every MKF position exactly.
+TopoDS_Shape emitRectColumn(const ConductorPath& path) {
+    const gp_Dir axial(0, 1, 0);
+    std::vector<TopoDS_Shape> solids;
+    solids.reserve(path.prims.size());
+    int compoundFaces = 0;
+    for (const auto& pr : path.prims) {
+        TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axial);
+        if (s.IsNull()) continue;
+        solids.push_back(s);
+        for (TopExp_Explorer e(s, TopAbs_FACE); e.More(); e.Next()) ++compoundFaces;
+    }
+    if (solids.empty()) {
+        throw std::runtime_error(
+            "ConductorBuilder: rectangular-wire rect/oblong column produced no solids for '" +
+            path.name + "'");
+    }
+    const bool diag = std::getenv("MVB_DIAG") != nullptr;
+    try {
+        TopTools_ListOfShape args, tools;
+        args.Append(solids.front());
+        for (size_t i = 1; i < solids.size(); ++i) tools.Append(solids[i]);
+        BRepAlgoAPI_Fuse fuse;
+        fuse.SetArguments(args);
+        fuse.SetTools(tools);
+        fuse.Build();
+        if (fuse.IsDone()) {
+            TopoDS_Shape fused = fuse.Shape();
+            int nsol = 0, fusedFaces = 0;
+            for (TopExp_Explorer e(fused, TopAbs_SOLID); e.More(); e.Next()) ++nsol;
+            for (TopExp_Explorer e(fused, TopAbs_FACE); e.More(); e.Next()) ++fusedFaces;
+            // A true spiral keeps most of its faces (each turn's flats survive); a brick-merge (the
+            // stacked flats fused away) keeps only a small fraction -> reject as a short.
+            bool notCollapsed = fusedFaces > compoundFaces / 2;
+            if (nsol == 1 && notCollapsed && BRepCheck_Analyzer(fused).IsValid()) {
+                ShapeUpgrade_UnifySameDomain unify(fused, Standard_True, Standard_True,
+                                                   Standard_True);
+                unify.Build();
+                TopoDS_Shape merged = unify.Shape();
+                if (BRepCheck_Analyzer(merged).IsValid()) {
+                    if (diag) std::cerr << "[rect-column] FUSED spiral solid (" << fusedFaces
+                                        << "/" << compoundFaces << " faces) from " << solids.size()
+                                        << " prims\n";
+                    return merged;
+                }
+            }
+            if (diag) std::cerr << "[rect-column] fuse nsol=" << nsol << " faces=" << fusedFaces
+                                << "/" << compoundFaces << " -> compound (turns touch / not a clean "
+                                << "spiral)\n";
+        }
+    } catch (const Standard_Failure&) {
+        if (diag) std::cerr << "[rect-column] fuse threw -> compound fallback\n";
+    }
+    BRep_Builder b;
+    TopoDS_Compound comp;
+    b.MakeCompound(comp);
+    for (const auto& s : solids) b.Add(comp, s);
+    return comp;
+}
+
 // Split the path into maximal continuous runs: at revisited points (the wire crossing
 // itself), at closed rings, and at lead<->wrap boundaries (the only non-tangent,
 // 90-degree junctions of the path — a pipe swept across them grows an unbounded mitre
@@ -1197,6 +1316,10 @@ TopoDS_Shape sweepRunChunked(const Primitive* const* prims, size_t count, double
 }
 
 TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
+    // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
+    // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
+    if (path.useRectSolids) return emitRectColumn(path);
+
     // Sweep each maximal continuous run as ONE pipe (the whole wrap chain when the wire
     // never crosses itself); lead runs emit as exact cylinders + sphere elbows. Fuse the
     // handful of pieces into a single solid.
@@ -1886,21 +2009,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         const MAS::WireType wireType = wire.get_type();
         const bool rectWire = wireType == MAS::WireType::RECTANGULAR ||
                               wireType == MAS::WireType::PLANAR;
-        // Rectangular/planar wire is swept as an oriented rectangle, kept flat-faced-axial by a
-        // fixed binormal along the column axis -- that frame stays well-defined only where NO
-        // primitive travels axially. ROUND columns have no axial-jump primitives (wraps are
-        // spirals, layer links are radial), so they are supported; rect/oblong columns zig-zag
-        // axially across the -Z face and toroids thread the hole, so a rect section there would
-        // flip. FOIL (a single wide sheet turn) is a different construction entirely. Those all
-        // still throw -- loudly and specifically -- rather than emit a mis-oriented section.
-        if ((rectWire && columnShape != MAS::ColumnShape::ROUND) ||
-            wireType == MAS::WireType::FOIL) {
+        // Rectangular/planar wire: on a ROUND column it sweeps as one body (fixed binormal); on a
+        // RECT/OBLONG column the wide flat section can't sweep the racetrack corners, so it is built
+        // per-primitive (prisms + revolved corners) and fused (emitRectColumn). TOROIDS thread the
+        // hole (a rect section would flip) and FOIL is a single wide sheet -- both still throw.
+        if ((rectWire && isToroidal) || wireType == MAS::WireType::FOIL) {
             throw std::runtime_error(
-                "ConductorBuilder: real-winding conductors support rectangular/planar wire only on "
-                "ROUND columns so far (rect/oblong/toroid columns zig-zag or thread axially, where "
-                "the swept rectangle's orientation flips), and FOIL wire not at all — winding '" +
-                ct.winding + "' (" + std::string(rectWire ? "rect/planar on non-round column"
-                                                          : "foil") + ")");
+                "ConductorBuilder: real-winding rectangular/planar wire is supported on round, "
+                "rectangular and oblong columns but not toroids (the section would flip threading "
+                "the hole), and FOIL wire not at all — winding '" + ct.winding + "' (" +
+                std::string(rectWire ? "rect/planar on toroid" : "foil") + ")");
         }
         // Resolve through the first turn: turn.dimensions carries the OUTER footprint
         // (the context-less overload would fall back to the round wire's CONDUCTING
@@ -1923,9 +2041,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         path.isRectangular = rectWire;
         path.wireWidth = wireW;
         path.wireHeight = wireH;
-        // Round-column rect wire IS single-body-capable (fixed-binormal sweep, below).
-        path.singleBodyCapable = !isToroidal && (columnShape == MAS::ColumnShape::ROUND ||
-                                                 columnShape == MAS::ColumnShape::OBLONG);
+        if (rectWire) {
+            // Round (or straight-less oblong) column: the section sweeps cleanly with a fixed
+            // binormal -> one body. A rect/oblong column with real corners: per-primitive rect
+            // solids + fuse (emitRectColumn), because the wide flat section can't sweep the corners.
+            path.singleBodyCapable = !isToroidal && effectivelyRound;
+            path.useRectSolids = !isToroidal && !effectivelyRound;
+        } else {
+            path.singleBodyCapable = !isToroidal && (columnShape == MAS::ColumnShape::ROUND ||
+                                                     columnShape == MAS::ColumnShape::OBLONG);
+        }
 
         const auto& turns = ct.turns;
 
