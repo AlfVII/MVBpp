@@ -257,15 +257,27 @@ std::vector<mvb::NamedShape> build_winding(const std::string& json_str,
 }
 
 std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments,
-                                            bool paintCoating) {
+                                            bool paintCoating, bool useRealWindingGeometry) {
     auto j = json::parse(json_str);
-    auto magnetic = j.get<MAS::Magnetic>();
     mvb::MagneticBuilder b;
     // Use polygonSegments for both wire and core for simplicity; the user
     // can craft separate paths later if they need finer-grained control.
     // paintCoating: true → OUTER (insulation) diameter [default], false →
     // CONDUCTING (copper) diameter for FEM winding-loss meshing (LITZ → bare
     // bundle as a solid via MKF).
+    // useRealWindingGeometry: replace the per-turn closed loops with ONE continuous copper body
+    // per (winding, parallel). MKF must (re)wind, so re-enrich through the real-winding autocomplete
+    // (a magnetic that already carries a geometricalDescription throws with the flag on — its turn
+    // positions are never silently re-interpreted). The conductor cross-section stays an exact
+    // circle; polygonSegments still facets the core/bobbin.
+    if (useRealWindingGeometry) {
+        auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
+        return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                               polygonSegments, polygonSegments, paintCoating,
+                               /*emitCoatingShells=*/false, /*includeInsulation=*/false,
+                               /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true);
+    }
+    auto magnetic = j.get<MAS::Magnetic>();
     return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
                             polygonSegments, polygonSegments, paintCoating);
 }
@@ -340,7 +352,7 @@ Inputs are MAS-1.0 JSON strings.
     mvbpp.drawBobbin     (bobbin_json,      outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawTurns      (turns_json,       outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
     mvbpp.drawWinding    (coil_json, windingName, outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
-    mvbpp.drawMagnetic   (magnetic_json,    outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
+    mvbpp.drawMagnetic   (magnetic_json,    outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True, useRealWindingGeometry=False)
 
 Pictorial-view function
 -----------------------
@@ -362,6 +374,13 @@ Notes
   bundle treated as one solid conductor via MKF).  False requires full wire
   data: only drawMagnetic (full Magnetic JSON) supports it; drawTurns/drawWinding
   operate on bare turns and raise for paintCoating=False.
+* useRealWindingGeometry (drawMagnetic only): False [default] draws each turn as a
+  closed loop; True re-winds through MKF and emits ONE continuous copper body per
+  (winding, parallel) — named "<winding> parallel <k>" — for FEM meshing.  Round
+  and oblong concentric columns become a single watertight solid; rectangular and
+  toroidal windings stay an exact multi-solid compound (both honour MKF crossings).
+  The conductor cross-section stays an exact circle; polygonSegments facets only
+  the core/bobbin.  A magnetic that already carries a geometricalDescription raises.
 )doc";
 
     auto def_draw = [&](const char* name,
@@ -434,7 +453,41 @@ Notes
     def_draw("drawCorePiece",  &build_core_piece);
     def_draw("drawBobbin",     &build_bobbin);
     def_draw_paint("drawTurns",    &build_turns);
-    def_draw_paint("drawMagnetic", &build_magnetic);
+
+    // drawMagnetic carries the extra keyword-only `useRealWindingGeometry`: false [default] draws
+    // the per-turn closed loops; true replaces each (winding, parallel) with ONE continuous copper
+    // body (round/oblong single solid; rectangular/toroidal exact compound) via MKF real winding.
+    m.def("drawMagnetic",
+          [](const std::string& json_str,
+             py::object outputPath,
+             const std::string& mode,
+             const std::string& plane,
+             double offset,
+             const std::string& format,
+             double scale,
+             int polygonSegments,
+             const std::string& symmetry,
+             const std::string& side,
+             bool paintCoating,
+             bool useRealWindingGeometry) {
+              auto named = build_magnetic(json_str, polygonSegments, paintCoating,
+                                          useRealWindingGeometry);
+              return deliver(std::move(named), outputPath, mode, plane, offset, format, scale,
+                             symmetry, side);
+          },
+          py::arg("json_str"),
+          py::arg("outputPath") = py::none(),
+          py::kw_only(),
+          py::arg("mode") = std::string("3D"),
+          py::arg("plane") = std::string("XY"),
+          py::arg("offset") = 0.0,
+          py::arg("format") = std::string("step"),
+          py::arg("scale") = 1.0,
+          py::arg("polygonSegments") = mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+          py::arg("symmetry") = std::string("none"),
+          py::arg("side") = std::string("+X+Y+Z"),
+          py::arg("paintCoating") = true,
+          py::arg("useRealWindingGeometry") = false);
 
     // drawWinding takes an extra positional `windingName`.
     m.def("drawWinding",
