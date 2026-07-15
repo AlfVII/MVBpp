@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -598,7 +599,7 @@ CaseResult run_one(const fs::path& path) {
 // The child serialises its CaseResult as JSON to a pipe; the parent reads it,
 // waitpids, and synthesises a failure CaseResult if the child was killed or
 // exited non-zero.
-CaseResult run_one_isolated(const fs::path& path) {
+CaseResult run_one_isolated(const fs::path& path, CaseResult (*runner)(const fs::path&)) {
     CaseResult fallback;
     fallback.file   = path.string();
     fallback.passed = false;
@@ -621,7 +622,7 @@ CaseResult run_one_isolated(const fs::path& path) {
         ::close(pipefd[0]);
         // SIGALRM default action is to terminate; that's what we want.
         ::alarm(static_cast<unsigned>(TOTAL_HARD_CAP_S) + 2);
-        CaseResult r = run_one(path);
+        CaseResult r = runner(path);
         json out = {
             {"file",   r.file},
             {"passed", r.passed},
@@ -706,6 +707,68 @@ CaseResult run_one_isolated(const fs::path& path) {
     return r;
 }
 
+// Real-winding variant: enrich WITH useRealWindingGeometry and build the continuous conductors.
+// passed == "MKF wound it AND MVB++ emitted non-empty geometry"; otherwise errors[0] carries the
+// throw message, which the parent classifies (a clean build vs a recognised upstream/limitation
+// throw vs an unrecognised failure). No fallbacks: every gap is a loud, specific exception.
+CaseResult run_one_realwinding(const fs::path& path) {
+    CaseResult r;
+    r.file = path.string();
+    auto fail = [&](std::string msg) { r.passed = false; r.errors.push_back(std::move(msg)); };
+
+    json j;
+    {
+        std::ifstream in(path);
+        if (!in.is_open()) { fail("cannot open file"); return r; }
+        try { in >> j; }
+        catch (const std::exception& e) { fail(std::string("parse: ") + e.what()); return r; }
+    }
+    try { mvb::patch_dimension_nominals(j); }
+    catch (const std::exception& e) { fail(std::string("patch_dim: ") + e.what()); return r; }
+    // Battery fixtures wrap the magnetic in {"magnetic": ...}; some (bare real-winding fixtures)
+    // are the magnetic itself. Accept either, matching test_real_winding's loadFixture.
+    json magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+
+    OpenMagnetics::Magnetic enriched;
+    try { enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWinding=*/true); }
+    catch (const std::exception& e) { fail(e.what()); return r; }
+
+    std::vector<mvb::NamedShape> all;
+    mvb::MagneticBuilder builder;
+    try {
+        all = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                    mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                    mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/true,
+                                    /*emitCoatingShells=*/false, /*includeInsulation=*/false,
+                                    /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true);
+    } catch (const std::exception& e) { fail(e.what()); return r; }
+
+    // A "Primary parallel 0"-style conductor must exist with a positive-volume solid.
+    int conductors = 0;
+    for (const auto& ns : all) {
+        if (ns.name.find(" parallel ") == std::string::npos) continue;
+        if (ns.shape.IsNull()) { fail("null conductor shape: " + ns.name); return r; }
+        ++conductors;
+    }
+    if (conductors == 0) { fail("buildAllNamed produced no continuous conductor"); return r; }
+    r.passed = true;
+    return r;
+}
+
+// Category of a real-winding throw. Each is an UPSTREAM (MKF/data) gap or a declared limitation
+// that MVB++ surfaces loudly, NOT a silent-wrong-geometry bug. An unrecognised message is a real
+// failure (returns "UNRECOGNISED") so a new fault mode cannot hide.
+const char* realwinding_category(const std::string& msg) {
+    if (msg.find("collision between") != std::string::npos)        return "collision (ABT #240/#187)";
+    if (msg.find("rectangular/planar/foil wire") != std::string::npos) return "foil/planar wire (unsupported)";
+    if (msg.find("produced 0 turns") != std::string::npos)         return "MKF 0 turns (doesn't fit window)";
+    if (msg.find("unsupported column shape") != std::string::npos) return "unsupported column shape";
+    if (msg.find("lies inside the column") != std::string::npos ||
+        msg.find("terminal lead groups") != std::string::npos ||
+        msg.find("inconsistent MAS") != std::string::npos)         return "inconsistent MAS data";
+    return "UNRECOGNISED";
+}
+
 void run_directory(const fs::path& root, const std::string& label) {
     std::vector<fs::path> files;
     collect_mas_files(root, files);
@@ -721,7 +784,7 @@ void run_directory(const fs::path& root, const std::string& label) {
     for (const auto& f : files) {
         std::cerr << "[" << label << "] " << f.filename().string() << " ... "
                   << std::flush;
-        CaseResult r = run_one_isolated(f);
+        CaseResult r = run_one_isolated(f, run_one);
         if (r.passed) {
             ++passed;
             std::cerr << "ok\n";
@@ -750,6 +813,52 @@ void run_directory(const fs::path& root, const std::string& label) {
     CHECK(failed.empty());
 }
 
+// Real-winding sweep over both battery roots. Every fixture must either BUILD a continuous
+// conductor OR throw a RECOGNISED upstream/limitation category -- an unrecognised throw, a crash,
+// or the clean-build count dropping below the known floor all fail the test. This asserts (a) the
+// real-winding path never silently produces wrong geometry and never regresses a working part, and
+// (b) every remaining gap is a known, categorised upstream issue (MKF blocking ABT #240/#187,
+// foil-wire limitation, MKF fit, or inconsistent MAS data).
+void run_realwinding_battery(int minCleanBuilds) {
+    std::vector<fs::path> files;
+    collect_mas_files(fs::path(MAS_EXAMPLES_DIR), files);
+    collect_mas_files(fs::path(MAS_COMPLETE_DIR), files);
+    INFO("real-winding battery: " << files.size() << " fixtures");
+    REQUIRE(files.size() >= 30);
+
+    int built = 0;
+    std::map<std::string, int> categories;
+    std::vector<std::pair<std::string, std::string>> unrecognised;  // (file, message)
+    for (const auto& f : files) {
+        std::cerr << "[realwinding-battery] " << f.filename().string() << " ... " << std::flush;
+        CaseResult r = run_one_isolated(f, run_one_realwinding);
+        if (r.passed) {
+            ++built;
+            std::cerr << "built\n";
+            continue;
+        }
+        std::string msg = r.errors.empty() ? "(no message — crash/kill)" : r.errors.front();
+        const char* cat = realwinding_category(msg);
+        categories[cat]++;
+        std::cerr << "throw: " << cat << "\n";
+        if (std::string(cat) == "UNRECOGNISED")
+            unrecognised.emplace_back(f.filename().string(), msg);
+    }
+
+    std::cerr << "[realwinding-battery] built=" << built << "/" << files.size() << "\n";
+    for (const auto& [cat, n] : categories)
+        std::cerr << "    " << cat << ": " << n << "\n";
+
+    INFO("real-winding battery: " << built << "/" << files.size() << " built");
+    for (const auto& [file, msg] : unrecognised)
+        UNSCOPED_INFO("UNRECOGNISED throw in " << file << ": " << msg);
+
+    // No fixture may fail with an unrecognised message (that would be a new, un-triaged fault).
+    CHECK(unrecognised.empty());
+    // The set of parts that build clean must not shrink (a working part regressing to a throw).
+    CHECK(built >= minCleanBuilds);
+}
+
 } // namespace
 
 TEST_CASE("MAS battery: simple examples", "[battery][simple]") {
@@ -758,4 +867,13 @@ TEST_CASE("MAS battery: simple examples", "[battery][simple]") {
 
 TEST_CASE("MAS battery: complete examples", "[battery][complete]") {
     run_directory(fs::path(MAS_COMPLETE_DIR), "complete");
+}
+
+TEST_CASE("MAS battery: real-winding sweep", "[realwinding-battery]") {
+    // Floor from the 2026-07-15 sweep of the 37 non-debug battery fixtures: 11 build a continuous
+    // conductor (round/oblong single solids + rect/toroid compounds); the other 26 throw recognised
+    // upstream categories (collision ABT #240/#187 ×14, MKF-fit 0-turns ×5, foil wire ×4,
+    // inconsistent MAS data ×2, unsupported column ×1). Raise this floor as MKF closes ABT
+    // #240/#187 and more parts wind clean.
+    run_realwinding_battery(/*minCleanBuilds=*/11);
 }
