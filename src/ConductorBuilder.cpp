@@ -163,6 +163,15 @@ struct ConductorPath {
     std::string name;
     double wireRadius = 0.0;
     std::vector<Primitive> prims;
+    // Whether this winding may be emitted as ONE swept solid (see emitConductor). True only for
+    // ROUND and OBLONG concentric columns, whose centerlines MakePipeShell sweeps with the section
+    // centered on the spine, honoring the MKF crossings. Excluded:
+    //   - RECTANGULAR columns: the long straight racetrack sides flip OCCT's pipe frame, producing
+    //     a valid-but-displaced pipe sitting a radius or two off the crossings.
+    //   - TOROIDAL windings: the high-torsion hole-threading spine only closes under a torsion-
+    //     stable frame, which shifts the section ~1-2% off the spine at the lead-adjacent crossings.
+    // Both keep the EXACT per-run compound, which places every crossing exactly.
+    bool singleBodyCapable = false;
 };
 
 // --- capsule distance helpers ----------------------------------------------------------
@@ -552,13 +561,11 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius) {
 // primitive returns a null wire and the caller keeps the exact per-run compound.
 TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, double wireRadius) {
     if (count == 0) return TopoDS_Wire();
-    for (size_t i = 0; i < count; ++i) {
-        const Primitive& p = *prims[i];
-        if (p.kind == Primitive::ARC3 || p.kind == Primitive::BLEND) return TopoDS_Wire();
-        if (p.kind == Primitive::SPIRAL &&
-            (p.spiral.blend || std::abs(p.spiral.r1 - p.spiral.r0) > 1e-9))
-            return TopoDS_Wire();
-    }
+    const bool dbg = std::getenv("MVB_DIAG") != nullptr;
+    auto kindName = [](int k) {
+        return k == Primitive::SEG ? "SEG" : k == Primitive::ARC3 ? "ARC3"
+             : k == Primitive::SPIRAL ? "SPIRAL" : "BLEND";
+    };
     auto entryDir = [&](const Primitive& p) {
         auto pts = samplePrim(p, wireRadius);
         gp_Vec v(pts[1].XYZ() - pts.front().XYZ());
@@ -581,11 +588,34 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
     std::vector<double> lens(count, 0.0);
     for (size_t i = 0; i < count; ++i) lens[i] = arcLen(*prims[i]);
     const double target = wireRadius * 0.8;
+    // Only SEG / ARC3 / non-blend SPIRAL can be shrunk by arc length. A BLEND or a
+    // cosine-blended SPIRAL has a non-linear arc-length map and cannot be trimmed, but it is
+    // built to enter/leave its neighbours tangentially, so it rarely lands at a real corner.
+    // When it does, route the WHOLE fillet trim onto the trimmable neighbour (an asymmetric
+    // one-sided fillet is still G1); only if BOTH sides are untrimmable do we give up.
+    auto trimmable = [](const Primitive& p) {
+        return p.kind == Primitive::SEG || p.kind == Primitive::ARC3 ||
+               (p.kind == Primitive::SPIRAL && !p.spiral.blend);
+    };
     for (size_t i = 0; i + 1 < count; ++i) {
         if (exitDir(*prims[i]).Angle(entryDir(*prims[i + 1])) < 0.05) continue;
-        double d = std::min({target, 0.4 * lens[i], 0.4 * lens[i + 1]});
-        endTrim[i] = std::max(endTrim[i], d);
-        startTrim[i + 1] = std::max(startTrim[i + 1], d);
+        bool ti = trimmable(*prims[i]), tj = trimmable(*prims[i + 1]);
+        if (!ti && !tj) {
+            if (dbg) std::cerr << "[spine] bail: both sides untrimmable at corner i=" << i
+                               << " (" << kindName(prims[i]->kind) << " -> "
+                               << kindName(prims[i + 1]->kind) << ")\n";
+            return TopoDS_Wire();
+        }
+        // At a lead/link <-> wrap junction the WRAP endpoint is an MKF turn/crossing position
+        // that must stay EXACTLY on the copper centerline; fillet only the lead/link side so the
+        // wire still passes through the crossing (the rounded bend lives on the lead's approach).
+        bool iLead = prims[i]->isLead || prims[i]->isConnection;
+        bool jLead = prims[i + 1]->isLead || prims[i + 1]->isConnection;
+        bool mixed = iLead != jLead;
+        if (ti && (!mixed || iLead))
+            endTrim[i] = std::max(endTrim[i], std::min(target, 0.4 * lens[i]));
+        if (tj && (!mixed || jLead))
+            startTrim[i + 1] = std::max(startTrim[i + 1], std::min(target, 0.4 * lens[i + 1]));
     }
     auto trimPrim = [](Primitive p, double sTrim, double eTrim, double totalLen) {
         if (p.kind == Primitive::SEG) {
@@ -596,7 +626,18 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
                 p.seg.a = gp_Pnt(p.seg.a.XYZ() + u * sTrim);
                 p.seg.b = gp_Pnt(p.seg.b.XYZ() - u * eTrim);
             }
-        } else {  // cylindrical, non-blend SPIRAL
+        } else if (p.kind == Primitive::ARC3) {
+            // Arc length is exactly radius * angle, so trimming by arc length is a pure
+            // rotation of the start vector and a shrink of the sweep angle.
+            double radius = p.arc.v0.Modulus();
+            if (radius > 1e-12) {
+                double sgn = p.arc.sweep > 0 ? 1.0 : -1.0;
+                double dS = sgn * sTrim / radius;   // advance the start angle
+                double dE = sgn * eTrim / radius;   // retract the end angle
+                p.arc.v0 = rotateXYZ(p.arc.v0, p.arc.axis, dS);
+                p.arc.sweep -= (dS + dE);
+            }
+        } else {  // non-blend SPIRAL (cylindrical helix, conical wrap, or flat linear spiral)
             double azSpan = p.spiral.az1 - p.spiral.az0;
             double speed = totalLen / std::max(1e-12, std::abs(azSpan));
             double sgn = azSpan > 0 ? 1.0 : -1.0;
@@ -604,9 +645,14 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
             double naz1 = p.spiral.az1 - sgn * (eTrim / speed);
             double f0 = (naz0 - p.spiral.az0) / azSpan;
             double f1 = (naz1 - p.spiral.az0) / azSpan;
-            double dy = p.spiral.y1 - p.spiral.y0;
-            p.spiral.y0 = p.spiral.y0 + dy * f0;  // must precede overwriting az0 below? no: y0 uses original
-            p.spiral.y1 = (p.spiral.y1 - dy) + dy * f1;  // = y0_orig + dy*f1
+            // Non-blend spiral: radius and height vary linearly with the azimuth fraction
+            // (straight meridian), so interpolate BOTH ends off the ORIGINAL endpoints.
+            double y0o = p.spiral.y0, dy = p.spiral.y1 - p.spiral.y0;
+            double r0o = p.spiral.r0, dr = p.spiral.r1 - p.spiral.r0;
+            p.spiral.y0 = y0o + dy * f0;
+            p.spiral.y1 = y0o + dy * f1;
+            p.spiral.r0 = r0o + dr * f0;
+            p.spiral.r1 = r0o + dr * f1;
             p.spiral.az0 = naz0;
             p.spiral.az1 = naz1;
         }
@@ -621,13 +667,21 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
     for (size_t i = 0; i < count; ++i) {
         Primitive tp = trimPrim(*prims[i], startTrim[i], endTrim[i], lens[i]);
         TopoDS_Edge e = primEdge(tp, wireRadius);
-        if (e.IsNull()) return TopoDS_Wire();
+        if (e.IsNull()) {
+            if (dbg) std::cerr << "[spine] bail: primEdge NULL i=" << i << " kind="
+                               << kindName(prims[i]->kind) << "\n";
+            return TopoDS_Wire();
+        }
         BRepAdaptor_Curve c(e);
         gp_Pnt a, b;
         gp_Vec da, db;
         c.D1(c.FirstParameter(), a, da);
         c.D1(c.LastParameter(), b, db);
-        if (da.Magnitude() < 1e-12 || db.Magnitude() < 1e-12) return TopoDS_Wire();
+        if (da.Magnitude() < 1e-12 || db.Magnitude() < 1e-12) {
+            if (dbg) std::cerr << "[spine] bail: zero D1 tangent i=" << i << " kind="
+                               << kindName(prims[i]->kind) << "\n";
+            return TopoDS_Wire();
+        }
         if (e.Orientation() == TopAbs_REVERSED) {
             std::swap(a, b);
             gp_Vec t = da; da = db.Reversed(); db = t.Reversed();
@@ -638,7 +692,9 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
     }
     BRepBuilderAPI_MakeWire wireMaker;
     for (size_t i = 0; i < count; ++i) {
-        if (i > 0 && startTrim[i] > 0.0) {  // a corner was trimmed here -> bridge with a cubic
+        // A corner was filleted here (either side trimmed, possibly asymmetric) -> the two
+        // trimmed ends leave a gap; bridge it with a tangent-matched cubic.
+        if (i > 0 && (startTrim[i] > 0.0 || endTrim[i - 1] > 0.0)) {
             gp_Pnt A = ep1[i - 1], B = ep0[i];
             double gap = A.Distance(B);
             if (gap > 1e-9) {
@@ -650,11 +706,19 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
                 poles(4) = B;
                 Handle(Geom_BezierCurve) bez = new Geom_BezierCurve(poles);
                 wireMaker.Add(BRepBuilderAPI_MakeEdge(bez).Edge());
-                if (!wireMaker.IsDone()) return TopoDS_Wire();
+                if (!wireMaker.IsDone()) {
+                    if (dbg) std::cerr << "[spine] bail: wireMaker fail on fillet bridge i="
+                                       << i << " gap=" << gap << "\n";
+                    return TopoDS_Wire();
+                }
             }
         }
         wireMaker.Add(edges[i]);
-        if (!wireMaker.IsDone()) return TopoDS_Wire();
+        if (!wireMaker.IsDone()) {
+            if (dbg) std::cerr << "[spine] bail: wireMaker fail adding edge i=" << i << " kind="
+                               << kindName(prims[i]->kind) << "\n";
+            return TopoDS_Wire();
+        }
     }
     if (!wireMaker.IsDone()) return TopoDS_Wire();
     return wireMaker.Wire();
@@ -663,17 +727,29 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
 // Sweep an already-built (G1) spine wire into a solid: the exact round profile, one MakePipeShell.
 TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir& t0,
                        double wireRadius, int profileSegments) {
-    try {
-        TopoDS_Wire prof = wireProfileWire(p0, t0, wireRadius, profileSegments);
-        BRepOffsetAPI_MakePipeShell ps(spine);
-        ps.SetMode(Standard_True);   // Frenet frame; the G1 spine needs no corner transition
-        ps.Add(prof);
-        ps.Build();
-        if (!ps.IsDone() || !ps.MakeSolid()) return TopoDS_Shape();
-        return ps.Shape();
-    } catch (const Standard_Failure&) {
-        return TopoDS_Shape();
+    // Frenet framing keeps the round section centered exactly on the spine but cannot close a
+    // spine with inflection points; corrected Frenet (SetMode(false)) parallel-transports the frame
+    // and closes those, and the discrete mode is the robust last resort. Only round and oblong
+    // windings reach here (singleBodyCapable) -- their spines stay low-torsion, so whichever frame
+    // closes them keeps the section on the spine. Try the frames in order and take the first that
+    // yields a valid watertight solid.
+    for (int mode = 0; mode < 3; ++mode) {
+        try {
+            TopoDS_Wire prof = wireProfileWire(p0, t0, wireRadius, profileSegments);
+            BRepOffsetAPI_MakePipeShell ps(spine);
+            if (mode == 0) ps.SetMode(Standard_True);         // Frenet
+            else if (mode == 1) ps.SetMode(Standard_False);   // corrected Frenet (torsion-stable)
+            else ps.SetDiscreteMode();                        // discrete
+            ps.Add(prof);
+            ps.Build();
+            if (!ps.IsDone() || !ps.MakeSolid()) continue;
+            TopoDS_Shape s = ps.Shape();
+            if (BRepCheck_Analyzer(s).IsValid()) return s;
+        } catch (const Standard_Failure&) {
+            continue;
+        }
     }
+    return TopoDS_Shape();
 }
 
 TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRadius,
@@ -1055,17 +1131,22 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     }
 
     // SINGLE BODY (for meshing/FEM): sweep the ENTIRE conductor centerline as ONE pipe over a
-    // G1 (tangent-continuous) spine -- buildFilletedWire keeps every lead/link/helix exact and
-    // rounds only the sharp junctions into physical wire bends. With no C0 corner to bridge, the
-    // Frenet-framed MakePipeShell closes into a single watertight solid, no boolean union (so no
-    // seam slivers, no multi-solid compound), with flat terminal caps from MakeSolid's end
-    // sections. The rounded bends move the copper volume well under a percent. Accept only a
-    // clean, valid, watertight single solid whose volume matches the swept copper; otherwise
-    // fall back to the exact per-run compound (a non-round column, or a winding too long for one
-    // pipe-shell).
-    {
+    // G1 (tangent-continuous) spine -- buildFilletedWire keeps every lead/link/helix/racetrack
+    // exact and rounds only the sharp junctions into physical wire bends, filleting only the
+    // lead/link side of a lead<->wrap corner so the wrap endpoints (MKF crossings) stay exactly on
+    // the centerline. With no C0 corner to bridge, MakePipeShell closes into a single watertight
+    // solid -- no boolean union (so no seam slivers, no multi-solid compound), flat terminal caps
+    // from MakeSolid's end sections. The rounded bends move the copper volume well under a percent.
+    // Emitted for ROUND and OBLONG concentric columns (singleBodyCapable); rectangular columns and
+    // toroids keep the exact per-run compound because MakePipeShell mis-frames their centerlines
+    // (see ConductorPath::singleBodyCapable). Accept only a clean, valid, watertight single solid
+    // whose volume matches the swept copper; otherwise fall back to the exact per-run compound.
+    if (path.singleBodyCapable) {
+        const bool diag = std::getenv("MVB_DIAG") != nullptr;
         TopoDS_Shape whole;
         TopoDS_Wire spine = buildFilletedWire(ptrs.data(), ptrs.size(), path.wireRadius);
+        if (diag && spine.IsNull())
+            std::cerr << "[single-body] spine NULL (untrimmable corner / edge build failed)\n";
         if (!spine.IsNull()) {
             auto p0pts = samplePrim(*ptrs[0], path.wireRadius);
             gp_Dir t0 = (p0pts.size() >= 2 &&
@@ -1086,11 +1167,19 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
             GProp_GProps gp;
             BRepGProp::VolumeProperties(whole, gp);
             double v = gp.Mass();
-            if (nsol == 1 && expected > 0.0 && v > 0.9 * expected && v < 1.1 * expected &&
-                !hasDegenerateSheetFace(whole, path.wireRadius) &&
-                BRepCheck_Analyzer(whole).IsValid()) {
+            bool okVol = expected > 0.0 && v > 0.9 * expected && v < 1.1 * expected;
+            bool okDeg = !hasDegenerateSheetFace(whole, path.wireRadius);
+            bool okChk = BRepCheck_Analyzer(whole).IsValid();
+            if (nsol == 1 && okVol && okDeg && okChk) {
+                if (diag) std::cerr << "[single-body] ACCEPTED v=" << v << " exp=" << expected
+                                    << "\n";
                 return whole;
             }
+            if (diag) std::cerr << "[single-body] rejected nsol=" << nsol << " okVol=" << okVol
+                                << " (v=" << v << " exp=" << expected << ") okDeg=" << okDeg
+                                << " okChk=" << okChk << "\n";
+        } else if (diag && !spine.IsNull()) {
+            std::cerr << "[single-body] sweep NULL (MakePipeShell failed on the G1 spine)\n";
         }
     }
 
@@ -1715,6 +1804,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         ConductorPath path;
         path.name = ct.winding + " parallel " + std::to_string(ct.parallel);
         path.wireRadius = wireRadius;
+        path.singleBodyCapable = !isToroidal && (columnShape == MAS::ColumnShape::ROUND ||
+                                                 columnShape == MAS::ColumnShape::OBLONG);
 
         const auto& turns = ct.turns;
 
