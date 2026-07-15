@@ -6,6 +6,10 @@
 #include "support/Utils.h"
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepCheck_Analyzer.hxx>
+#include <Geom_BezierCurve.hxx>
+#include <TColgp_Array1OfPnt.hxx>
+#include <BRepAdaptor_Curve.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
@@ -538,6 +542,140 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius) {
 // must not revisit any point — OCCT's pipe-shell corrupts the heap in curve-on-surface
 // projection on self-touching spines (observed in 7.9: free() abort inside
 // ShapeConstruct_ProjectCurveOnSurface), so callers split at those points.
+// Build the conductor centerline as a G1 (tangent-continuous) wire for the single-body sweep.
+// Every straight lead/link and every helix stays EXACT (analytic edge, so the pipe-shell does
+// not flare the way it would on a free-form spline). At each SHARP corner the two segments are
+// trimmed back by a hair and bridged with a short tangent-matched cubic -- rounding the wire
+// bend the way a real wound wire physically bends. With no C0 corners left, MakePipeShell has
+// nothing to "transition", so it produces a watertight solid instead of leaving gaps.
+// Only round windings (straight segments + cylindrical helices) are handled here; any other
+// primitive returns a null wire and the caller keeps the exact per-run compound.
+TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, double wireRadius) {
+    if (count == 0) return TopoDS_Wire();
+    for (size_t i = 0; i < count; ++i) {
+        const Primitive& p = *prims[i];
+        if (p.kind == Primitive::ARC3 || p.kind == Primitive::BLEND) return TopoDS_Wire();
+        if (p.kind == Primitive::SPIRAL &&
+            (p.spiral.blend || std::abs(p.spiral.r1 - p.spiral.r0) > 1e-9))
+            return TopoDS_Wire();
+    }
+    auto entryDir = [&](const Primitive& p) {
+        auto pts = samplePrim(p, wireRadius);
+        gp_Vec v(pts[1].XYZ() - pts.front().XYZ());
+        return v.Magnitude() > 1e-12 ? gp_Dir(v) : gp_Dir(1, 0, 0);
+    };
+    auto exitDir = [&](const Primitive& p) {
+        auto pts = samplePrim(p, wireRadius);
+        gp_Vec v(pts.back().XYZ() - pts[pts.size() - 2].XYZ());
+        return v.Magnitude() > 1e-12 ? gp_Dir(v) : gp_Dir(1, 0, 0);
+    };
+    auto arcLen = [&](const Primitive& p) {
+        auto pts = samplePrim(p, wireRadius);
+        double L = 0;
+        for (size_t k = 1; k < pts.size(); ++k) L += pts[k].Distance(pts[k - 1]);
+        return L;
+    };
+    // Trim distance at each end of each primitive: a fillet is needed only where consecutive
+    // segments meet at an angle (a helix chains tangent-continuously to the next helix).
+    std::vector<double> startTrim(count, 0.0), endTrim(count, 0.0);
+    std::vector<double> lens(count, 0.0);
+    for (size_t i = 0; i < count; ++i) lens[i] = arcLen(*prims[i]);
+    const double target = wireRadius * 0.8;
+    for (size_t i = 0; i + 1 < count; ++i) {
+        if (exitDir(*prims[i]).Angle(entryDir(*prims[i + 1])) < 0.05) continue;
+        double d = std::min({target, 0.4 * lens[i], 0.4 * lens[i + 1]});
+        endTrim[i] = std::max(endTrim[i], d);
+        startTrim[i + 1] = std::max(startTrim[i + 1], d);
+    }
+    auto trimPrim = [](Primitive p, double sTrim, double eTrim, double totalLen) {
+        if (p.kind == Primitive::SEG) {
+            gp_XYZ dir = p.seg.b.XYZ() - p.seg.a.XYZ();
+            double L = dir.Modulus();
+            if (L > 1e-12) {
+                gp_XYZ u = dir / L;
+                p.seg.a = gp_Pnt(p.seg.a.XYZ() + u * sTrim);
+                p.seg.b = gp_Pnt(p.seg.b.XYZ() - u * eTrim);
+            }
+        } else {  // cylindrical, non-blend SPIRAL
+            double azSpan = p.spiral.az1 - p.spiral.az0;
+            double speed = totalLen / std::max(1e-12, std::abs(azSpan));
+            double sgn = azSpan > 0 ? 1.0 : -1.0;
+            double naz0 = p.spiral.az0 + sgn * (sTrim / speed);
+            double naz1 = p.spiral.az1 - sgn * (eTrim / speed);
+            double f0 = (naz0 - p.spiral.az0) / azSpan;
+            double f1 = (naz1 - p.spiral.az0) / azSpan;
+            double dy = p.spiral.y1 - p.spiral.y0;
+            p.spiral.y0 = p.spiral.y0 + dy * f0;  // must precede overwriting az0 below? no: y0 uses original
+            p.spiral.y1 = (p.spiral.y1 - dy) + dy * f1;  // = y0_orig + dy*f1
+            p.spiral.az0 = naz0;
+            p.spiral.az1 = naz1;
+        }
+        return p;
+    };
+    // Build each trimmed edge and capture its EXACT endpoint tangents (analytic D1, not the
+    // sampled finite difference) so the bridging cubics are truly tangent to the neighbours --
+    // any residual kink makes MakePipeShell fail on the mixed-curve spine.
+    std::vector<TopoDS_Edge> edges(count);
+    std::vector<gp_Pnt> ep0(count), ep1(count);
+    std::vector<gp_Dir> et0(count), et1(count);
+    for (size_t i = 0; i < count; ++i) {
+        Primitive tp = trimPrim(*prims[i], startTrim[i], endTrim[i], lens[i]);
+        TopoDS_Edge e = primEdge(tp, wireRadius);
+        if (e.IsNull()) return TopoDS_Wire();
+        BRepAdaptor_Curve c(e);
+        gp_Pnt a, b;
+        gp_Vec da, db;
+        c.D1(c.FirstParameter(), a, da);
+        c.D1(c.LastParameter(), b, db);
+        if (da.Magnitude() < 1e-12 || db.Magnitude() < 1e-12) return TopoDS_Wire();
+        if (e.Orientation() == TopAbs_REVERSED) {
+            std::swap(a, b);
+            gp_Vec t = da; da = db.Reversed(); db = t.Reversed();
+        }
+        edges[i] = e;
+        ep0[i] = a; et0[i] = gp_Dir(da);
+        ep1[i] = b; et1[i] = gp_Dir(db);
+    }
+    BRepBuilderAPI_MakeWire wireMaker;
+    for (size_t i = 0; i < count; ++i) {
+        if (i > 0 && startTrim[i] > 0.0) {  // a corner was trimmed here -> bridge with a cubic
+            gp_Pnt A = ep1[i - 1], B = ep0[i];
+            double gap = A.Distance(B);
+            if (gap > 1e-9) {
+                double s = gap / 3.0;
+                TColgp_Array1OfPnt poles(1, 4);
+                poles(1) = A;
+                poles(2) = gp_Pnt(A.XYZ() + et1[i - 1].XYZ() * s);
+                poles(3) = gp_Pnt(B.XYZ() - et0[i].XYZ() * s);
+                poles(4) = B;
+                Handle(Geom_BezierCurve) bez = new Geom_BezierCurve(poles);
+                wireMaker.Add(BRepBuilderAPI_MakeEdge(bez).Edge());
+                if (!wireMaker.IsDone()) return TopoDS_Wire();
+            }
+        }
+        wireMaker.Add(edges[i]);
+        if (!wireMaker.IsDone()) return TopoDS_Wire();
+    }
+    if (!wireMaker.IsDone()) return TopoDS_Wire();
+    return wireMaker.Wire();
+}
+
+// Sweep an already-built (G1) spine wire into a solid: the exact round profile, one MakePipeShell.
+TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir& t0,
+                       double wireRadius) {
+    try {
+        TopoDS_Wire prof = wireProfileWire(p0, t0, wireRadius, 0);
+        BRepOffsetAPI_MakePipeShell ps(spine);
+        ps.SetMode(Standard_True);   // Frenet frame; the G1 spine needs no corner transition
+        ps.Add(prof);
+        ps.Build();
+        if (!ps.IsDone() || !ps.MakeSolid()) return TopoDS_Shape();
+        return ps.Shape();
+    } catch (const Standard_Failure&) {
+        return TopoDS_Shape();
+    }
+}
+
 TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRadius,
                       int wirePolygonSegments) {
     if (count == 0) return TopoDS_Shape();
@@ -910,6 +1048,46 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     if (!path.prims.empty()) {
         flatCaps.push_back(primEndpoints(path.prims.front()).first);
         flatCaps.push_back(primEndpoints(path.prims.back()).second);
+    }
+
+    // SINGLE BODY (for meshing/FEM): sweep the ENTIRE conductor centerline as ONE pipe over a
+    // G1 (tangent-continuous) spine -- buildFilletedWire keeps every lead/link/helix exact and
+    // rounds only the sharp junctions into physical wire bends. With no C0 corner to bridge, the
+    // Frenet-framed MakePipeShell closes into a single watertight solid, no boolean union (so no
+    // seam slivers, no multi-solid compound), with flat terminal caps from MakeSolid's end
+    // sections. The rounded bends move the copper volume well under a percent. Accept only a
+    // clean, valid, watertight single solid whose volume matches the swept copper; otherwise
+    // fall back to the exact per-run compound (a non-round column, or a winding too long for one
+    // pipe-shell).
+    {
+        TopoDS_Shape whole;
+        TopoDS_Wire spine = buildFilletedWire(ptrs.data(), ptrs.size(), path.wireRadius);
+        if (!spine.IsNull()) {
+            auto p0pts = samplePrim(*ptrs[0], path.wireRadius);
+            gp_Dir t0 = (p0pts.size() >= 2 &&
+                         (p0pts[1].XYZ() - p0pts[0].XYZ()).Modulus() > 1e-12)
+                            ? gp_Dir(p0pts[1].XYZ() - p0pts[0].XYZ())
+                            : gp_Dir(1, 0, 0);
+            whole = sweepWire(spine, p0pts.front(), t0, path.wireRadius);
+        }
+        if (!whole.IsNull()) {
+            int nsol = 0;
+            for (TopExp_Explorer e(whole, TopAbs_SOLID); e.More(); e.Next()) ++nsol;
+            double spineLen = 0.0;
+            for (size_t i = 0; i < ptrs.size(); ++i) {
+                auto pts = samplePrim(*ptrs[i], path.wireRadius);
+                for (size_t k = 1; k < pts.size(); ++k) spineLen += pts[k].Distance(pts[k - 1]);
+            }
+            double expected = kPi * path.wireRadius * path.wireRadius * spineLen;
+            GProp_GProps gp;
+            BRepGProp::VolumeProperties(whole, gp);
+            double v = gp.Mass();
+            if (nsol == 1 && expected > 0.0 && v > 0.9 * expected && v < 1.1 * expected &&
+                !hasDegenerateSheetFace(whole, path.wireRadius) &&
+                BRepCheck_Analyzer(whole).IsValid()) {
+                return whole;
+            }
+        }
     }
 
     BRep_Builder builder;
