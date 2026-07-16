@@ -1003,14 +1003,28 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         }
         return gp_Dir(0, 1, 0);
     };
+    // A corner (ARC3) is revolved about its OWN bend axis, so its section's axial is that arc axis
+    // for the whole elbow. A straight must therefore meet each neighbouring elbow on THAT elbow's
+    // axis (not the raw azimuthal, which differs by a degree or so and steps the faces). So a
+    // straight's end axial = the adjacent elbow's arc axis, flipped to the azimuthal hemisphere so
+    // the twist loft goes the short way; a straight next to another straight (a lead) uses azimuthal.
+    auto alignHemisphere = [](const gp_XYZ& axis, const gp_Dir& ref) {
+        gp_Dir a(axis);
+        return a.Dot(ref) >= 0.0 ? a : gp_Dir(a.Reversed());
+    };
     std::vector<TopoDS_Shape> solids;
     solids.reserve(path.prims.size());
     int compoundFaces = 0;
-    for (const auto& pr : path.prims) {
+    for (size_t i = 0; i < path.prims.size(); ++i) {
+        const Primitive& pr = path.prims[i];
         auto [pa, pb] = primEndpoints(pr);
-        // Section orientation at each END: the toroid's azimuthal tangent there (constant Y for
-        // concentric). A straight then twists between the two; corners take their own arc axis.
         gp_Dir axialA = axialFor(pa), axialB = axialFor(pb);
+        if (pr.kind == Primitive::SEG) {
+            if (i > 0 && path.prims[i - 1].kind == Primitive::ARC3)
+                axialA = alignHemisphere(path.prims[i - 1].arc.axis, axialA);
+            if (i + 1 < path.prims.size() && path.prims[i + 1].kind == Primitive::ARC3)
+                axialB = alignHemisphere(path.prims[i + 1].arc.axis, axialB);
+        }
         TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB);
         if (s.IsNull()) continue;
         solids.push_back(s);
