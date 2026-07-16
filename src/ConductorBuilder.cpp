@@ -1130,6 +1130,11 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         BRepAlgoAPI_Fuse fuse;
         fuse.SetArguments(args);
         fuse.SetTools(tools);
+        // The per-primitive solids OVERLAP slightly at each junction (consecutive sections are
+        // co-located but not bit-coincident), so a real boolean intersection is needed to weld them
+        // -- GlueShift, which skips coincident-face splitting, leaves them unwelded. A small fuzzy
+        // value absorbs the sub-micron section misalignment so the union stays clean.
+        fuse.SetFuzzyValue(1e-7);
         fuse.Build();
         if (fuse.IsDone()) {
             TopoDS_Shape fused = fuse.Shape();
@@ -2194,10 +2199,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             path.toroidal = isToroidal;
         } else {
             // Round / litz wire. Round & oblong columns sweep as one clean single body. A
-            // RECTANGULAR column instead goes through the per-primitive ANALYTIC path (SEG ->
-            // cylinder, ARC3 -> torus) and fuses to ONE FEM-ready solid -- the per-run swept-pipe
-            // compound leaves un-fusable seam slivers there. A toroid keeps the swept-pipe compound
-            // (bore-tangent; the analytic tori nick the bore and a tight spring won't fuse cleanly).
+            // RECTANGULAR column goes through the per-primitive ANALYTIC path (SEG -> cylinder,
+            // ARC3 -> torus segment) and fuses to ONE FEM-ready solid -- the per-run swept-pipe
+            // compound leaves un-fusable seam slivers there. A TOROID keeps its swept-pipe compound:
+            // the analytic tori nick the bore (fails the toroidal-CMC tangency) and the fuse of the
+            // tight poloidal tori comes out invalid.
             path.singleBodyCapable = !isToroidal && (columnShape == MAS::ColumnShape::ROUND ||
                                                      columnShape == MAS::ColumnShape::OBLONG);
             bool rectColumnAnalytic = !isToroidal && columnShape == MAS::ColumnShape::RECTANGULAR;
