@@ -14,6 +14,7 @@
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
+#include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepOffsetAPI_MakePipeShell.hxx>
@@ -921,15 +922,37 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
 // tighter than the wire's half-width cleanly, exactly where a swept flat section would collapse);
 // straights are prisms; gentle -Z transitions are piped (corrected Frenet). Used for rect/oblong
 // columns, whose racetrack corners defeat a single swept pipe.
-TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir& axial) {
+TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir& axialStart,
+                           const gp_Dir& axialEnd, double extendA = 0.0, double extendB = 0.0) {
     try {
         if (pr.kind == Primitive::SEG) {
             gp_XYZ dir = pr.seg.b.XYZ() - pr.seg.a.XYZ();
             if (dir.Modulus() < 1e-12) return TopoDS_Shape();
-            TopoDS_Face face =
-                BRepBuilderAPI_MakeFace(rectProfileWire(pr.seg.a, gp_Dir(dir), axial, w, h)).Face();
-            return BRepPrimAPI_MakePrism(face, gp_Vec(dir)).Shape();
+            gp_Dir t(dir);
+            gp_XYZ u = dir / dir.Modulus();
+            // extendA/extendB grow the prism past a SHARP junction (a lead's own 90-degree bend has
+            // no elbow primitive) so the two prisms overlap through the corner and the fuse fills
+            // the mitre instead of leaving a gap.
+            gp_Pnt a(pr.seg.a.XYZ() - u * extendA), b(pr.seg.b.XYZ() + u * extendB);
+            gp_XYZ ext = b.XYZ() - a.XYZ();
+            // A straight whose ends want the SAME section orientation is a plain prism. When the
+            // ends differ (a toroidal chord that advances azimuthally as it carries the wire to the
+            // next turn), TWIST the section from start to end by lofting between the two oriented
+            // rectangles -- so the straight meets its neighbouring elbows at their own angle instead
+            // of kinking at a single fixed orientation.
+            if (axialStart.Angle(axialEnd) < 0.01) {
+                TopoDS_Face face =
+                    BRepBuilderAPI_MakeFace(rectProfileWire(a, t, axialStart, w, h)).Face();
+                return BRepPrimAPI_MakePrism(face, gp_Vec(ext)).Shape();
+            }
+            BRepOffsetAPI_ThruSections loft(Standard_True);  // solid
+            loft.AddWire(rectProfileWire(a, t, axialStart, w, h));
+            loft.AddWire(rectProfileWire(b, t, axialEnd, w, h));
+            loft.Build();
+            if (!loft.IsDone()) return TopoDS_Shape();
+            return loft.Shape();
         }
+        const gp_Dir& axial = axialStart;
         if (pr.kind == Primitive::ARC3) {
             double radius = pr.arc.v0.Modulus();
             if (radius < 1e-12 || std::abs(pr.arc.sweep) < 1e-12) return TopoDS_Shape();
@@ -986,13 +1009,43 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         }
         return gp_Dir(0, 1, 0);
     };
+    // Tangents at each primitive end (for detecting sharp, elbow-less junctions -- the leads).
+    double sampR = std::min(path.wireWidth, path.wireHeight) / 2.0;
+    auto entryDir = [&](const Primitive& p) {
+        auto pts = samplePrim(p, sampR);
+        return pts.size() >= 2 && (pts[1].XYZ() - pts[0].XYZ()).Modulus() > 1e-12
+                   ? gp_Dir(pts[1].XYZ() - pts[0].XYZ())
+                   : gp_Dir(1, 0, 0);
+    };
+    auto exitDir = [&](const Primitive& p) {
+        auto pts = samplePrim(p, sampR);
+        size_t n = pts.size();
+        return n >= 2 && (pts[n - 1].XYZ() - pts[n - 2].XYZ()).Modulus() > 1e-12
+                   ? gp_Dir(pts[n - 1].XYZ() - pts[n - 2].XYZ())
+                   : gp_Dir(1, 0, 0);
+    };
+    const double cornerFill = 0.5 * std::hypot(path.wireWidth, path.wireHeight);
     std::vector<TopoDS_Shape> solids;
     solids.reserve(path.prims.size());
     int compoundFaces = 0;
-    for (const auto& pr : path.prims) {
+    for (size_t pidx = 0; pidx < path.prims.size(); ++pidx) {
+        const Primitive& pr = path.prims[pidx];
         auto [pa, pb] = primEndpoints(pr);
-        gp_Dir axial = axialFor(gp_Pnt((pa.XYZ() + pb.XYZ()) * 0.5));
-        TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axial);
+        // Section orientation at each END: the toroid's azimuthal tangent there (constant Y for
+        // concentric). A straight then twists between the two; corners take their own arc axis.
+        gp_Dir axialA = axialFor(pa), axialB = axialFor(pb);
+        // Grow this primitive into a SHARP, elbow-less junction (a lead's own 90-degree bend) so the
+        // two prisms overlap through the corner and the fuse fills the mitre. Tangent junctions
+        // (SEG<->elbow, the winding corners) stay put.
+        double extA = 0.0, extB = 0.0;
+        if (pidx > 0 &&
+            exitDir(path.prims[pidx - 1]).Angle(entryDir(pr)) > 0.05)
+            extA = cornerFill;
+        if (pidx + 1 < path.prims.size() &&
+            exitDir(pr).Angle(entryDir(path.prims[pidx + 1])) > 0.05)
+            extB = cornerFill;
+        TopoDS_Shape s =
+            rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB, extA, extB);
         if (s.IsNull()) continue;
         solids.push_back(s);
         for (TopExp_Explorer e(s, TopAbs_FACE); e.More(); e.Next()) ++compoundFaces;
