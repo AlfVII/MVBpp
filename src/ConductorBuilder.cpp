@@ -1030,12 +1030,58 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         return n >= 2 && (pts[n - 1].XYZ() - pts[n - 2].XYZ()).Modulus() > 1e-12
                    ? gp_Dir(pts[n - 1].XYZ() - pts[n - 2].XYZ()) : gp_Dir(1, 0, 0);
     };
-    const double cornerFill = 0.5 * std::hypot(path.wireWidth, path.wireHeight);
-    // Fill ONLY a terminal lead's own 90-degree bend (both sides isLead, elbow-less, sharp) -- the
-    // input/output connection corner. Every winding corner has a real elbow and is left untouched.
-    auto leadCorner = [&](const Primitive& a, const Primitive& b) {
-        return a.isLead && b.isLead && exitDir(a).Angle(entryDir(b)) > 0.05;
+    auto segLen = [](const Primitive& p) {
+        return p.kind == Primitive::SEG ? p.seg.a.Distance(p.seg.b) : 0.0;
     };
+    // A terminal lead's own bend is two isLead SEGs with no elbow between them. Build a REAL rounded
+    // elbow there -- the same revolved-rectangle corner the winding turns use -- by trimming both
+    // lead prisms back by R*tan(angle/2) and inserting an ARC3 of radius R. Only isLead<->isLead
+    // corners qualify, so every winding corner is untouched. rotationAxis[i] carries the elbow's
+    // bend axis so the trimmed lead prism aligns its section to it (flush, as the turns do).
+    std::vector<double> trimStart(path.prims.size(), 0.0), trimEnd(path.prims.size(), 0.0);
+    std::vector<gp_Dir> axisAfter(path.prims.size(), gp_Dir(0, 1, 0));
+    std::vector<gp_Dir> axisBefore(path.prims.size(), gp_Dir(0, 1, 0));
+    std::vector<bool> hasAxisAfter(path.prims.size(), false), hasAxisBefore(path.prims.size(), false);
+    std::vector<TopoDS_Shape> leadElbows;
+    for (size_t i = 0; i + 1 < path.prims.size(); ++i) {
+        const Primitive& A = path.prims[i];
+        const Primitive& B = path.prims[i + 1];
+        if (!(A.isLead && B.isLead)) continue;
+        gp_Dir dA = exitDir(A), dB = entryDir(B);
+        double ang = dA.Angle(dB);
+        if (ang < 0.05) continue;
+        gp_XYZ bendAxis = dA.XYZ().Crossed(dB.XYZ());
+        if (bendAxis.Modulus() < 1e-12) continue;
+        bendAxis.Normalize();
+        double R = std::min({std::min(path.wireWidth, path.wireHeight), 0.4 * segLen(A),
+                             0.4 * segLen(B)});
+        if (R < 1e-9) continue;
+        double trim = R * std::tan(ang / 2.0);
+        gp_Pnt P = primEndpoints(A).second;
+        gp_XYZ Ap = P.XYZ() - dA.XYZ() * trim;
+        gp_XYZ nA = dB.XYZ() - dA.XYZ() * dB.XYZ().Dot(dA.XYZ());  // dB perp to dA -> toward centre
+        if (nA.Modulus() < 1e-12) continue;
+        nA.Normalize();
+        Primitive elbow;
+        elbow.kind = Primitive::ARC3;
+        elbow.arc.c = gp_Pnt(Ap + nA * R);
+        elbow.arc.axis = bendAxis;
+        elbow.arc.v0 = Ap - (Ap + nA * R);  // centre -> Ap, magnitude R
+        elbow.arc.sweep = ang;
+        gp_XYZ Bp = P.XYZ() + dB.XYZ() * trim;
+        if (primEndpoints(elbow).second.Distance(gp_Pnt(Bp)) > 1e-6)
+            elbow.arc.axis = bendAxis * -1.0;
+        TopoDS_Shape es = rectPrimSolid(elbow, path.wireWidth, path.wireHeight, gp_Dir(bendAxis),
+                                        gp_Dir(bendAxis));
+        if (es.IsNull()) continue;
+        leadElbows.push_back(es);
+        trimEnd[i] = trim;
+        trimStart[i + 1] = trim;
+        axisAfter[i] = gp_Dir(elbow.arc.axis);
+        hasAxisAfter[i] = true;
+        axisBefore[i + 1] = gp_Dir(elbow.arc.axis);
+        hasAxisBefore[i + 1] = true;
+    }
     std::vector<TopoDS_Shape> solids;
     solids.reserve(path.prims.size());
     int compoundFaces = 0;
@@ -1048,15 +1094,21 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                 axialA = alignHemisphere(path.prims[i - 1].arc.axis, axialA);
             if (i + 1 < path.prims.size() && path.prims[i + 1].kind == Primitive::ARC3)
                 axialB = alignHemisphere(path.prims[i + 1].arc.axis, axialB);
+            // Align the trimmed lead prism to the inserted elbow's axis (flush, as the turns).
+            if (hasAxisBefore[i]) axialA = alignHemisphere(axisBefore[i].XYZ(), axialA);
+            if (hasAxisAfter[i]) axialB = alignHemisphere(axisAfter[i].XYZ(), axialB);
         }
-        double extA = (i > 0 && leadCorner(path.prims[i - 1], pr)) ? cornerFill : 0.0;
-        double extB = (i + 1 < path.prims.size() && leadCorner(pr, path.prims[i + 1])) ? cornerFill
-                                                                                       : 0.0;
+        // Negative extend == trim the prism back so the inserted lead elbow meets it flush.
+        double extA = -trimStart[i], extB = -trimEnd[i];
         TopoDS_Shape s =
             rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB, extA, extB);
         if (s.IsNull()) continue;
         solids.push_back(s);
         for (TopExp_Explorer e(s, TopAbs_FACE); e.More(); e.Next()) ++compoundFaces;
+    }
+    for (const auto& es : leadElbows) {
+        solids.push_back(es);
+        for (TopExp_Explorer e(es, TopAbs_FACE); e.More(); e.Next()) ++compoundFaces;
     }
     if (solids.empty()) {
         throw std::runtime_error(
