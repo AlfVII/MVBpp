@@ -430,10 +430,15 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
 
     // Exact bore: wall contact is true tangency, zero interference within OCCT booleans.
     requireNoPairwiseOverlap(named, 1e-12);
+    // This 12-turn toroid sweeps to ONE FEM-ready solid via the simple MakePipe (its framing keeps
+    // the round section centred on the high-torsion hole-threading spine, where MakePipeShell's
+    // corrected Frenet drifts a crossing off-centre). Denser toroids whose spine MakePipe cannot
+    // close fall back to the exact per-run compound -- still crossing-exact, just multi-solid.
     int solids = 0;
     for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
         ++solids;
-    if (solids == 1) REQUIRE(!hasSelfIntersections(conductor->shape));
+    REQUIRE(solids == 1);
+    REQUIRE(!hasSelfIntersections(conductor->shape));
 
     // FEM terminal faces: the two free ends of the conductor are flat PLANAR discs (the
     // swept lead cylinder's end cap, no sphere), so downstream FEM can assign a current

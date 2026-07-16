@@ -12,11 +12,14 @@
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepOffsetAPI_MakePipeShell.hxx>
 #include <BRepLib.hxx>
 #include <GCE2d_MakeSegment.hxx>
@@ -280,6 +283,22 @@ std::vector<gp_Pnt> samplePrim(const Primitive& p, double wireRadius) {
                                sp.y0 + (sp.y1 - sp.y0) * f, sp.az0 + (sp.az1 - sp.az0) * t));
     }
     return pts;
+}
+
+// A correct ROUND sweep keeps every centreline point at the centre of its circular section, so the
+// nearest solid wall is ~wireRadius away. A framing that drifts the section off the spine (the toroid
+// high-torsion failure mode of MakePipeShell's corrected Frenet) leaves an interior centreline point
+// closer to one wall. Verify the sampled interior points all clear the floor; if not, the single body
+// is geometrically wrong even though it is watertight and the right volume -- reject it.
+static bool centrelineStaysCentred(const TopoDS_Shape& solid,
+                                   const std::vector<gp_Pnt>& interiorPts, double wireRadius) {
+    const double floor = 0.85 * wireRadius;  // backstop vs gross drift; a good MakePipe holds >0.98
+    for (const auto& pt : interiorPts) {
+        TopoDS_Vertex v = BRepBuilderAPI_MakeVertex(pt);
+        BRepExtrema_DistShapeShape d(v, solid);
+        if (!d.IsDone() || d.Value() < floor) return false;
+    }
+    return true;
 }
 
 double polyPolyDistance(const std::vector<gp_Pnt>& polyA, const std::vector<gp_Pnt>& polyB) {
@@ -821,7 +840,8 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
 TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir& t0,
                        double wireRadius, int profileSegments, bool rectangular = false,
                        double rectWidth = 0.0, double rectHeight = 0.0,
-                       const gp_Dir& axialAxis = gp_Dir(0, 1, 0)) {
+                       const gp_Dir& axialAxis = gp_Dir(0, 1, 0),
+                       bool preferSimplePipe = false) {
     if (rectangular) {
         try {
             TopoDS_Wire prof = rectProfileWire(p0, t0, axialAxis, rectWidth, rectHeight);
@@ -832,6 +852,23 @@ TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir&
             if (!ps.IsDone() || !ps.MakeSolid()) return TopoDS_Shape();
             TopoDS_Shape s = ps.Shape();
             if (BRepCheck_Analyzer(s).IsValid()) return s;
+        } catch (const Standard_Failure&) {
+        }
+        return TopoDS_Shape();
+    }
+    // A TOROID's hole-threading spine has high torsion: MakePipeShell's corrected Frenet closes a
+    // watertight, right-volume body but drifts the round section a percent or two off the spine at
+    // the lead-adjacent crossing. The simple MakePipe with a FACE profile keeps the section centred
+    // there, so for toroids we use it EXCLUSIVELY -- never the corrected-Frenet fallback, which would
+    // silently ship an off-centre crossing. If MakePipe can't close (complex spread spine), return
+    // null and let the caller drop to the exact per-run compound.
+    if (preferSimplePipe) {
+        try {
+            TopoDS_Face prof = wireProfile(p0, t0, wireRadius, profileSegments);
+            BRepOffsetAPI_MakePipe mp(spine, prof);
+            mp.Build();
+            if (mp.IsDone() && !mp.Shape().IsNull() && BRepCheck_Analyzer(mp.Shape()).IsValid())
+                return mp.Shape();
         } catch (const Standard_Failure&) {
         }
         return TopoDS_Shape();
@@ -1511,7 +1548,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                             : gp_Dir(1, 0, 0);
             whole = sweepWire(spine, p0pts.front(), t0, path.wireRadius, /*exact profile*/ 0,
                               path.isRectangular, path.wireWidth, path.wireHeight,
-                              /*axialAxis=*/gp_Dir(0, 1, 0));
+                              /*axialAxis=*/gp_Dir(0, 1, 0), /*preferSimplePipe=*/path.toroidal);
         }
         if (!whole.IsNull()) {
             int nsol = 0;
@@ -1534,14 +1571,28 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
             // guarded by BRepCheck validity + the exact volume match instead.
             bool okDeg = path.isRectangular || !hasDegenerateSheetFace(whole, path.wireRadius);
             bool okChk = BRepCheck_Analyzer(whole).IsValid();
-            if (nsol == 1 && okVol && okDeg && okChk) {
+            // Toroid sweeps additionally must keep the section centred on the spine: a valid, right-
+            // volume body whose section drifted off an interior crossing is geometrically WRONG.
+            // Sample the wrap (non-lead) centrelines -- lead tips sit at the end caps (~0 clearance)
+            // and would false-reject -- and require every one to clear 0.85*wireRadius.
+            bool okCentre = true;
+            if (path.toroidal) {
+                std::vector<gp_Pnt> interior;
+                for (size_t i = 0; i < ptrs.size(); ++i) {
+                    if (ptrs[i]->isLead) continue;
+                    auto pts = samplePrim(*ptrs[i], path.wireRadius);
+                    interior.insert(interior.end(), pts.begin(), pts.end());
+                }
+                okCentre = centrelineStaysCentred(whole, interior, path.wireRadius);
+            }
+            if (nsol == 1 && okVol && okDeg && okChk && okCentre) {
                 if (diag) std::cerr << "[single-body] ACCEPTED v=" << v << " exp=" << expected
                                     << "\n";
                 return whole;
             }
             if (diag) std::cerr << "[single-body] rejected nsol=" << nsol << " okVol=" << okVol
                                 << " (v=" << v << " exp=" << expected << ") okDeg=" << okDeg
-                                << " okChk=" << okChk << "\n";
+                                << " okChk=" << okChk << " okCentre=" << okCentre << "\n";
         } else if (diag && !spine.IsNull()) {
             std::cerr << "[single-body] sweep NULL (MakePipeShell failed on the G1 spine)\n";
         }
@@ -2201,11 +2252,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // Round / litz wire. Round & oblong columns sweep as one clean single body. A
             // RECTANGULAR column goes through the per-primitive ANALYTIC path (SEG -> cylinder,
             // ARC3 -> torus segment) and fuses to ONE FEM-ready solid -- the per-run swept-pipe
-            // compound leaves un-fusable seam slivers there. A TOROID keeps its swept-pipe compound:
-            // the analytic tori nick the bore (fails the toroidal-CMC tangency) and the fuse of the
-            // tight poloidal tori comes out invalid.
-            path.singleBodyCapable = !isToroidal && (columnShape == MAS::ColumnShape::ROUND ||
-                                                     columnShape == MAS::ColumnShape::OBLONG);
+            // compound leaves un-fusable seam slivers there. A round TOROID also becomes ONE solid,
+            // swept with the simple MakePipe (its framing keeps the section centred on the high-
+            // torsion hole-threading spine, where corrected Frenet drifts a crossing off-centre); if
+            // its spread spine is too complex for MakePipe to close, emitConductor drops to the exact
+            // per-run compound (still crossing-exact, just multi-solid).
+            path.singleBodyCapable = isToroidal ||
+                                     (columnShape == MAS::ColumnShape::ROUND ||
+                                      columnShape == MAS::ColumnShape::OBLONG);
+            path.toroidal = isToroidal;
             bool rectColumnAnalytic = !isToroidal && columnShape == MAS::ColumnShape::RECTANGULAR;
             path.useRectSolids = rectColumnAnalytic;
             path.roundProfile = rectColumnAnalytic;
