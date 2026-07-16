@@ -444,6 +444,51 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
     REQUIRE(planarFaces >= 2);
 }
 
+TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[realwinding]") {
+    // Rectangular wire on a toroid (single layer): each turn is built from per-primitive rect
+    // solids (prisms + revolved poloidal elbows) oriented on the local AZIMUTHAL axis, then fused.
+    // Every MKF inner/outer crossing must still lie on the copper (the section's inscribed circle
+    // is min(w,h)/2 = turnWireRadius, so the 0.99*r probes stay inside whatever the orientation).
+    auto magneticJson = loadFixture("realwinding_toroid_rect.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, true, 0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       /*corePolygonSegments=*/0,
+                                       true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+    REQUIRE(shapeVolume(conductor->shape) > 0.0);
+
+    auto turnsOpt = enriched.get_coil().get_turns_description();
+    REQUIRE(turnsOpt.has_value());
+    const auto& turns = *turnsOpt;
+    for (size_t i = 0; i < turns.size(); ++i) {
+        const auto& c = turns[i].get_coordinates();
+        REQUIRE(c.size() >= 2);
+        double wr = turnWireRadius(turns[i]);
+        requireCrossingOnCenterline(conductor->shape, gp_Pnt(c[0], c[1], 0.0), wr,
+                                    gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+                                    "turn " + turns[i].get_name() + " inner crossing");
+        if (i + 1 < turns.size()) {
+            auto add = turns[i].get_additional_coordinates();
+            REQUIRE(add.has_value());
+            REQUIRE(!add->empty());
+            requireCrossingOnCenterline(conductor->shape,
+                                        gp_Pnt((*add)[0][0], (*add)[0][1], 0.0), wr,
+                                        gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+                                        "turn " + turns[i].get_name() + " outer crossing");
+        }
+    }
+    // Flat-wire-on-round-bore sagitta: a rectangular wire's FLAT inner face can't sit flush against
+    // the round bore the way a round wire's tangent does -- placed tangent at its centre, its
+    // corners dip into the core by ~(height/2)^2 / (2*boreRadius). That is a real, tiny (< 1e-3
+    // mm^3) geometric artifact of flat wire on a curved bore, not an interference to fix, so the
+    // core<->conductor tolerance here is looser than the round-wire toroid's exact-tangency 1e-12.
+    requireNoPairwiseOverlap(named, 1e-9);
+}
+
 TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean",
           "[realwinding]") {
     // A spread 3-winding toroidal CMC with TWO rings per 120-degree section

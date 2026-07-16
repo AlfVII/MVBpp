@@ -1,0 +1,42 @@
+{
+  "magnetic": {
+    "coil": {
+      "bobbin": "Dummy",
+      "functionalDescription": [
+        {
+          "isolationSide": "primary",
+          "name": "Primary",
+          "numberParallels": 1,
+          "numberTurns": 12,
+          "wire": {
+            "type": "rectangular",
+            "material": "copper",
+            "conductingWidth": {
+              "nominal": 0.0009
+            },
+            "conductingHeight": {
+              "nominal": 0.0006
+            },
+            "outerWidth": {
+              "nominal": 0.00098
+            },
+            "outerHeight": {
+              "nominal": 0.00068
+            },
+            "name": "Rect 0.9x0.6"
+          }
+        }
+      ]
+    },
+    "core": {
+      "functionalDescription": {
+        "gapping": [],
+        "material": "HF 60",
+        "numberStacks": 1,
+        "shape": "T 40/24/16",
+        "type": "toroidal"
+      },
+      "name": "custom"
+    }
+  }
+}

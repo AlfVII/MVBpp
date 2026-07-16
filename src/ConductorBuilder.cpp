@@ -182,6 +182,8 @@ struct ConductorPath {
     // (annular wedges, clean at any corner radius) -- and the solids fused (useRectSolids).
     bool isRectangular = false;
     bool useRectSolids = false;
+    bool toroidal = false;    // rect wire on a toroid: the section's "axial" axis is the local
+                              // AZIMUTHAL direction (tangent to the big ring), not the column Y.
     double wireWidth = 0.0;   // radial extent [m]
     double wireHeight = 0.0;  // axial extent [m]
 };
@@ -333,12 +335,13 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                     }
                     if (ci == cj && shareEndpoint(pa, pb)) continue;
                     double d = polyPolyDistance(polys[ci][i], polys[cj][j]);
-                    // Rectangular wire (round columns): the round capsule is wrong -- the section is
-                    // width(radial) x height(axial). Decompose the closest-approach vector into its
-                    // AXIAL (column-axis Y) and in-plane (radial/tangential) parts and require the
-                    // section boxes to overlap in BOTH. (Approximate: the in-plane part lumps radial
-                    // with tangential; exact rect-vs-rect is future work. Round pairs keep the exact
-                    // capsule test above unchanged.)
+                    // Rectangular wire: the round capsule is wrong -- the section is width(radial) x
+                    // height(axial). Decompose the closest-approach vector into its AXIAL and in-
+                    // plane (radial/tangential) parts and require the section boxes to overlap in
+                    // BOTH. The axial axis is the column Y for concentric windings, or the toroid's
+                    // AZIMUTHAL tangent (the direction adjacent turns are spaced) at the contact.
+                    // (Approximate: the in-plane part lumps radial with tangential; round pairs keep
+                    // the exact capsule test above unchanged.)
                     if (rectPair && d < 0.5 * std::hypot(A.wireWidth + A.wireHeight,
                                                          B.wireWidth + B.wireHeight)) {
                         gp_Pnt ca, cb;
@@ -349,7 +352,13 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                                 if (dd < best) { best = dd; ca = va; cb = vb; }
                             }
                         gp_XYZ sep = cb.XYZ() - ca.XYZ();
-                        double axialSep = std::abs(sep.Y());
+                        gp_XYZ axialDir(0, 1, 0);
+                        if (A.toroidal || B.toroidal) {
+                            gp_XYZ mid = (ca.XYZ() + cb.XYZ()) * 0.5;
+                            gp_XYZ az(-mid.Z(), 0.0, mid.X());  // azimuthal tangent (ring in XZ)
+                            if (az.Modulus() > 1e-9) axialDir = az / az.Modulus();
+                        }
+                        double axialSep = std::abs(sep.Dot(axialDir));
                         double inPlaneSep =
                             std::sqrt(std::max(0.0, sep.SquareModulus() - axialSep * axialSep));
                         double axA = A.isRectangular ? A.wireHeight / 2.0 : A.wireRadius;
@@ -927,8 +936,12 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
             gp_Pnt start(pr.arc.c.XYZ() + pr.arc.v0);
             gp_XYZ tan = pr.arc.axis.Crossed(pr.arc.v0);  // start tangent (d/dt of the arc at t=0)
             if (tan.Modulus() < 1e-12) return TopoDS_Shape();
-            TopoDS_Face face =
-                BRepBuilderAPI_MakeFace(rectProfileWire(start, gp_Dir(tan), axial, w, h)).Face();
+            // A corner's section axis IS the bend axis (the column Y for a racetrack, the azimuthal
+            // tangent for a toroidal poloidal elbow), so the revolved rectangle is a clean annular
+            // wedge in the bend plane -- matching make_toroidal_quarter_swept_rectangle.
+            TopoDS_Face face = BRepBuilderAPI_MakeFace(
+                                   rectProfileWire(start, gp_Dir(tan), gp_Dir(pr.arc.axis), w, h))
+                                   .Face();
             // Revolve the (radial x axial) profile about the corner axis: right-hand about +axis
             // for a positive sweep, about -axis for a negative one; angle is |sweep|.
             gp_Dir revDir = pr.arc.sweep > 0 ? gp_Dir(pr.arc.axis) : gp_Dir(pr.arc.axis).Reversed();
@@ -963,11 +976,22 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
 // merged brick loses almost all its faces) and keep the per-primitive COMPOUND, which shows every
 // turn as its own solid and honours every MKF position exactly.
 TopoDS_Shape emitRectColumn(const ConductorPath& path) {
-    const gp_Dir axial(0, 1, 0);
+    // The straight/blend section's "axial" axis: the column axis Y for concentric columns, or the
+    // toroid's AZIMUTHAL tangent (perpendicular to the poloidal plane) at the primitive's position.
+    // (Corners take their axis from the arc itself, inside rectPrimSolid.)
+    auto axialFor = [&](const gp_Pnt& c) -> gp_Dir {
+        if (path.toroidal) {
+            gp_XYZ az(-c.Z(), 0.0, c.X());  // tangent to the big ring (hole axis Y, ring in XZ)
+            if (az.Modulus() > 1e-9) return gp_Dir(az);
+        }
+        return gp_Dir(0, 1, 0);
+    };
     std::vector<TopoDS_Shape> solids;
     solids.reserve(path.prims.size());
     int compoundFaces = 0;
     for (const auto& pr : path.prims) {
+        auto [pa, pb] = primEndpoints(pr);
+        gp_Dir axial = axialFor(gp_Pnt((pa.XYZ() + pb.XYZ()) * 0.5));
         TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axial);
         if (s.IsNull()) continue;
         solids.push_back(s);
@@ -2009,16 +2033,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         const MAS::WireType wireType = wire.get_type();
         const bool rectWire = wireType == MAS::WireType::RECTANGULAR ||
                               wireType == MAS::WireType::PLANAR;
-        // Rectangular/planar wire: on a ROUND column it sweeps as one body (fixed binormal); on a
-        // RECT/OBLONG column the wide flat section can't sweep the racetrack corners, so it is built
-        // per-primitive (prisms + revolved corners) and fused (emitRectColumn). TOROIDS thread the
-        // hole (a rect section would flip) and FOIL is a single wide sheet -- both still throw.
-        if ((rectWire && isToroidal) || wireType == MAS::WireType::FOIL) {
+        // Rectangular/planar wire: ROUND column -> one body via fixed binormal; RECT/OBLONG column
+        // or TOROID -> per-primitive rect solids fused (emitRectColumn), with the section oriented
+        // by the local bend/spacing axis (column Y, or the toroid's azimuthal tangent). Only FOIL
+        // (a single wide sheet, a different construction) still throws.
+        if (wireType == MAS::WireType::FOIL) {
             throw std::runtime_error(
-                "ConductorBuilder: real-winding rectangular/planar wire is supported on round, "
-                "rectangular and oblong columns but not toroids (the section would flip threading "
-                "the hole), and FOIL wire not at all — winding '" + ct.winding + "' (" +
-                std::string(rectWire ? "rect/planar on toroid" : "foil") + ")");
+                "ConductorBuilder: real-winding does not support FOIL wire (a single wide sheet "
+                "turn is a different construction) — winding '" + ct.winding + "'");
         }
         // Resolve through the first turn: turn.dimensions carries the OUTER footprint
         // (the context-less overload would fall back to the round wire's CONDUCTING
@@ -2043,10 +2065,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         path.wireHeight = wireH;
         if (rectWire) {
             // Round (or straight-less oblong) column: the section sweeps cleanly with a fixed
-            // binormal -> one body. A rect/oblong column with real corners: per-primitive rect
-            // solids + fuse (emitRectColumn), because the wide flat section can't sweep the corners.
+            // binormal -> one body. A rect/oblong column with real corners, OR a toroid: per-
+            // primitive rect solids + fuse (emitRectColumn) -- the wide flat section can't sweep the
+            // corners, and the toroid's poloidal elbows carry the section on the azimuthal axis.
             path.singleBodyCapable = !isToroidal && effectivelyRound;
-            path.useRectSolids = !isToroidal && !effectivelyRound;
+            path.useRectSolids = isToroidal || !effectivelyRound;
+            path.toroidal = isToroidal;
         } else {
             path.singleBodyCapable = !isToroidal && (columnShape == MAS::ColumnShape::ROUND ||
                                                      columnShape == MAS::ColumnShape::OBLONG);
