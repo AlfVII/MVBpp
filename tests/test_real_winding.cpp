@@ -13,6 +13,7 @@
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <TopoDS_Edge.hxx>
@@ -343,10 +344,13 @@ TEST_CASE("Real winding: rectangular-column E core zigzag racetrack conductor",
 
     // E-core window walls are planar (no facet sag): tangent contact only.
     requireNoPairwiseOverlap(named, 1e-10);
+    // A rectangular column's round-wire conductor is built from per-primitive cylinders + torus
+    // elbows and fused into ONE FEM-ready solid (the swept-pipe compound would sliver on the fuse).
     int solids = 0;
     for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
         ++solids;
-    if (solids == 1) REQUIRE(!hasSelfIntersections(conductor->shape));
+    REQUIRE(solids == 1);
+    REQUIRE(!hasSelfIntersections(conductor->shape));
 }
 
 TEST_CASE("Real winding: oblong-column EP core stadium conductor", "[realwinding]") {
@@ -487,6 +491,56 @@ TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[rea
     // mm^3) geometric artifact of flat wire on a curved bore, not an interference to fix, so the
     // core<->conductor tolerance here is looser than the round-wire toroid's exact-tangency 1e-12.
     requireNoPairwiseOverlap(named, 1e-9);
+}
+
+// Count the solids in a named conductor body.
+static int conductorSolidCount(const TopoDS_Shape& shape) {
+    int n = 0;
+    for (TopExp_Explorer exp(shape, TopAbs_SOLID); exp.More(); exp.Next()) ++n;
+    return n;
+}
+
+TEST_CASE("Real winding: LITZ wire builds ONE continuous body", "[realwinding]") {
+    // Litz flows through the round path as a bare bundle. Round column -> ONE single solid.
+    auto magneticJson = loadFixture("realwinding_litz_round.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+    REQUIRE(shapeVolume(conductor->shape) > 0.0);
+    REQUIRE(conductorSolidCount(conductor->shape) == 1);          // FEM-ready single body
+    REQUIRE(BRepCheck_Analyzer(conductor->shape).IsValid());
+}
+
+TEST_CASE("Real winding: round-column RECTANGULAR wire is ONE body", "[realwinding]") {
+    // 03_buck (PQ32, 3x0.5 mm rectangular wire) -> fixed-binormal single solid.
+    auto magneticJson = loadFixture("realwinding_rect_wire_round.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+    REQUIRE(shapeVolume(conductor->shape) > 0.0);
+    REQUIRE(conductorSolidCount(conductor->shape) == 1);
+    REQUIRE(BRepCheck_Analyzer(conductor->shape).IsValid());
+}
+
+TEST_CASE("Real winding: rectangular-column RECTANGULAR wire builds", "[realwinding]") {
+    // 18_stacked (E70, 5x1 mm): the per-turn racetrack solids. Its copper turns TOUCH, so the fuse
+    // would short them into a brick -- the per-turn compound is kept (correct), so it is multi-solid
+    // BY DESIGN. Assert only that it builds valid positive-volume copper for every turn.
+    auto magneticJson = loadFixture("realwinding_rect_wire_rect.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+    REQUIRE(shapeVolume(conductor->shape) > 0.0);
+    REQUIRE(conductorSolidCount(conductor->shape) >= 1);
 }
 
 TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean",

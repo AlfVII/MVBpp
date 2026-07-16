@@ -30,7 +30,7 @@ static void printUsage(const char* prog) {
 }
 
 static bool processFile(const fs::path& inputPath, const fs::path& outputPath, bool useMkf,
-                        bool useRealWinding, int segments) {
+                        bool useRealWinding, int segments, bool copperFootprint = false) {
     try {
         // Read JSON
         std::ifstream f(inputPath);
@@ -66,6 +66,7 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
             auto enriched = mvb::magnetic_autocomplete_safe(magnetic, true);
             mvb::DrawConfig cfg{format, includeBobbin, scale, symmetryPlanes};
             cfg.useRealWindingGeometry = true;
+            cfg.paintCoating = !copperFootprint;  // --copper => bare CONDUCTING footprint (FEM)
             if (segments >= 0) { cfg.wirePolygonSegments = segments; cfg.corePolygonSegments = segments; }
             result = builder.drawMagnetic(enriched, outputPath.parent_path().string(), cfg);
         } else if (useMkf) {
@@ -115,12 +116,13 @@ int main(int argc, char* argv[]) {
     fs::path outputDir;
     bool useMkf = true;
     bool useRealWinding = false;
+    bool copperFootprint = false;
     int segments = -1;  // -1 = builder default; 0 = exact analytic curves
-    
+
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        
+
         if (arg == "-h" || arg == "--help") {
             printUsage(argv[0]);
             return 0;
@@ -132,6 +134,8 @@ int main(int argc, char* argv[]) {
             useMkf = false;
         } else if (arg == "--real") {
             useRealWinding = true;
+        } else if (arg == "--copper") {
+            copperFootprint = true;
         } else if (arg == "--segments") {
             if (++i < argc) segments = std::stoi(argv[i]);
         } else if (arg[0] != '-') {
@@ -152,6 +156,7 @@ int main(int argc, char* argv[]) {
         outputPath = dir / (inputPath.stem().string() + "_mvbpp.step");
     }
     
-    bool success = processFile(inputPath, outputPath, useMkf, useRealWinding, segments);
+    bool success =
+        processFile(inputPath, outputPath, useMkf, useRealWinding, segments, copperFootprint);
     return success ? 0 : 1;
 }

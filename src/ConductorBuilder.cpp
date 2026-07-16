@@ -183,6 +183,11 @@ struct ConductorPath {
     // (annular wedges, clean at any corner radius) -- and the solids fused (useRectSolids).
     bool isRectangular = false;
     bool useRectSolids = false;
+    // ROUND wire on a toroid / rect column also goes through the per-primitive analytic path (SEG ->
+    // cylinder, ARC3 -> torus segment), because unioning the swept BSpline pipes of the per-run
+    // compound leaves seam slivers. Analytic solids fuse into ONE clean FEM-ready body. roundProfile
+    // selects the circle section in that path; round/oblong columns keep the clean single-body sweep.
+    bool roundProfile = false;
     bool toroidal = false;    // rect wire on a toroid: the section's "axial" axis is the local
                               // AZIMUTHAL direction (tangent to the big ring), not the column Y.
     double wireWidth = 0.0;   // radial extent [m]
@@ -923,7 +928,12 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
 // straights are prisms; gentle -Z transitions are piped (corrected Frenet). Used for rect/oblong
 // columns, whose racetrack corners defeat a single swept pipe.
 TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir& axialStart,
-                           const gp_Dir& axialEnd, double extendA = 0.0, double extendB = 0.0) {
+                           const gp_Dir& axialEnd, double extendA = 0.0, double extendB = 0.0,
+                           bool round = false, double radius = 0.0) {
+    // Section profile at a point: an exact circle for round/litz wire, else the oriented rectangle.
+    auto profile = [&](const gp_Pnt& c, const gp_Dir& tan, const gp_Dir& ax) {
+        return round ? wireProfileWire(c, tan, radius, 0) : rectProfileWire(c, tan, ax, w, h);
+    };
     try {
         if (pr.kind == Primitive::SEG) {
             gp_XYZ dir = pr.seg.b.XYZ() - pr.seg.a.XYZ();
@@ -934,14 +944,12 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
             gp_XYZ u = dir / dir.Modulus();
             gp_Pnt sa(pr.seg.a.XYZ() - u * extendA), sb(pr.seg.b.XYZ() + u * extendB);
             gp_XYZ ext = sb.XYZ() - sa.XYZ();
-            // A straight whose ends want the SAME section orientation is a plain prism. When the
-            // ends differ (a toroidal chord that advances azimuthally as it carries the wire to the
-            // next turn), TWIST the section from start to end by lofting between the two oriented
-            // rectangles -- so the straight meets its neighbouring elbows at their own angle instead
-            // of kinking at a single fixed orientation.
-            if (axialStart.Angle(axialEnd) < 0.01) {
-                TopoDS_Face face =
-                    BRepBuilderAPI_MakeFace(rectProfileWire(sa, t, axialStart, w, h)).Face();
+            // A round section is rotation-invariant, and a rect straight whose ends want the SAME
+            // orientation, are plain prisms (SEG -> cylinder for round). Only a rect straight whose
+            // ends differ (a toroidal chord advancing azimuthally to the next turn) is TWISTED by
+            // lofting between the two oriented rectangles, so it meets its elbows at their own angle.
+            if (round || axialStart.Angle(axialEnd) < 0.01) {
+                TopoDS_Face face = BRepBuilderAPI_MakeFace(profile(sa, t, axialStart)).Face();
                 return BRepPrimAPI_MakePrism(face, gp_Vec(ext)).Shape();
             }
             BRepOffsetAPI_ThruSections loft(Standard_True);  // solid
@@ -953,35 +961,32 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
         }
         const gp_Dir& axial = axialStart;
         if (pr.kind == Primitive::ARC3) {
-            double radius = pr.arc.v0.Modulus();
-            if (radius < 1e-12 || std::abs(pr.arc.sweep) < 1e-12) return TopoDS_Shape();
+            double r = pr.arc.v0.Modulus();
+            if (r < 1e-12 || std::abs(pr.arc.sweep) < 1e-12) return TopoDS_Shape();
             gp_Pnt start(pr.arc.c.XYZ() + pr.arc.v0);
             gp_XYZ tan = pr.arc.axis.Crossed(pr.arc.v0);  // start tangent (d/dt of the arc at t=0)
             if (tan.Modulus() < 1e-12) return TopoDS_Shape();
-            // A corner's section axis IS the bend axis (the column Y for a racetrack, the azimuthal
-            // tangent for a toroidal poloidal elbow), so the revolved rectangle is a clean annular
-            // wedge in the bend plane -- matching make_toroidal_quarter_swept_rectangle.
-            TopoDS_Face face = BRepBuilderAPI_MakeFace(
-                                   rectProfileWire(start, gp_Dir(tan), gp_Dir(pr.arc.axis), w, h))
-                                   .Face();
-            // Revolve the (radial x axial) profile about the corner axis: right-hand about +axis
-            // for a positive sweep, about -axis for a negative one; angle is |sweep|.
+            // Revolve the section about the corner's bend axis: for round that is a torus segment,
+            // for rect a clean annular wedge in the (radial x axial) bend plane (its section axis IS
+            // the arc axis -- matching make_toroidal_quarter_swept_rectangle).
+            TopoDS_Face face =
+                BRepBuilderAPI_MakeFace(profile(start, gp_Dir(tan), gp_Dir(pr.arc.axis))).Face();
             gp_Dir revDir = pr.arc.sweep > 0 ? gp_Dir(pr.arc.axis) : gp_Dir(pr.arc.axis).Reversed();
             return BRepPrimAPI_MakeRevol(face, gp_Ax1(pr.arc.c, revDir), std::abs(pr.arc.sweep))
                 .Shape();
         }
-        // BLEND / SPIRAL (gentle -Z transitions): pipe the rect over the analytic edge.
-        double r = std::min(w, h) / 2.0;
-        TopoDS_Edge e = primEdge(pr, r);
+        // BLEND / SPIRAL (gentle -Z transitions): pipe the section over the analytic edge.
+        double sampleR = round ? radius : std::min(w, h) / 2.0;
+        TopoDS_Edge e = primEdge(pr, sampleR);
         if (e.IsNull()) return TopoDS_Shape();
-        auto pts = samplePrim(pr, r);
+        auto pts = samplePrim(pr, sampleR);
         if (pts.size() < 2) return TopoDS_Shape();
         gp_Dir t0 = (pts[1].XYZ() - pts[0].XYZ()).Modulus() > 1e-12
                         ? gp_Dir(pts[1].XYZ() - pts[0].XYZ())
                         : gp_Dir(1, 0, 0);
         BRepOffsetAPI_MakePipeShell ps(BRepBuilderAPI_MakeWire(e).Wire());
         ps.SetMode(Standard_False);  // corrected Frenet: carry the section through the gentle bend
-        ps.Add(rectProfileWire(pts.front(), t0, axial, w, h));
+        ps.Add(profile(pts.front(), t0, axial));
         ps.Build();
         if (!ps.IsDone() || !ps.MakeSolid()) return TopoDS_Shape();
         return ps.Shape();
@@ -1001,6 +1006,8 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
     // The straight/blend section's "axial" axis: the column axis Y for concentric columns, or the
     // toroid's AZIMUTHAL tangent (perpendicular to the poloidal plane) at the primitive's position.
     // (Corners take their axis from the arc itself, inside rectPrimSolid.)
+    const bool round = path.roundProfile;
+    const double radius = path.wireRadius;
     auto axialFor = [&](const gp_Pnt& c) -> gp_Dir {
         if (path.toroidal) {
             gp_XYZ az(-c.Z(), 0.0, c.X());  // tangent to the big ring (hole axis Y, ring in XZ)
@@ -1072,7 +1079,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         if (primEndpoints(elbow).second.Distance(gp_Pnt(Bp)) > 1e-6)
             elbow.arc.axis = bendAxis * -1.0;
         TopoDS_Shape es = rectPrimSolid(elbow, path.wireWidth, path.wireHeight, gp_Dir(bendAxis),
-                                        gp_Dir(bendAxis));
+                                        gp_Dir(bendAxis), 0.0, 0.0, round, radius);
         if (es.IsNull()) continue;
         leadElbows.push_back(es);
         trimEnd[i] = trim;
@@ -1089,7 +1096,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         const Primitive& pr = path.prims[i];
         auto [pa, pb] = primEndpoints(pr);
         gp_Dir axialA = axialFor(pa), axialB = axialFor(pb);
-        if (pr.kind == Primitive::SEG) {
+        if (!round && pr.kind == Primitive::SEG) {  // a round section needs no orientation
             if (i > 0 && path.prims[i - 1].kind == Primitive::ARC3)
                 axialA = alignHemisphere(path.prims[i - 1].arc.axis, axialA);
             if (i + 1 < path.prims.size() && path.prims[i + 1].kind == Primitive::ARC3)
@@ -1100,8 +1107,8 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         }
         // Negative extend == trim the prism back so the inserted lead elbow meets it flush.
         double extA = -trimStart[i], extB = -trimEnd[i];
-        TopoDS_Shape s =
-            rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB, extA, extB);
+        TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB, extA,
+                                       extB, round, radius);
         if (s.IsNull()) continue;
         solids.push_back(s);
         for (TopExp_Explorer e(s, TopAbs_FACE); e.More(); e.Next()) ++compoundFaces;
@@ -1129,9 +1136,10 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
             int nsol = 0, fusedFaces = 0;
             for (TopExp_Explorer e(fused, TopAbs_SOLID); e.More(); e.Next()) ++nsol;
             for (TopExp_Explorer e(fused, TopAbs_FACE); e.More(); e.Next()) ++fusedFaces;
-            // A true spiral keeps most of its faces (each turn's flats survive); a brick-merge (the
-            // stacked flats fused away) keeps only a small fraction -> reject as a short.
-            bool notCollapsed = fusedFaces > compoundFaces / 2;
+            // A true rect spiral keeps most of its faces (each turn's flats survive); a brick-merge
+            // (stacked flats fused away) keeps only a small fraction -> reject as a short. A ROUND
+            // section can't brick -- turns touch only along a line -- so it never triggers this.
+            bool notCollapsed = round || fusedFaces > compoundFaces / 2;
             if (nsol == 1 && notCollapsed && BRepCheck_Analyzer(fused).IsValid()) {
                 ShapeUpgrade_UnifySameDomain unify(fused, Standard_True, Standard_True,
                                                    Standard_True);
@@ -2185,8 +2193,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             path.useRectSolids = isToroidal || !effectivelyRound;
             path.toroidal = isToroidal;
         } else {
+            // Round / litz wire. Round & oblong columns sweep as one clean single body. A
+            // RECTANGULAR column instead goes through the per-primitive ANALYTIC path (SEG ->
+            // cylinder, ARC3 -> torus) and fuses to ONE FEM-ready solid -- the per-run swept-pipe
+            // compound leaves un-fusable seam slivers there. A toroid keeps the swept-pipe compound
+            // (bore-tangent; the analytic tori nick the bore and a tight spring won't fuse cleanly).
             path.singleBodyCapable = !isToroidal && (columnShape == MAS::ColumnShape::ROUND ||
                                                      columnShape == MAS::ColumnShape::OBLONG);
+            bool rectColumnAnalytic = !isToroidal && columnShape == MAS::ColumnShape::RECTANGULAR;
+            path.useRectSolids = rectColumnAnalytic;
+            path.roundProfile = rectColumnAnalytic;
         }
 
         const auto& turns = ct.turns;

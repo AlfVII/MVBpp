@@ -1,0 +1,301 @@
+{
+  "magnetic": {
+    "coil": {
+      "bobbin": {
+        "processedDescription": {
+          "columnDepth": 0.008225,
+          "columnShape": "round",
+          "columnThickness": 0.0015000000000000005,
+          "columnWidth": 0.008225,
+          "coordinates": [
+            0,
+            0,
+            0
+          ],
+          "wallThickness": 0.0012500000000000002,
+          "windingWindows": [
+            {
+              "area": 4.972499999999999e-05,
+              "coordinates": [
+                0.010987499999999999,
+                0,
+                0
+              ],
+              "height": 0.009,
+              "sectionsAlignment": "innerOrTop",
+              "sectionsOrientation": "overlapping",
+              "shape": "rectangular",
+              "width": 0.0055249999999999995,
+              "windingOrder": "U"
+            }
+          ]
+        }
+      },
+      "functionalDescription": [
+        {
+          "isolationSide": "primary",
+          "name": "Primary",
+          "numberParallels": 1,
+          "numberTurns": 16,
+          "wire": "Litz 20x0.1 - Grade 1 - Single Served"
+        }
+      ]
+    },
+    "core": {
+      "functionalDescription": {
+        "gapping": [
+          {
+            "area": 0.00014208,
+            "coordinates": [
+              0,
+              0,
+              0
+            ],
+            "distanceClosestNormalSurface": 0.0057475,
+            "distanceClosestParallelSurface": 0.007025,
+            "length": 5e-06,
+            "sectionDimensions": [
+              0.01345,
+              0.01345
+            ],
+            "shape": "round",
+            "type": "residual"
+          },
+          {
+            "area": 8.4072e-05,
+            "coordinates": [
+              0.015660727,
+              0,
+              0
+            ],
+            "distanceClosestNormalSurface": 0.0057475,
+            "distanceClosestParallelSurface": 0.007025,
+            "length": 5e-06,
+            "sectionDimensions": [
+              0.003821455,
+              0.022
+            ],
+            "shape": "irregular",
+            "type": "residual"
+          },
+          {
+            "area": 8.4072e-05,
+            "coordinates": [
+              -0.015660727,
+              0,
+              0
+            ],
+            "distanceClosestNormalSurface": 0.0057475,
+            "distanceClosestParallelSurface": 0.007025,
+            "length": 5e-06,
+            "sectionDimensions": [
+              0.003821455,
+              0.022
+            ],
+            "shape": "irregular",
+            "type": "residual"
+          }
+        ],
+        "material": {
+          "coerciveForce": [
+            {
+              "magneticField": 191,
+              "magneticFluxDensity": 0,
+              "temperature": 25
+            }
+          ],
+          "curieTemperature": 500,
+          "density": 6870,
+          "family": "HF",
+          "heatConductivity": {
+            "nominal": 6.551
+          },
+          "manufacturerInfo": {
+            "datasheetUrl": "https://s3.amazonaws.com/micrometals-production/filer_public/4f/14/4f14033f-866c-4c78-bfce-afa4cb14e84c/hf-060-datasheet.pdf",
+            "name": "Micrometals"
+          },
+          "material": "powder",
+          "materialComposition": "FeNi",
+          "name": "HF 60",
+          "permeability": {
+            "initial": {
+              "modifiers": {
+                "EQ": {
+                  "frequencyFactor": {
+                    "a": 0.016666666666666,
+                    "b": 2.63613971401688e-09,
+                    "c": 0.9604462927406151,
+                    "d": 0
+                  },
+                  "magneticFieldDcBiasFactor": {
+                    "a": 0.01,
+                    "b": 2.024260170597537e-09,
+                    "c": 1.63874526672196,
+                    "d": 0
+                  },
+                  "magneticFluxDensityFactor": {
+                    "a": 631.199368528185,
+                    "b": 6877.584573069681,
+                    "c": 1.10285384713211,
+                    "d": 239.53349010875377,
+                    "e": -1.4,
+                    "f": 118.8253235837
+                  },
+                  "method": "micrometals",
+                  "temperatureFactor": {
+                    "a": 142
+                  }
+                },
+                "PQ": {
+                  "frequencyFactor": {
+                    "a": 0.016666666666666,
+                    "b": 2.63613971401688e-09,
+                    "c": 0.9604462927406151,
+                    "d": 0
+                  },
+                  "magneticFieldDcBiasFactor": {
+                    "a": 0.01,
+                    "b": 2.7460839346025383e-10,
+                    "c": 1.87123278733929,
+                    "d": 0
+                  },
+                  "magneticFluxDensityFactor": {
+                    "a": 631.199368528185,
+                    "b": 6877.584573069681,
+                    "c": 1.10285384713211,
+                    "d": 239.53349010875377,
+                    "e": -1.4,
+                    "f": 118.8253235837
+                  },
+                  "method": "micrometals",
+                  "temperatureFactor": {
+                    "a": 142
+                  }
+                },
+                "default": {
+                  "frequencyFactor": {
+                    "a": 0.016666666666666,
+                    "b": 2.63613971401688e-09,
+                    "c": 0.9604462927406151,
+                    "d": 0
+                  },
+                  "magneticFieldDcBiasFactor": {
+                    "a": 0.01,
+                    "b": 1.625372212593809e-11,
+                    "c": 2.11089867428021,
+                    "d": 0
+                  },
+                  "magneticFluxDensityFactor": {
+                    "a": 631.199368528185,
+                    "b": 6877.584573069655,
+                    "c": 1.10285384713211,
+                    "d": 239.53349010875377,
+                    "e": -1.4,
+                    "f": 118.8253235837
+                  },
+                  "method": "micrometals",
+                  "temperatureFactor": {
+                    "a": 142
+                  }
+                }
+              },
+              "value": 60
+            }
+          },
+          "remanence": [
+            {
+              "magneticField": 0,
+              "magneticFluxDensity": 0.014400000000000001,
+              "temperature": 25
+            }
+          ],
+          "resistivity": [
+            {
+              "temperature": 25,
+              "value": 100
+            }
+          ],
+          "saturation": [
+            {
+              "magneticField": 7957,
+              "magneticFluxDensity": 1.4162,
+              "temperature": 100
+            }
+          ],
+          "type": "commercial",
+          "volumetricLosses": {
+            "EQ": [
+              {
+                "a": 8.19495972662926e-07,
+                "b": 0.00046720517784400005,
+                "c": 0.000744864591291,
+                "d": 0.003593146110719,
+                "method": "micrometals"
+              }
+            ],
+            "PQ": [
+              {
+                "a": 3.8811640360097717e-05,
+                "b": 5.944097999564959e-05,
+                "c": 0.00135881670397,
+                "d": 0.004837350648153001,
+                "method": "micrometals"
+              }
+            ],
+            "default": [
+              {
+                "a": 1.389e-06,
+                "b": 0.0007382200930410001,
+                "c": 0.000721162594486,
+                "d": 0.0009445528069540001,
+                "method": "micrometals"
+              }
+            ]
+          }
+        },
+        "numberStacks": 1,
+        "shape": {
+          "aliases": [
+            "PQ 33/21"
+          ],
+          "dimensions": {
+            "A": {
+              "maximum": 0.0325,
+              "minimum": 0.0315
+            },
+            "B": {
+              "maximum": 0.0104,
+              "minimum": 0.01015
+            },
+            "C": {
+              "maximum": 0.0225,
+              "minimum": 0.0215
+            },
+            "D": {
+              "maximum": 0.0059,
+              "minimum": 0.0056
+            },
+            "E": {
+              "maximum": 0.028,
+              "minimum": 0.027
+            },
+            "F": {
+              "maximum": 0.0137,
+              "minimum": 0.0132
+            },
+            "G": {
+              "maximum": 0.02,
+              "minimum": 0.019
+            }
+          },
+          "family": "pq",
+          "magneticCircuit": "open",
+          "name": "PQ 32/20",
+          "type": "standard"
+        },
+        "type": "twoPieceSet"
+      },
+      "name": "custom"
+    }
+  }
+}
