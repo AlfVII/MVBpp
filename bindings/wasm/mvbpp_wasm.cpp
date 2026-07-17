@@ -97,6 +97,14 @@ bool resolveUseRealWinding(const val& v) {
     return v.as<bool>();
 }
 
+// femReady is an optional trailing argument (drawMagnetic only, with useRealWindingGeometry=true);
+// omitted/undefined keeps the FAST per-run compound (drawing). Pass true for the SLOW meshable
+// geometry: one-piece per parallel where a sweep closes, conformal mitre for dense toroids.
+bool resolveFemReady(const val& v) {
+    if (v.isUndefined() || v.isNull()) return false;
+    return v.as<bool>();
+}
+
 std::string upper(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
@@ -438,19 +446,23 @@ static int adaptive_wire_segments(int requested, std::size_t numTurns) {
 }
 
 std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments,
-                                            bool paintCoating, bool useRealWindingGeometry) {
+                                            bool paintCoating, bool useRealWindingGeometry,
+                                            bool femReady = false) {
     auto j = json::parse(json_str);
     mvb::MagneticBuilder b;
     // useRealWindingGeometry: replace the per-turn closed loops with ONE continuous copper body per
     // (winding, parallel). MKF must (re)wind, so re-enrich through the real-winding autocomplete.
     // The conductor cross-section stays an exact circle regardless of segments, so wireSeg is moot
     // (0); polygonSegments still facets the core/bobbin.
+    // femReady: false [default] -> fast per-run compound (drawing); true -> slow one-piece/conformal
+    // FEM geometry (single body where a sweep closes, conformal mitre for dense toroids).
     if (useRealWindingGeometry) {
         auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
         return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
                                /*wireSeg=*/0, polygonSegments, paintCoating,
                                /*emitCoatingShells=*/false, /*includeInsulation=*/false,
-                               /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true);
+                               /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true,
+                               femReady);
     }
     auto magnetic = j.get<MAS::Magnetic>();
     std::size_t numTurns = 0;
@@ -772,9 +784,11 @@ val _drawMagnetic(const std::string& json_str,
                   const std::string& symmetry,
                   const std::string& side,
                   val paintCoating,
-                  val useRealWindingGeometry) {
+                  val useRealWindingGeometry,
+                  val femReady) {
     auto named = build_magnetic(json_str, polygonSegments, resolvePaintCoating(paintCoating),
-                                resolveUseRealWinding(useRealWindingGeometry));
+                                resolveUseRealWinding(useRealWindingGeometry),
+                                resolveFemReady(femReady));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     return makeUint8Array(data);
@@ -791,9 +805,11 @@ std::string _drawMagneticToPath(const std::string& json_str,
                                 const std::string& symmetry,
                                 const std::string& side,
                                 val paintCoating,
-                                val useRealWindingGeometry) {
+                                val useRealWindingGeometry,
+                                val femReady) {
     auto named = build_magnetic(json_str, polygonSegments, resolvePaintCoating(paintCoating),
-                                resolveUseRealWinding(useRealWindingGeometry));
+                                resolveUseRealWinding(useRealWindingGeometry),
+                                resolveFemReady(femReady));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     write_bytes(path, data);

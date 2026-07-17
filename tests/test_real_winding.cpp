@@ -641,3 +641,43 @@ TEST_CASE("Real winding: pre-enriched input with the flag on throws", "[realwind
                               /*useRealWindingGeometry=*/true),
         Catch::Matchers::ContainsSubstring("geometricalDescription"));
 }
+
+TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre compound",
+          "[realwinding]") {
+    // A 60-turn toroid is too dense for the single-solid MakePipe sweep to close on its packed hole
+    // spine, so femReady=true builds the CONFORMAL mitre-jointed compound instead: each primitive is
+    // its own round solid, and neighbours are sliced on their shared angle-bisector plane so they
+    // ABUT on a coincident elliptical face rather than interpenetrating. This is the FEM-meshable
+    // (no double material) form of a winding that cannot be a single solid.
+    auto magneticJson = loadFixture("realwinding_toroid_3in.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       /*corePolygonSegments=*/0, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+    REQUIRE(conductor != nullptr);
+
+    std::vector<TopoDS_Solid> solids;
+    for (TopExp_Explorer e(conductor->shape, TopAbs_SOLID); e.More(); e.Next())
+        solids.push_back(TopoDS::Solid(e.Current()));
+    // MakePipe can't close one body here, so the conductor is a multi-solid conformal compound.
+    REQUIRE(solids.size() > 1);
+    // Every mitred solid is watertight/valid -- the per-solid ShapeFix makes the torus cut-curves
+    // survive a STEP round-trip (they were valid in memory but degraded on reload without it).
+    for (const auto& s : solids) REQUIRE(BRepCheck_Analyzer(s).IsValid());
+
+    // Conformal: neighbouring (consecutive-primitive) solids share a mitre face and do NOT overlap.
+    // Sample consecutive pairs across the whole winding and require ~zero common volume; a plain
+    // overlapping per-run compound would carry ~0.5-1 mm^3 (5e-10 m^3) at each joint here.
+    int checked = 0;
+    int stride = std::max<int>(1, static_cast<int>(solids.size()) / 15);
+    for (size_t i = 0; i + 1 < solids.size(); i += static_cast<size_t>(stride)) {
+        double v = commonVolume(solids[i], solids[i + 1]);
+        INFO("mitre neighbour overlap [" << i << "," << (i + 1) << "] = " << v);
+        REQUIRE(v <= 1e-12);
+        ++checked;
+    }
+    REQUIRE(checked >= 10);
+}

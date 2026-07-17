@@ -257,7 +257,8 @@ std::vector<mvb::NamedShape> build_winding(const std::string& json_str,
 }
 
 std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments,
-                                            bool paintCoating, bool useRealWindingGeometry) {
+                                            bool paintCoating, bool useRealWindingGeometry,
+                                            bool femReady = false) {
     auto j = json::parse(json_str);
     mvb::MagneticBuilder b;
     // Use polygonSegments for both wire and core for simplicity; the user
@@ -270,12 +271,15 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
     // (a magnetic that already carries a geometricalDescription throws with the flag on — its turn
     // positions are never silently re-interpreted). The conductor cross-section stays an exact
     // circle; polygonSegments still facets the core/bobbin.
+    // femReady: false [default] -> fast per-run compound (drawing); true -> the slow one-piece /
+    // conformal FEM geometry (single body where a sweep closes, conformal mitre for dense toroids).
     if (useRealWindingGeometry) {
         auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
         return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
                                polygonSegments, polygonSegments, paintCoating,
                                /*emitCoatingShells=*/false, /*includeInsulation=*/false,
-                               /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true);
+                               /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true,
+                               femReady);
     }
     auto magnetic = j.get<MAS::Magnetic>();
     return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
@@ -352,7 +356,7 @@ Inputs are MAS-1.0 JSON strings.
     mvbpp.drawBobbin     (bobbin_json,      outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawTurns      (turns_json,       outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
     mvbpp.drawWinding    (coil_json, windingName, outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
-    mvbpp.drawMagnetic   (magnetic_json,    outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True, useRealWindingGeometry=False)
+    mvbpp.drawMagnetic   (magnetic_json,    outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True, useRealWindingGeometry=False, femReady=False)
 
 Pictorial-view function
 -----------------------
@@ -381,6 +385,12 @@ Notes
   toroidal windings stay an exact multi-solid compound (both honour MKF crossings).
   The conductor cross-section stays an exact circle; polygonSegments facets only
   the core/bobbin.  A magnetic that already carries a geometricalDescription raises.
+* femReady (drawMagnetic only, with useRealWindingGeometry=True): False [default]
+  builds the FAST per-run compound — overlapping swept pipes, ideal for the 3D
+  viewer, sub-second.  True builds the SLOW meshable geometry — one continuous body
+  per (winding, parallel) where a sweep closes (columns, sparse toroids), a conformal
+  (non-overlapping) mitre-jointed compound for dense toroids.  Use True only when
+  exporting for FEM (it is ~20-30x slower on toroids).
 )doc";
 
     auto def_draw = [&](const char* name,
@@ -469,9 +479,10 @@ Notes
              const std::string& symmetry,
              const std::string& side,
              bool paintCoating,
-             bool useRealWindingGeometry) {
+             bool useRealWindingGeometry,
+             bool femReady) {
               auto named = build_magnetic(json_str, polygonSegments, paintCoating,
-                                          useRealWindingGeometry);
+                                          useRealWindingGeometry, femReady);
               return deliver(std::move(named), outputPath, mode, plane, offset, format, scale,
                              symmetry, side);
           },
@@ -487,7 +498,8 @@ Notes
           py::arg("symmetry") = std::string("none"),
           py::arg("side") = std::string("+X+Y+Z"),
           py::arg("paintCoating") = true,
-          py::arg("useRealWindingGeometry") = false);
+          py::arg("useRealWindingGeometry") = false,
+          py::arg("femReady") = false);
 
     // drawWinding takes an extra positional `windingName`.
     m.def("drawWinding",
