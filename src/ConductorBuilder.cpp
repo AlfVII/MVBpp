@@ -14,6 +14,8 @@
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepAlgoAPI_Common.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
@@ -59,6 +61,7 @@
 #include <BOPAlgo_GlueEnum.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <ShapeUpgrade_UnifySameDomain.hxx>
+#include <ShapeFix_Shape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <iostream>
@@ -1502,6 +1505,173 @@ TopoDS_Shape sweepRunChunked(const Primitive* const* prims, size_t count, double
     return compound;
 }
 
+// ---------------------------------------------------------------------------------------
+// Conformal per-primitive toroid (mitre joints). A dense toroid's winding cannot become one
+// solid (MakePipe self-intersects on the packed hole spine; a boolean fuse of the per-run pipes
+// comes out invalid), and the plain per-primitive compound OVERLAPS at every joint (double
+// material -> not a valid FEM assembly). Here each primitive is built as its OWN round solid,
+// grown a hair past both endpoints, then sliced by the ANGLE-BISECTOR plane through each shared
+// point. Two equal round tubes mitred on their bisector leave IDENTICAL elliptical faces (same
+// centre, tilt and radius), so neighbouring solids ABUT on a coincident face instead of
+// overlapping: a conformal, mesh-shareable assembly. Centrelines/crossings never move.
+static gp_Dir primFwdStart(const Primitive& p, double r) {
+    auto pts = samplePrim(p, r);
+    for (size_t i = 1; i < pts.size(); ++i) {
+        gp_Vec v(pts.front(), pts[i]);
+        if (v.Magnitude() > 1e-12) return gp_Dir(v);
+    }
+    return gp_Dir(1, 0, 0);
+}
+static gp_Dir primFwdEnd(const Primitive& p, double r) {
+    auto pts = samplePrim(p, r);
+    for (size_t i = pts.size(); i-- > 1;) {
+        gp_Vec v(pts[i - 1], pts.back());
+        if (v.Magnitude() > 1e-12) return gp_Dir(v);
+    }
+    return gp_Dir(1, 0, 0);
+}
+
+// A round solid for one primitive, grown by overA/overB past its start/end so a tilted bisector
+// plane fully crosses the tube there (SEG -> longer cylinder, ARC3 -> wider revolve, else pipe).
+// A tangent junction passes 0 -> the tube ends flush on a perpendicular cap, no growth, no cut.
+static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, double overB) {
+    if (pr.kind == Primitive::SEG) {
+        gp_Vec d(pr.seg.a, pr.seg.b);
+        double len = d.Magnitude();
+        if (len < 1e-12) return {};
+        gp_Dir dir(d);
+        gp_Pnt a = pr.seg.a.Translated(gp_Vec(dir) * (-overA));
+        return BRepPrimAPI_MakeCylinder(gp_Ax2(a, dir), r, len + overA + overB).Shape();
+    }
+    if (pr.kind == Primitive::ARC3) {
+        double radius = pr.arc.v0.Modulus();
+        if (radius < 1e-12 || std::abs(pr.arc.sweep) < 1e-12) return {};
+        double sgn = pr.arc.sweep < 0 ? -1.0 : 1.0;
+        double ddA = (overA / radius) * sgn, ddB = (overB / radius) * sgn;
+        double total = pr.arc.sweep + ddA + ddB;
+        if (std::abs(total) > 1.9 * kPi) return {};  // a near-full revolve would self-close: caller retries
+        gp_XYZ v0e = rotateXYZ(pr.arc.v0, pr.arc.axis, -ddA);
+        gp_Pnt start(pr.arc.c.XYZ() + v0e);
+        gp_XYZ tangent = pr.arc.axis.Crossed(v0e);
+        TopoDS_Face prof = wireProfile(start, gp_Dir(tangent), r, 0);
+        BRepPrimAPI_MakeRevol rev(prof, gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)), total);
+        return rev.IsDone() ? rev.Shape() : TopoDS_Shape();
+    }
+    // BLEND / SPIRAL: smooth transitions meet their neighbours tangentially, so the exact pipe (no
+    // overhang) suffices -- their joints are never cut.
+    auto pts = samplePrim(pr, r);
+    if (pts.size() < 2) return {};
+    TopoDS_Edge e = primEdge(pr, r);
+    if (e.IsNull()) return {};
+    try {
+        TopoDS_Wire spine = BRepBuilderAPI_MakeWire(e).Wire();
+        gp_Vec t0(pts[0], pts[1]);
+        if (t0.Magnitude() < 1e-12) return {};
+        TopoDS_Wire prof = wireProfileWire(pts.front(), gp_Dir(t0), r, 0);
+        BRepOffsetAPI_MakePipeShell ps(spine);
+        ps.Add(prof);
+        ps.Build();
+        if (ps.IsDone() && ps.MakeSolid()) return ps.Shape();
+    } catch (const Standard_Failure&) {
+    }
+    return {};
+}
+
+// Keep the half of `solid` on the `keepDir` side of the plane through P. The knife box is sized
+// TIGHT to the wire (lateral +-4r covers the tilted elliptical section; depth spans the solid),
+// so the boolean stays cheap -- a fat 2*diagonal box was the bulk of the per-cut cost.
+static TopoDS_Shape halfKeep(const TopoDS_Shape& solid, const gp_Pnt& P, const gp_Dir& keepDir,
+                             double r) {
+    Bnd_Box bb;
+    BRepBndLib::Add(solid, bb);
+    if (bb.IsVoid()) return solid;
+    double x0, y0, z0, x1, y1, z1;
+    bb.Get(x0, y0, z0, x1, y1, z1);
+    double lat = 4.0 * r;
+    double depth = gp_Pnt(x0, y0, z0).Distance(gp_Pnt(x1, y1, z1)) + 4.0 * r;
+    gp_Ax2 ax0(P, keepDir);
+    gp_XYZ X = ax0.XDirection().XYZ(), Y = ax0.YDirection().XYZ();
+    gp_Pnt corner(P.XYZ() - lat * X - lat * Y);  // box laterally centred on P, near face on the plane
+    TopoDS_Shape box =
+        BRepPrimAPI_MakeBox(gp_Ax2(corner, keepDir, ax0.XDirection()), 2 * lat, 2 * lat, depth).Shape();
+    try {
+        BRepAlgoAPI_Common cmn(solid, box);
+        if (cmn.IsDone() && !cmn.Shape().IsNull()) return cmn.Shape();
+    } catch (const Standard_Failure&) {
+    }
+    return solid;
+}
+
+TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, double wireRadius) {
+    const double over = 1.3 * wireRadius;   // covers a bisector tilt up to ~50 deg half-angle
+    const double tanThresh = 0.05;          // rad (~3 deg): below this a junction is tangent -> no cut
+    const bool diag = std::getenv("MVB_MITRE_DIAG") != nullptr;
+    BRep_Builder builder;
+    TopoDS_Compound compound;
+    builder.MakeCompound(compound);
+    size_t n = ptrs.size();
+    if (n == 0) return compound;
+    std::vector<gp_Dir> fs(n), fe(n);
+    for (size_t i = 0; i < n; ++i) {
+        fs[i] = primFwdStart(*ptrs[i], wireRadius);
+        fe[i] = primFwdEnd(*ptrs[i], wireRadius);
+    }
+    int nCut = 0, nRepaired = 0, nInvalid = 0;
+    for (size_t i = 0; i < n; ++i) {
+        // Bend at each end: a tangent joint (wrap SEG<->ARC) needs no growth and no boolean; only a
+        // real corner (the entrance/exit leads) is grown and sliced on its angle-bisector plane.
+        bool bentS = false;
+        gp_Dir nS = fs[i];
+        if (i > 0 && fe[i - 1].Angle(fs[i]) > tanThresh) {
+            gp_Vec s(fe[i - 1].XYZ());
+            s += gp_Vec(fs[i].XYZ());
+            if (s.Magnitude() > 1e-9) { nS = gp_Dir(s); bentS = true; }
+        }
+        bool bentE = false;
+        gp_Dir nE = fe[i];
+        if (i + 1 < n && fe[i].Angle(fs[i + 1]) > tanThresh) {
+            gp_Vec s(fe[i].XYZ());
+            s += gp_Vec(fs[i + 1].XYZ());
+            if (s.Magnitude() > 1e-9) { nE = gp_Dir(s); bentE = true; }
+        }
+        TopoDS_Shape solid = rawGrownSolid(*ptrs[i], wireRadius, bentS ? over : 0.0, bentE ? over : 0.0);
+        if (solid.IsNull()) {  // ARC clamp (near-full revolve): fall back to a flush, uncut tube
+            solid = rawGrownSolid(*ptrs[i], wireRadius, 0.0, 0.0);
+            bentS = bentE = false;
+        }
+        if (solid.IsNull()) continue;
+        if (bentS) { solid = halfKeep(solid, primEndpoints(*ptrs[i]).first, nS, wireRadius); ++nCut; }
+        if (bentE) {
+            solid = halfKeep(solid, primEndpoints(*ptrs[i]).second, gp_Dir(nE.XYZ() * -1.0), wireRadius);
+            ++nCut;
+        }
+        // STEP round-trip robustness: the boolean's cut curve on a torus can carry an edge tolerance
+        // that a STEP export degrades into an invalid solid (valid in memory, invalid on reload).
+        // ShapeFix tightens edges/tolerances in place so the written solid survives the round-trip.
+        if (!solid.IsNull() && (bentS || bentE)) {
+            try {
+                ShapeFix_Shape fix(solid);
+                fix.Perform();
+                if (!fix.Shape().IsNull()) solid = fix.Shape();
+            } catch (const Standard_Failure&) {
+            }
+        }
+        // A slice that self-intersected or emptied the tube (very short/sharp primitive) is caught
+        // here and rebuilt as a plain flush-capped tube -- always valid, at worst a hair of overlap
+        // at that single joint. Never emit an invalid solid.
+        if (solid.IsNull() || !BRepCheck_Analyzer(solid).IsValid()) {
+            TopoDS_Shape flush = rawGrownSolid(*ptrs[i], wireRadius, 0.0, 0.0);
+            if (!flush.IsNull() && BRepCheck_Analyzer(flush).IsValid()) { solid = flush; ++nRepaired; }
+            else { ++nInvalid; continue; }
+        }
+        builder.Add(compound, solid);
+    }
+    if (diag)
+        std::cerr << "[mitre] prims=" << n << " boolean-cuts=" << nCut << " repaired=" << nRepaired
+                  << " dropped-invalid=" << nInvalid << "\n";
+    return compound;
+}
+
 TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
@@ -1605,6 +1775,12 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
             "ConductorBuilder: rectangular-wire single-body sweep failed for '" + path.name +
             "' (fixed-binormal MakePipeShell did not close a valid solid); refusing to fall back to "
             "a round-profile compound");
+    }
+
+    // Prototype: a conformal (mitre-jointed) toroid compound -- valid, non-overlapping FEM assembly
+    // where the single-solid sweep can't close. Env-gated while under evaluation.
+    if (path.toroidal && std::getenv("MVB_MITRE")) {
+        return pruneDegenerateSolids(emitToroidConformal(ptrs, path.wireRadius));
     }
 
     BRep_Builder builder;
