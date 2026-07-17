@@ -34,6 +34,12 @@ public:
         // true  -> conductor swept at the OUTER (insulation) footprint (visualisation)
         // false -> swept at the CONDUCTING (copper) footprint (FEM)
         bool paintCoating = true;
+        // false (OM / drawing) -> fast per-run compound: overlapping swept pipes, perfect for the
+        //   3D viewer, seconds to build.
+        // true  (FEM export)   -> the slow one-piece machinery: single continuous body per parallel
+        //   where a sweep closes (columns, sparse toroids), a conformal mitre-jointed compound for
+        //   dense toroids, fuse for single-turns. Meshable (no self-overlap) but far slower.
+        bool femReady = false;
     };
 
     // Builds one solid per (winding, parallel), named "<winding> parallel <k>" (MAS style).

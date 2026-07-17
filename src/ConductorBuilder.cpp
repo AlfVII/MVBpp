@@ -198,6 +198,8 @@ struct ConductorPath {
                               // AZIMUTHAL direction (tangent to the big ring), not the column Y.
     double wireWidth = 0.0;   // radial extent [m]
     double wireHeight = 0.0;  // axial extent [m]
+    bool femReady = false;    // true -> pay for the one-piece/conformal FEM geometry; false -> fast
+                              // per-run compound for drawing (see ConductorBuilder::Options::femReady)
 };
 
 // --- capsule distance helpers ----------------------------------------------------------
@@ -1704,7 +1706,9 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // toroids keep the exact per-run compound because MakePipeShell mis-frames their centerlines
     // (see ConductorPath::singleBodyCapable). Accept only a clean, valid, watertight single solid
     // whose volume matches the swept copper; otherwise fall back to the exact per-run compound.
-    if (path.singleBodyCapable) {
+    // Round/litz wire only sweeps a single body when FEM geometry is asked for; rectangular wire
+    // has no valid round-profile compound fallback, so it MUST take the single-body path regardless.
+    if (path.singleBodyCapable && (path.isRectangular || path.femReady)) {
         const bool diag = std::getenv("MVB_DIAG") != nullptr;
         TopoDS_Shape whole;
         TopoDS_Wire spine = buildFilletedWire(ptrs.data(), ptrs.size(), path.wireRadius);
@@ -1777,9 +1781,10 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
             "a round-profile compound");
     }
 
-    // Prototype: a conformal (mitre-jointed) toroid compound -- valid, non-overlapping FEM assembly
-    // where the single-solid sweep can't close. Env-gated while under evaluation.
-    if (path.toroidal && std::getenv("MVB_MITRE")) {
+    // FEM: a conformal (mitre-jointed) toroid compound -- a valid, non-overlapping, mesh-shareable
+    // assembly for the dense toroids where the single-solid sweep can't close. Drawing (femReady
+    // false) skips it and keeps the fast overlapping per-run compound below.
+    if (path.toroidal && path.femReady) {
         return pruneDegenerateSolids(emitToroidConformal(ptrs, path.wireRadius));
     }
 
@@ -1843,7 +1848,10 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // fuse only simple single-turn conductors, where the union is both cheap and clean.
     bool multiTurn = !path.prims.empty() &&
                      path.prims.back().turnOrdinal != path.prims.front().turnOrdinal;
-    TopoDS_Shape result = multiTurn ? compound : fuseAllSolids(compound, path.wireRadius);
+    // Only FEM geometry pays to fuse a single-turn conductor into one clean solid; drawing keeps the
+    // fast compound. Multi-turn conductors never fuse cleanly (seam slivers), so they stay a compound.
+    TopoDS_Shape result =
+        (path.femReady && !multiTurn) ? fuseAllSolids(compound, path.wireRadius) : compound;
     return pruneDegenerateSolids(result);
 }
 
@@ -2416,6 +2424,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         path.isRectangular = rectWire;
         path.wireWidth = wireW;
         path.wireHeight = wireH;
+        path.femReady = opts.femReady;
         if (rectWire) {
             // Round (or straight-less oblong) column: the section sweeps cleanly with a fixed
             // binormal -> one body. A rect/oblong column with real corners, OR a toroid: per-

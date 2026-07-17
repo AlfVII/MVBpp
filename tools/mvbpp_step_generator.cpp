@@ -25,12 +25,15 @@ static void printUsage(const char* prog) {
               << "  -d, --output-dir <dir> Output directory (batch mode)\n"
               << "  --no-mkf              Skip MKF enrichment\n"
               << "  --real                Real winding: continuous conductor per (winding, parallel)\n"
+              << "  --fem                 FEM geometry: one-piece / conformal conductors (slow); "
+                 "default is the fast drawing compound\n"
               << "  --segments <N>        Wire+core polygon segments (0 = exact analytic curves)\n"
               << "  -h, --help            Show this help\n";
 }
 
 static bool processFile(const fs::path& inputPath, const fs::path& outputPath, bool useMkf,
-                        bool useRealWinding, int segments, bool copperFootprint = false) {
+                        bool useRealWinding, int segments, bool copperFootprint = false,
+                        bool femReady = false) {
     try {
         // Read JSON
         std::ifstream f(inputPath);
@@ -67,6 +70,7 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
             mvb::DrawConfig cfg{format, includeBobbin, scale, symmetryPlanes};
             cfg.useRealWindingGeometry = true;
             cfg.paintCoating = !copperFootprint;  // --copper => bare CONDUCTING footprint (FEM)
+            cfg.femReady = femReady;              // --fem => slow one-piece/conformal meshable geometry
             if (segments >= 0) { cfg.wirePolygonSegments = segments; cfg.corePolygonSegments = segments; }
             result = builder.drawMagnetic(enriched, outputPath.parent_path().string(), cfg);
         } else if (useMkf) {
@@ -117,6 +121,7 @@ int main(int argc, char* argv[]) {
     bool useMkf = true;
     bool useRealWinding = false;
     bool copperFootprint = false;
+    bool femReady = false;
     int segments = -1;  // -1 = builder default; 0 = exact analytic curves
 
     // Parse arguments
@@ -136,6 +141,8 @@ int main(int argc, char* argv[]) {
             useRealWinding = true;
         } else if (arg == "--copper") {
             copperFootprint = true;
+        } else if (arg == "--fem") {
+            femReady = true;
         } else if (arg == "--segments") {
             if (++i < argc) segments = std::stoi(argv[i]);
         } else if (arg[0] != '-') {
@@ -156,7 +163,7 @@ int main(int argc, char* argv[]) {
         outputPath = dir / (inputPath.stem().string() + "_mvbpp.step");
     }
     
-    bool success =
-        processFile(inputPath, outputPath, useMkf, useRealWinding, segments, copperFootprint);
+    bool success = processFile(inputPath, outputPath, useMkf, useRealWinding, segments,
+                               copperFootprint, femReady);
     return success ? 0 : 1;
 }

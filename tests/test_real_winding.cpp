@@ -113,7 +113,7 @@ TEST_CASE("Real winding: single-parallel PQ33 becomes one continuous conductor",
                                        mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
                                        /*paintCoating=*/true, /*emitCoatingShells=*/false,
                                        /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
 
     // Exactly one conductor for the single (winding, parallel); no per-turn ring solids.
     const mvb::NamedShape* conductor = nullptr;
@@ -196,7 +196,7 @@ TEST_CASE("Real winding: two parallels become two independent conductors", "[rea
                                        mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
                                        true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
 
     const mvb::NamedShape* p0 = nullptr;
     const mvb::NamedShape* p1 = nullptr;
@@ -324,7 +324,7 @@ TEST_CASE("Real winding: rectangular-column E core zigzag racetrack conductor",
                                        mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
                                        true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
 
     // Every MKF crossing must lie ON the copper. For a rectangular column the crossing
@@ -362,7 +362,7 @@ TEST_CASE("Real winding: oblong-column EP core stadium conductor", "[realwinding
                                        mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
                                        true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
 
     // Oblong crossing sits at the -Z cap apex: same z = -(x + D - W) mapping.
@@ -400,7 +400,7 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
                                        mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        /*corePolygonSegments=*/0,
                                        true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
 
     // The assembly is counter-rotated to the MAS frame (ring in XY, hole axis Z), so a
@@ -466,7 +466,7 @@ TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[rea
                                        mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        /*corePolygonSegments=*/0,
                                        true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
 
@@ -512,7 +512,7 @@ TEST_CASE("Real winding: LITZ wire builds ONE continuous body", "[realwinding]")
     mvb::MagneticBuilder builder;
     auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
     REQUIRE(conductorSolidCount(conductor->shape) == 1);          // FEM-ready single body
@@ -526,7 +526,7 @@ TEST_CASE("Real winding: round-column RECTANGULAR wire is ONE body", "[realwindi
     mvb::MagneticBuilder builder;
     auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
     REQUIRE(conductorSolidCount(conductor->shape) == 1);
@@ -542,7 +542,7 @@ TEST_CASE("Real winding: rectangular-column RECTANGULAR wire builds", "[realwind
     mvb::MagneticBuilder builder;
     auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
     REQUIRE(conductorSolidCount(conductor->shape) >= 1);
@@ -575,10 +575,12 @@ TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean"
     }
 
     mvb::MagneticBuilder builder;
+    // CMC spread windings stay on the fast drawing compound (femReady=false): the test only asserts
+    // the three windings don't overlap EACH OTHER, which the per-run compound already satisfies.
     auto named = builder.buildAllNamed(enriched, false, 0,
                                        mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        /*corePolygonSegments=*/0, true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/false);
     const char* names[] = {"Primary parallel 0", "Secondary parallel 0",
                            "Tertiary parallel 0"};
     std::vector<const mvb::NamedShape*> conductors;
@@ -599,10 +601,12 @@ TEST_CASE("Real winding: single-layer spread 3-winding toroidal CMC builds clean
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
 
     mvb::MagneticBuilder builder;
+    // CMC spread windings stay on the fast drawing compound (femReady=false): the test only asserts
+    // the three windings don't overlap EACH OTHER, which the per-run compound already satisfies.
     auto named = builder.buildAllNamed(enriched, false, 0,
                                        mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        /*corePolygonSegments=*/0, true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true);
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/false);
 
     // One continuous conductor per winding (three windings, each spread over its own
     // ~120-degree arc), all fully independent copper bodies.

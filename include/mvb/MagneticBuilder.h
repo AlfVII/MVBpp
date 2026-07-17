@@ -31,6 +31,10 @@ struct DrawConfig {
     // true → real winding: ONE continuous conductor per (winding, parallel) instead of
     //        independent per-turn loops; MKF enriches with real-winding turn blocking on.
     bool        useRealWindingGeometry = false;
+    // Real-winding only. false (OM / drawing) → fast per-run compound conductors for the 3D viewer.
+    // true (FEM export) → the slow one-piece/conformal machinery: single body per parallel where a
+    // sweep closes, a mitre-jointed conformal compound for dense toroids. Meshable but far slower.
+    bool        femReady               = false;
 };
 
 class MagneticBuilder {
@@ -121,7 +125,8 @@ public:
                                           bool emitCoatingShells = false,
                                           bool includeInsulation = false,
                                           double coreCoatingThickness = 0.0,
-                                          bool useRealWindingGeometry = false) const;
+                                          bool useRealWindingGeometry = false,
+                                          bool femReady = false) const;
     std::vector<NamedShape> buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
@@ -133,7 +138,8 @@ public:
                                           // >0: build the core's insulating coating as a conformal
                                           // shell solid ("<core> coating") of this thickness [m].
                                           double coreCoatingThickness = 0.0,
-                                          bool useRealWindingGeometry = false) const;
+                                          bool useRealWindingGeometry = false,
+                                          bool femReady = false) const;
 
     // ---- Standalone builders for the unified bindings API -----------------
     //

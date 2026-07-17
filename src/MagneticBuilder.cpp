@@ -195,7 +195,7 @@ std::string MagneticBuilder::drawMagnetic(const MAS::Magnetic& magnetic,
                                cfg.wirePolygonSegments, cfg.corePolygonSegments,
                                cfg.paintCoating, /*emitCoatingShells=*/false,
                                /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
-                               cfg.useRealWindingGeometry);
+                               cfg.useRealWindingGeometry, cfg.femReady);
     return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale);
 }
 
@@ -219,7 +219,7 @@ std::string MagneticBuilder::drawMagnetic(const OpenMagnetics::Magnetic& magneti
                                cfg.wirePolygonSegments, cfg.corePolygonSegments,
                                cfg.paintCoating, /*emitCoatingShells=*/false,
                                /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
-                               cfg.useRealWindingGeometry);
+                               cfg.useRealWindingGeometry, cfg.femReady);
     return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale);
 }
 
@@ -567,7 +567,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                                                          bool emitCoatingShells,
                                                          bool includeInsulation,
                                                          double coreCoatingThickness,
-                                                         bool useRealWindingGeometry) const {
+                                                         bool useRealWindingGeometry,
+                                                         bool femReady) const {
     // MAS 1.x makes Magnetic.core / Magnetic.coil optional, but this builder
     // requires both present. The generated getters return the optional BY VALUE,
     // so bind COPIES (not references — a reference would dangle past the temporary).
@@ -642,7 +643,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
     OpenMagnetics::Magnetic enriched = magnetic_autocomplete_safe(magnetic, useRealWindingGeometry);
     return buildAllNamed(enriched, includeBobbin, symmetryPlanes,
                          wirePolygonSegments, corePolygonSegments, paintCoating, emitCoatingShells,
-                         includeInsulation, coreCoatingThickness, useRealWindingGeometry);
+                         includeInsulation, coreCoatingThickness, useRealWindingGeometry, femReady);
 }
 
 std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
@@ -654,7 +655,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                                          bool emitCoatingShells,
                                                          bool includeInsulation,
                                                          double coreCoatingThickness,
-                                                         bool useRealWindingGeometry) const {
+                                                         bool useRealWindingGeometry,
+                                                         bool femReady) const {
     auto all = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
 
     if (coreCoatingThickness > 0.0) {   // conformal core-coating shells (offset core - core)
@@ -677,6 +679,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         const bool toroidalCore = isCoreToroidal(magnetic.get_core());
         ConductorBuilder::Options copts;
         copts.wirePolygonSegments = wirePolygonSegments;
+        copts.femReady = femReady;   // OM drawing -> fast compound; FEM export -> one-piece/conformal
         auto emitConductors = [&](bool coat, const std::string& suffix) {
             copts.paintCoating = coat;
             for (auto& ns : ConductorBuilder::buildAll(magnetic.get_coil(), bobbinPd,
