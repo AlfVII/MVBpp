@@ -29,12 +29,14 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
         case MAS::CoreShapeFamily::EI:
         case MAS::CoreShapeFamily::EL:
         case MAS::CoreShapeFamily::ELP:
+        case MAS::CoreShapeFamily::EF:  // ABT #266: EF is an E-core variant
         case MAS::CoreShapeFamily::PLANAR_E:
         case MAS::CoreShapeFamily::PLANAR_EL:
             builder = std::make_unique<ShapeE>(); break;
         case MAS::CoreShapeFamily::ER:
         case MAS::CoreShapeFamily::ETD:
         case MAS::CoreShapeFamily::EQ:
+        case MAS::CoreShapeFamily::EER:  // ABT #265: ER-type with round centre leg
         case MAS::CoreShapeFamily::PLANAR_ER:
             builder = std::make_unique<ShapeEr>(); break;
         case MAS::CoreShapeFamily::T:
@@ -52,6 +54,11 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
         case MAS::CoreShapeFamily::PM:
             builder = std::make_unique<ShapePm>(subtype); break;
         case MAS::CoreShapeFamily::EP:
+        case MAS::CoreShapeFamily::EPC:  // ABT #270: EP derivatives share EP geometry
+        case MAS::CoreShapeFamily::EPQ:  // ABT #268
+        case MAS::CoreShapeFamily::EPW:  // ABT #269
+        case MAS::CoreShapeFamily::EPT:  // ABT #271
+        case MAS::CoreShapeFamily::LEP:  // ABT #272
             builder = std::make_unique<ShapeEp>(); break;
         case MAS::CoreShapeFamily::EPX:
             builder = std::make_unique<ShapeEpx>(); break;
