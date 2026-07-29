@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <nlohmann/json.hpp>
 
 using Catch::Matchers::WithinRel;
@@ -512,4 +513,61 @@ TEST_CASE("ETD49 5-turn STL export with mm scale", "[stl][assembly][json]") {
     auto sz = std::filesystem::file_size(path);
     CHECK(sz > 80);
     std::filesystem::remove_all(outDir);
+}
+
+// ── Scale regression ─────────────────────────────────────────────────────────
+// The builder emits geometry in SI metres; exportSTEP and exportSTLToBytes each OWN
+// the metres->millimetres conversion (ABT #317 + its STL companion), so a caller
+// handing over raw metre shapes gets a mm-scale file that opens at physical size.
+// The other STL tests only assert non-emptiness, which catches neither a LOST scale
+// (1000x too small) nor a DOUBLE scale (1e6x too big); this brackets the real size.
+TEST_CASE("exportSTEP and exportSTLToBytes emit millimetres, not metres", "[scale][step][stl]") {
+    auto magnetic = make_simple_e_magnetic();          // E core, A dimension = 0.019 m = 19 mm
+    mvb::MagneticBuilder builder;
+    auto coreNamed = builder.buildCoreNamed(magnetic.get_core().value());
+    REQUIRE(!coreNamed.empty());
+    std::vector<TopoDS_Shape> coreShapes;
+    std::vector<std::string> names;
+    for (size_t i = 0; i < coreNamed.size(); ++i) {
+        coreShapes.push_back(coreNamed[i].shape);
+        names.push_back("Core_" + std::to_string(i));
+    }
+
+    // A correct mm export puts the largest extent near 19 mm: metres would read ~0.019
+    // (<<1), a double scale ~19000 (>>1000). Bracket generously to stay detail-agnostic.
+    const double LO = 3.0, HI = 300.0;   // mm
+
+    // STEP round-trip (guards ABT #317)
+    std::string generated =
+        (std::filesystem::temp_directory_path() / "mvb_scale_e_core.step").string();
+    REQUIRE(mvb::exportSTEP(coreShapes, names, generated));
+    StepStats step = analyzeShape(loadSTEP(generated));
+    const double stepExtent = std::max({step.xmax - step.xmin,
+                                        step.ymax - step.ymin,
+                                        step.zmax - step.zmin});
+    INFO("STEP max extent (mm): " << stepExtent);
+    CHECK(stepExtent > LO);
+    CHECK(stepExtent < HI);
+    std::filesystem::remove(generated);
+
+    // STL bytes — the wasm/python binding path this companion fix repaired
+    std::string stl = mvb::exportSTLToBytes(coreShapes, 0.1, 0.2, /*binary=*/false);
+    REQUIRE(!stl.empty());
+    double mn[3] = {1e300, 1e300, 1e300}, mx[3] = {-1e300, -1e300, -1e300};
+    std::istringstream in(stl);
+    std::string tok;
+    while (in >> tok) {
+        if (tok == "vertex") {
+            double v[3];
+            in >> v[0] >> v[1] >> v[2];
+            for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], v[k]); mx[k] = std::max(mx[k], v[k]); }
+        }
+    }
+    const double stlExtent = std::max({mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]});
+    INFO("STL max extent (mm): " << stlExtent);
+    CHECK(stlExtent > LO);
+    CHECK(stlExtent < HI);
+
+    // same geometry, same unit -> STEP and STL agree closely
+    CHECK_THAT(stlExtent, WithinRel(stepExtent, 0.05));
 }
