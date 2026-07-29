@@ -187,15 +187,9 @@ static void compareSTEPAgainstReference(const std::string& refPath,
     coreShapes.reserve(coreNamed.size());
     for (auto& ns : coreNamed) coreShapes.push_back(ns.shape);
 
-    // Scale to mm to match Python MVB export convention
-    {
-        gp_Trsf trsf;
-        trsf.SetScale(gp_Pnt(0, 0, 0), 1000.0);
-        for (auto& s : coreShapes) {
-            s = BRepBuilderAPI_Transform(s, trsf).Shape();
-        }
-    }
-
+    // exportSTEP owns the metres->millimetres conversion now (ABT #317); the
+    // reference STEPs are in mm, so pass the builder's metre shapes straight
+    // through and let the exporter emit mm — do NOT pre-scale here.
     std::vector<std::string> names;
     for (size_t i = 0; i < coreShapes.size(); ++i) {
         names.push_back("Core_" + std::to_string(i));
@@ -280,26 +274,20 @@ static void compareFullAssemblyAgainstReference(const std::string& refPath,
     std::vector<TopoDS_Shape> allShapes;
     std::vector<std::string> allNames;
 
-    // Scale to mm to match Python MVB export convention
-    try {
-        gp_Trsf trsf;
-        trsf.SetScale(gp_Pnt(0, 0, 0), 1000.0);
-        for (auto& s : coreShapes) {
-            allShapes.push_back(BRepBuilderAPI_Transform(s, trsf).Shape());
-            allNames.push_back("Core_" + std::to_string(allNames.size()));
-        }
-        if (!bobbinShape.IsNull()) {
-            allShapes.push_back(BRepBuilderAPI_Transform(bobbinShape, trsf).Shape());
-            allNames.push_back("Bobbin");
-        }
-        for (auto& s : turnShapes) {
-            allShapes.push_back(BRepBuilderAPI_Transform(s, trsf).Shape());
-            allNames.push_back("Turn_" + std::to_string(allNames.size()));
-        }
-    } catch (const std::exception& e) {
-        FAIL("Scale/transform exception: " << e.what());
-    } catch (...) {
-        FAIL("Scale/transform unknown exception");
+    // exportSTEP owns the metres->millimetres conversion now (ABT #317); the
+    // reference STEPs are in mm, so push the builder's metre shapes directly and
+    // let the exporter emit mm — do NOT pre-scale here.
+    for (auto& s : coreShapes) {
+        allShapes.push_back(s);
+        allNames.push_back("Core_" + std::to_string(allNames.size()));
+    }
+    if (!bobbinShape.IsNull()) {
+        allShapes.push_back(bobbinShape);
+        allNames.push_back("Bobbin");
+    }
+    for (auto& s : turnShapes) {
+        allShapes.push_back(s);
+        allNames.push_back("Turn_" + std::to_string(allNames.size()));
     }
 
     try {
@@ -435,25 +423,20 @@ static void compareFullAssemblyAgainstReference(const std::string& refPath,
     std::vector<TopoDS_Shape> allShapes;
     std::vector<std::string> allNames;
 
-    try {
-        gp_Trsf trsf;
-        trsf.SetScale(gp_Pnt(0, 0, 0), 1000.0);
-        for (auto& s : coreShapes) {
-            allShapes.push_back(BRepBuilderAPI_Transform(s, trsf).Shape());
-            allNames.push_back("Core_" + std::to_string(allNames.size()));
-        }
-        if (!bobbinShape.IsNull()) {
-            allShapes.push_back(BRepBuilderAPI_Transform(bobbinShape, trsf).Shape());
-            allNames.push_back("Bobbin");
-        }
-        for (auto& s : turnShapes) {
-            allShapes.push_back(BRepBuilderAPI_Transform(s, trsf).Shape());
-            allNames.push_back("Turn_" + std::to_string(allNames.size()));
-        }
-    } catch (const std::exception& e) {
-        FAIL("Scale/transform exception: " << e.what());
-    } catch (...) {
-        FAIL("Scale/transform unknown exception");
+    // exportSTEP owns the metres->millimetres conversion now (ABT #317); the
+    // reference STEPs are in mm, so push the builder's metre shapes directly and
+    // let the exporter emit mm — do NOT pre-scale here.
+    for (auto& s : coreShapes) {
+        allShapes.push_back(s);
+        allNames.push_back("Core_" + std::to_string(allNames.size()));
+    }
+    if (!bobbinShape.IsNull()) {
+        allShapes.push_back(bobbinShape);
+        allNames.push_back("Bobbin");
+    }
+    for (auto& s : turnShapes) {
+        allShapes.push_back(s);
+        allNames.push_back("Turn_" + std::to_string(allNames.size()));
     }
 
     try {

@@ -1,9 +1,11 @@
 #include "mvb/StepExporter.h"
 
 #include <BRepBndLib.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <Bnd_Box.hxx>
+#include <gp_Trsf.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <STEPCAFControl_Reader.hxx>
 #include <STEPCAFControl_Writer.hxx>
@@ -57,12 +59,29 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
     Handle(XCAFDoc_ShapeTool) shapeTool =
         XCAFDoc_DocumentTool::ShapeTool(doc->Main());
 
+    // Model coordinates are in SI (metres) — the whole MVB++/MKF/MAS convention
+    // (see exportSTLToBytes below). OCCT's length unit is millimetres and it
+    // faithfully labels whatever numbers it is given: writing metre-valued
+    // coordinates with STEPCAFControl_Writer's default emits
+    // SI_UNIT(.MILLI.,.METRE.) over numbers that are actually metres, so every
+    // STEP opens 1000x too small (ABT #317). Setting write.step.unit=M does NOT
+    // fix it — OCCT then divides the coordinates by 1000 to match the metre
+    // header, preserving the same wrong physical size (verified empirically).
+    // The only correct fix is to convert the geometry metres->millimetres here,
+    // once, so the emitted numbers match the default mm header. This is the
+    // single source of truth for the conversion: callers pass metres and MUST
+    // NOT pre-scale.
+    gp_Trsf metresToMillimetres;
+    metresToMillimetres.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+
     for (const auto& ns : shapes) {
         if (ns.shape.IsNull()) continue;
+        const TopoDS_Shape shapeMm =
+            BRepBuilderAPI_Transform(ns.shape, metresToMillimetres).Shape();
         // AddShape(isAssembly=false): register the shape as a free top-level
         // component so STEPCAFControl_Writer emits it as a discrete product
         // (with our name attached) rather than burying it in a compound.
-        TDF_Label lab = shapeTool->AddShape(ns.shape, Standard_False);
+        TDF_Label lab = shapeTool->AddShape(shapeMm, Standard_False);
         if (!ns.name.empty()) {
             TDataStd_Name::Set(lab, TCollection_ExtendedString(ns.name.c_str()));
         }

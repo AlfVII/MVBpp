@@ -74,14 +74,8 @@ static void exportCore(const std::string& outPath, const MAS::Magnetic& magnetic
     mvb::MagneticBuilder builder;
     auto named = builder.buildCoreNamed(magnetic.get_core().value());
 
-    gp_Trsf trsf;
-    trsf.SetScale(gp_Pnt(0, 0, 0), 1000.0);
-    for (auto& ns : named) {
-        if (!ns.shape.IsNull()) {
-            ns.shape = BRepBuilderAPI_Transform(ns.shape, trsf).Shape();
-        }
-    }
-
+    // exportSTEP now owns the metres->millimetres conversion (ABT #317); pass the
+    // builder's native metre-valued shapes straight through — do NOT pre-scale.
     mvb::exportSTEP(named, outPath);
 }
 
