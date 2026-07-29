@@ -20,7 +20,7 @@ namespace mvb {
 struct DrawConfig {
     std::string format                = "step";  // "step" or "stl"
     bool        includeBobbin         = true;
-    double      scale                 = 1.0;     // 1000 for mm export
+    double      scale                 = 1.0;     // extra USER scale; exporters emit mm natively (ABT #317) — keep 1.0
     int         symmetryPlanes        = 0;       // 0=full, 1=half, 2=quarter
     int         wirePolygonSegments    = DEFAULT_WIRE_POLYGON_SEGMENTS;
     int         corePolygonSegments    = DEFAULT_CORE_POLYGON_SEGMENTS;
@@ -46,7 +46,9 @@ public:
     //   outputPath            : directory where magnetic.step / magnetic.stl is written
     //   format                : "step" or "stl"
     //   includeBobbin         : include bobbin geometry
-    //   scale                 : uniform scale factor (use 1000 for mm export)
+    //   scale                 : extra uniform USER scale on top of the exporters'
+    //                           native millimetre output (ABT #317). Keep 1.0 for a
+    //                           correct mm file; 1000 now double-scales (1e6x too big).
     //   symmetryPlanes        : 0=full, 1=half, 2=quarter domain
     //   wirePolygonSegments   : <=0 = exact torus, >0 = faceted polygon (wire cross-section)
     //   corePolygonSegments   : polygon segments for core cylinders/circles

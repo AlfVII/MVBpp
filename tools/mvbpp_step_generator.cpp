@@ -60,7 +60,7 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
         mvb::MagneticBuilder builder;
         const std::string format       = "step";
         const bool includeBobbin       = true;
-        const double scale             = 1000.0;  // mm, like Python MVB
+        const double scale             = 1.0;     // exporters emit mm natively (ABT #317); 1000 double-scaled 1e6x
         const int symmetryPlanes       = 0;
 
         std::string result;

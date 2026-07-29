@@ -507,8 +507,10 @@ TEST_CASE("ETD49 5-turn STL export with mm scale", "[stl][assembly][json]") {
     auto tmpDir = std::filesystem::temp_directory_path();
     std::string outDir = (tmpDir / "mvb_stl_test_etd49").string();
     std::filesystem::create_directories(outDir);
+    // scale=1.0: exportSTL owns the metres->mm conversion now (ABT #317); passing
+    // 1000 here would double-scale (1e6x too big).
     std::string path = builder.drawMagnetic(magnetic, outDir, "stl",
-                                             /*includeBobbin=*/true, /*scale=*/1000.0);
+                                             /*includeBobbin=*/true, /*scale=*/1.0);
     REQUIRE(std::filesystem::exists(path));
     auto sz = std::filesystem::file_size(path);
     CHECK(sz > 80);

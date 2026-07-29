@@ -138,9 +138,17 @@ std::vector<NamedShape> importSTEP(const std::string& filepath) {
 
 bool exportSTL(const TopoDS_Shape& compound, const std::string& filepath) {
     if (compound.IsNull()) return false;
-    BRepMesh_IncrementalMesh mesh(compound, 0.001);
+    // Own the metres->millimetres conversion here, like exportSTEP and
+    // exportSTLToBytes (ABT #317), so every exporter is uniform: callers hand over
+    // native SI-metre geometry and MUST pass scale=1.0 (NOT the old 1000 — passing
+    // 1000 now double-scales, 1e6x too big). The 0.001 deflection was always in the
+    // caller's mm space, so it is unchanged.
+    gp_Trsf metresToMillimetres;
+    metresToMillimetres.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+    const TopoDS_Shape mm = BRepBuilderAPI_Transform(compound, metresToMillimetres).Shape();
+    BRepMesh_IncrementalMesh mesh(mm, 0.001);
     StlAPI_Writer writer;
-    writer.Write(compound, filepath.c_str());
+    writer.Write(mm, filepath.c_str());
     return true;
 }
 

@@ -71,6 +71,22 @@ def is_svg(text: str) -> bool:
     return s.startswith("<?xml") or s.startswith("<svg")
 
 
+def _step_max_coord_mm(data: bytes) -> float:
+    """Largest |coordinate| among the CARTESIAN_POINTs in a STEP file. The file's unit
+    is millimetres, so this is the model's extent in mm -- used to assert the exporter
+    emits physical mm, not metres (1000x small) or a double scale (1000x big)."""
+    import re
+    text = data.decode("ascii", "replace")
+    mx = 0.0
+    for m in re.finditer(r"CARTESIAN_POINT\s*\(\s*'[^']*'\s*,\s*\(([^)]*)\)", text):
+        for tok in m.group(1).split(","):
+            try:
+                mx = max(mx, abs(float(tok)))
+            except ValueError:
+                pass
+    return mx
+
+
 # ── Public API surface ──────────────────────────────────────────────────────
 
 class TestPublicSurface:
@@ -128,9 +144,20 @@ class TestDrawMagnetic:
         out = mvbpp.drawMagnetic(basic_magnetic_raw, format="stl", **NO_FILTER)
         assert isinstance(out, bytes) and is_stl_binary(out)
 
-    def test_scale_mm(self, basic_magnetic_raw):
-        out = mvbpp.drawMagnetic(basic_magnetic_raw, scale=1000.0, **NO_FILTER)
-        assert is_step(out)
+    def test_default_export_is_mm_and_scale_is_a_user_multiplier(self, basic_magnetic_raw):
+        # Exporters emit millimetres natively (ABT #317), so the DEFAULT (scale=1.0)
+        # lands at physical mm size -- a core's largest coordinate is O(1-1000 mm),
+        # never O(0.001) metres and never O(1e6) (the double-scale the old
+        # "scale=1000 for mm" convention now produces). `scale` is a pure user
+        # multiplier ON TOP of mm: scale=1000 makes it ~1000x bigger, it does NOT
+        # re-run the mm conversion.
+        mm = mvbpp.drawMagnetic(basic_magnetic_raw, scale=1.0, **NO_FILTER)
+        assert is_step(mm)
+        mm_extent = _step_max_coord_mm(mm)
+        assert 0.1 < mm_extent < 2000.0, f"default export is not mm-scale (max coord {mm_extent})"
+
+        big = mvbpp.drawMagnetic(basic_magnetic_raw, scale=1000.0, **NO_FILTER)
+        assert _step_max_coord_mm(big) > 100.0 * mm_extent, "scale is not acting as a user multiplier"
 
     def test_polygon_segments_low(self, basic_magnetic_raw):
         out = mvbpp.drawMagnetic(basic_magnetic_raw, polygonSegments=8, **NO_FILTER)
