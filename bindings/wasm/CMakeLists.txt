@@ -80,7 +80,7 @@ set(OCCT_ESSENTIAL_LIBS
     TKernel TKMath TKG2d TKG3d TKGeomBase TKBRep
     TKGeomAlgo TKTopAlgo TKPrim TKBO TKBool TKMesh TKShHealing
     TKCDF TKLCAF TKXSBase TKXCAF TKCAF TKVCAF TKBin TKXml TKStd
-    TKOffset TKRWMesh TKDESTEP TKDEIGES TKDESTL
+    TKFillet TKOffset TKRWMesh TKDESTEP TKDEIGES TKDESTL
 )
 target_link_libraries(occt INTERFACE ${OCCT_ESSENTIAL_LIBS})
 
@@ -167,6 +167,7 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/Symmetry.cpp
     ${REPO_ROOT}/src/Utils.cpp
     ${REPO_ROOT}/src/TurnBuilder.cpp
+    ${REPO_ROOT}/src/ConductorBuilder.cpp
     ${REPO_ROOT}/src/BobbinBuilder.cpp
     ${REPO_ROOT}/src/shapes/ShapeBuilder.cpp
     ${REPO_ROOT}/src/shapes/ShapeE.cpp
