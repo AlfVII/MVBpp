@@ -151,6 +151,13 @@ std::string exportSTLToBytes(const std::vector<TopoDS_Shape>& shapes,
 {
     if (shapes.empty()) return {};
 
+    // Model coordinates are in SI (metres); scale metres -> millimetres so the STL
+    // opens at correct physical size in the CAD/slicer tools that consume it (they
+    // assume mm — the frontend even passes its mesh tolerance as `tolMm`). Same
+    // convention as exportSTEP (ABT #317): a raw-metre STL opened 1000x too small.
+    gp_Trsf metresToMillimetres;
+    metresToMillimetres.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+
     // Combine into a single compound — StlAPI_Writer walks sub-solids.
     TopoDS_Compound compound;
     TopoDS_Builder b;
@@ -158,17 +165,17 @@ std::string exportSTLToBytes(const std::vector<TopoDS_Shape>& shapes,
     bool any = false;
     for (const auto& s : shapes) {
         if (s.IsNull()) continue;
-        b.Add(compound, s);
+        b.Add(compound, BRepBuilderAPI_Transform(s, metresToMillimetres).Shape());
         any = true;
     }
     if (!any) return {};
 
-    // Model coordinates are in SI (meters). Compute a scale-appropriate
-    // absolute linear deflection from the overall bounding-box diagonal.
-    // Using relative deflection (0.001 = 0.1 %) on tiny per-face boxes
-    // (e.g. individual wire turns) creates sub-micron meshes and OOMs in
-    // WASM. Absolute deflection capped at ~0.5 % of overall size keeps
-    // mesh counts bounded while preserving recognisable geometry.
+    // Geometry is now in millimetres (scaled above). Compute a scale-appropriate
+    // absolute linear deflection from the overall bounding-box diagonal. Using
+    // relative deflection on tiny per-face boxes (e.g. individual wire turns) creates
+    // sub-micron meshes and OOMs in WASM. Absolute deflection ~0.5 % of overall size,
+    // floored at 1.0 mm (was 0.001 m before the mm scaling — physically identical),
+    // keeps mesh counts bounded while preserving recognisable geometry.
     Bnd_Box bbox;
     BRepBndLib::Add(compound, bbox);
     Standard_Real xMin, yMin, zMin, xMax, yMax, zMax;
@@ -177,7 +184,7 @@ std::string exportSTLToBytes(const std::vector<TopoDS_Shape>& shapes,
     const Standard_Real dy = yMax - yMin;
     const Standard_Real dz = zMax - zMin;
     const Standard_Real diagonal = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const Standard_Real linDeflection = std::max(diagonal * 0.005, 0.001);
+    const Standard_Real linDeflection = std::max(diagonal * 0.005, 1.0);
     BRepMesh_IncrementalMesh mesh(compound, linDeflection, Standard_False,
                                    angularTolerance, Standard_False);
     mesh.Perform();
