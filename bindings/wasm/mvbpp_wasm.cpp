@@ -862,6 +862,28 @@ std::string _enrichMagnetic(const std::string& json_str) {
     return out.dump();
 }
 
+// Re-exposed for the WebFrontend worker (both still exist in C++, just unbound after the
+// draw* API refactor): the symmetry-plane query the 3D viewer uses to offer half/quarter
+// cut options, and the core-gapping technical drawing (SVG) the technical-drawing exporter
+// renders. Signatures match the pre-refactor binding the worker was written against.
+std::vector<std::string> _getSymmetryPlanes(const std::string& magnetic_json) {
+    auto mag = parseEnriched(magnetic_json);
+    mvb::MagneticBuilder builder;
+    auto shapes = builder.buildAllNamed(mag, /*includeBobbin=*/false, /*symmetryPlanes=*/0);
+    auto sym = mvb::analyze_symmetry(shapes);
+    std::vector<std::string> out;
+    for (auto p : sym.valid_planes) out.emplace_back(mvb::to_string(p));
+    return out;
+}
+
+std::string _drawCoreGappingTechnicalDrawing(const std::string& json_str, double widthPx,
+                                             double labelFontPx, const std::string& projColor,
+                                             const std::string& dimColor) {
+    auto mag = parseEnriched(json_str);
+    return mvb::SectionDrawing::drawCoreGappingTechnicalDrawing(mag, widthPx, labelFontPx,
+                                                               projColor, dimColor);
+}
+
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -897,4 +919,8 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
 
     // Metadata
     function("getSupportedFamilies", &guard<&mvb::get_supported_families>::call);
+
+    // Re-exposed for the WebFrontend worker (unbound after the draw* refactor)
+    function("getSymmetryPlanes",   &guard<&_getSymmetryPlanes>::call);
+    function("drawCoreGappingTechnicalDrawing", &guard<&_drawCoreGappingTechnicalDrawing>::call);
 }
