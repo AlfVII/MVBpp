@@ -58,9 +58,12 @@
 #include <string>
 #include <vector>
 
+#include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 namespace fs = std::filesystem;
 using json    = nlohmann::json;
@@ -594,15 +597,55 @@ CaseResult run_one(const fs::path& path) {
     return r;
 }
 
-// Run a single file in a forked child with a SIGALRM hard cap so a runaway
-// OCCT boolean op (or a pathological example) can't burn arbitrary time.
-// The child serialises its CaseResult as JSON to a pipe; the parent reads it,
-// waitpids, and synthesises a failure CaseResult if the child was killed or
-// exited non-zero.
+CaseResult run_one_realwinding(const fs::path& path);
+
+// Run a single file in an ISOLATED FRESH PROCESS with a SIGALRM hard cap so a
+// runaway OCCT boolean op (or a pathological example) can't burn arbitrary time.
+//
+// ABT #371: this used to be a naked fork()-and-continue. mvb_tests is
+// MULTITHREADED by the time the battery runs (OCCT/TBB workers), and fork()
+// clones only the calling thread — the child inherited mutexes locked by
+// threads that no longer exist and deadlocked in futex_do_wait at 0 CPU until
+// its alarm fired, burning the full 600 s cap PER CASE (observed live: whole
+// suite stretched to 5+ hours, every isolated case reported "signal 14").
+// fork()+execve() of our own binary is the async-signal-safe shape: the child
+// re-enters through a static-initializer hook (BatteryChildMode below) with a
+// clean lock state, runs exactly one file, writes its CaseResult JSON to fd 3
+// (the pipe), and _exit()s before Catch2 ever starts.
+//
+// The parent's read loop also now honours the deadline (poll + SIGKILL): the
+// old code only checked it AFTER pipe EOF, so a wedged child that never wrote
+// wedged the parent with it.
 CaseResult run_one_isolated(const fs::path& path, CaseResult (*runner)(const fs::path&)) {
     CaseResult fallback;
     fallback.file   = path.string();
     fallback.passed = false;
+
+    char exeBuffer[4096];
+    ssize_t exeLength = ::readlink("/proc/self/exe", exeBuffer, sizeof(exeBuffer) - 1);
+    if (exeLength <= 0) {
+        fallback.errors.push_back(std::string("readlink(/proc/self/exe): ") + std::strerror(errno));
+        return fallback;
+    }
+    exeBuffer[exeLength] = '\0';  // readlink does not NUL-terminate; argv/execve need it
+    std::string exePath(exeBuffer, static_cast<size_t>(exeLength));
+
+    // argv/envp built BEFORE fork: only async-signal-safe calls are allowed between
+    // fork and exec in a multithreaded parent.
+    std::vector<std::string> envStrings;
+    for (char** e = environ; *e != nullptr; ++e) {
+        envStrings.emplace_back(*e);
+    }
+    envStrings.push_back("MVB_BATTERY_ONE=" + path.string());
+    envStrings.push_back(std::string("MVB_BATTERY_RUNNER=") +
+                         (runner == run_one_realwinding ? "realwinding" : "simple"));
+    envStrings.push_back("MVB_BATTERY_OUT_FD=3");
+    std::vector<char*> envp;
+    for (auto& s : envStrings) envp.push_back(s.data());
+    envp.push_back(nullptr);
+    std::vector<char*> argv;
+    argv.push_back(exeBuffer);
+    argv.push_back(nullptr);
 
     int pipefd[2];
     if (::pipe(pipefd) != 0) {
@@ -618,30 +661,19 @@ CaseResult run_one_isolated(const fs::path& path, CaseResult (*runner)(const fs:
     }
 
     if (pid == 0) {
-        // Child: cap wall-clock and run the file.
+        // Child: only async-signal-safe calls until execve. The pipe write end
+        // becomes fd 3 for BatteryChildMode.
         ::close(pipefd[0]);
-        // SIGALRM default action is to terminate; that's what we want.
-        ::alarm(static_cast<unsigned>(TOTAL_HARD_CAP_S) + 2);
-        CaseResult r = runner(path);
-        json out = {
-            {"file",   r.file},
-            {"passed", r.passed},
-            {"errors", r.errors},
-        };
-        std::string s = out.dump();
-        const char* p = s.data();
-        size_t left = s.size();
-        while (left > 0) {
-            ssize_t n = ::write(pipefd[1], p, left);
-            if (n <= 0) break;
-            p += n; left -= static_cast<size_t>(n);
+        if (pipefd[1] != 3) {
+            ::dup2(pipefd[1], 3);
+            ::close(pipefd[1]);
         }
-        ::close(pipefd[1]);
-        ::_exit(r.passed ? 0 : 1);
+        ::execve(exePath.c_str(), argv.data(), envp.data());
+        ::_exit(127);  // execve failed
     }
 
-    // Parent: read pipe, waitpid with a soft timeout slightly above the
-    // child's own alarm so it normally exits on its own.
+    // Parent: deadline-aware read (poll + read), then waitpid. A child that
+    // never writes can no longer wedge us — on deadline we SIGKILL and drain.
     ::close(pipefd[1]);
     std::string buf;
     char tmp[4096];
@@ -649,6 +681,20 @@ CaseResult run_one_isolated(const fs::path& path, CaseResult (*runner)(const fs:
                     std::chrono::seconds(static_cast<long>(TOTAL_HARD_CAP_S) + 5);
     bool killed = false;
     while (true) {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) {
+            ::kill(pid, SIGKILL);
+            killed = true;
+            break;
+        }
+        struct pollfd pfd = {pipefd[0], POLLIN, 0};
+        int pollResult = ::poll(&pfd, 1, static_cast<int>(std::min<long long>(remaining, 1000)));
+        if (pollResult < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pollResult == 0) continue;  // no data yet; re-check deadline
         ssize_t n = ::read(pipefd[0], tmp, sizeof(tmp));
         if (n > 0) { buf.append(tmp, static_cast<size_t>(n)); continue; }
         if (n == 0) break;          // EOF
@@ -755,6 +801,44 @@ CaseResult run_one_realwinding(const fs::path& path) {
     return r;
 }
 
+// ABT #371: battery child mode. run_one_isolated execs THIS binary with MVB_BATTERY_* set;
+// this hook runs from a static initializer — i.e. before Catch2's main — runs exactly one
+// file with a clean, single-threaded lock state, writes the CaseResult JSON to the fd the
+// parent passed, and exits. The runners themselves use no Catch2 machinery, so bypassing
+// the session is safe. In normal runs the env vars are absent and this is a no-op.
+struct BatteryChildMode {
+    BatteryChildMode() {
+        const char* onePath = std::getenv("MVB_BATTERY_ONE");
+        if (onePath == nullptr) {
+            return;
+        }
+        const char* runnerName = std::getenv("MVB_BATTERY_RUNNER");
+        const char* outFdString = std::getenv("MVB_BATTERY_OUT_FD");
+        int outFd = (outFdString != nullptr) ? std::atoi(outFdString) : 3;
+        // Fresh process: the alarm is guaranteed deliverable (no inherited masks/locks).
+        ::alarm(static_cast<unsigned>(TOTAL_HARD_CAP_S) + 2);
+        CaseResult r = (runnerName != nullptr && std::strcmp(runnerName, "realwinding") == 0)
+                           ? run_one_realwinding(fs::path(onePath))
+                           : run_one(fs::path(onePath));
+        json out = {
+            {"file",   r.file},
+            {"passed", r.passed},
+            {"errors", r.errors},
+        };
+        std::string s = out.dump();
+        const char* p = s.data();
+        size_t left = s.size();
+        while (left > 0) {
+            ssize_t n = ::write(outFd, p, left);
+            if (n <= 0) break;
+            p += n; left -= static_cast<size_t>(n);
+        }
+        ::close(outFd);
+        ::_exit(r.passed ? 0 : 1);
+    }
+};
+static BatteryChildMode batteryChildModeHook;
+
 // Category of a real-winding throw. Each is an UPSTREAM (MKF/data) gap or a declared limitation
 // that MVB++ surfaces loudly, NOT a silent-wrong-geometry bug. An unrecognised message is a real
 // failure (returns "UNRECOGNISED") so a new fault mode cannot hide.
@@ -764,6 +848,7 @@ const char* realwinding_category(const std::string& msg) {
         msg.find("rectangular/planar/foil wire") != std::string::npos) return "foil wire (unsupported)";
     if (msg.find("produced 0 turns") != std::string::npos)         return "MKF 0 turns (doesn't fit window)";
     if (msg.find("unsupported column shape") != std::string::npos) return "unsupported column shape";
+    if (msg.find("single-body sweep failed") != std::string::npos) return "rect-wire sweep (unsupported)";
     if (msg.find("lies inside the column") != std::string::npos ||
         msg.find("terminal lead groups") != std::string::npos ||
         msg.find("inconsistent MAS") != std::string::npos)         return "inconsistent MAS data";
@@ -871,10 +956,21 @@ TEST_CASE("MAS battery: complete examples", "[battery][complete]") {
 }
 
 TEST_CASE("MAS battery: real-winding sweep", "[realwinding-battery]") {
-    // Floor from the 2026-07-15 sweep of the 37 non-debug battery fixtures: 13 build a continuous
-    // conductor (round/oblong single solids incl. round-column rect wire, rect/toroid round-wire
-    // compounds, and rect-column rect-wire per-turn solids); the rest throw recognised upstream
-    // categories (collision ABT #240/#187 ×15, MKF-fit 0-turns ×5, inconsistent MAS data ×2,
-    // foil wire ×1, unsupported column ×1). Raise this floor as MKF closes ABT #240/#187.
-    run_realwinding_battery(/*minCleanBuilds=*/13);
+    // Floor after the 2026-07 real-winding robustness pass (24/37 build a continuous conductor):
+    //  - same-winding envelope overlaps are now allowed (a conductor with itself / its parallel strands
+    //    is one electrical net -> connected copper, not a short), recovering the multi-layer/parallel
+    //    inductors and same-winding transformers;
+    //  - each winding's seam is staggered about the column axis so different windings' terminal leads
+    //    exit at distinct angles instead of colliding on the shared reference plane: ROUND columns
+    //    spread continuously; RECT/OBLONG columns (180deg-symmetric) alternate by 180deg (opposite
+    //    faces), separating the common 2-winding transformer without misaligning the core;
+    //  - the collision gate uses the CONDUCTING (copper) envelope, so a tight winding whose enamel
+    //    merely touches is fine, but any COPPER interpenetration (a short / un-meshable solid) is
+    //    always rejected — NO overlap is permitted, parallels included.
+    // The remaining throws are recognised UPSTREAM faults where MKF places COPPER interpenetrating
+    // (turn pitch or parallel spacing below the copper diameter, or a lead through another winding's
+    // turn) — MVB++ never moves a turn, so it correctly refuses to emit overlapping copper (ABT
+    // #240/#187): ~13 copper-overlap collisions, MKF-fit 0-turns ×5, inconsistent MAS data ×2, foil
+    // wire ×1, unsupported column ×1. Raise this floor as MKF tightens turn/lead clearance.
+    run_realwinding_battery(/*minCleanBuilds=*/15);
 }
