@@ -3109,7 +3109,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     }
 
     // Column geometry (concentric) / toroidal window data.
-    const MAS::ColumnShape columnShape = bobbinPd.get_column_shape();
+    MAS::ColumnShape columnShape = bobbinPd.get_column_shape();
+    // IRREGULAR columns (EFD / EPX-style poles: flat-sided profiles that are none of the three
+    // analytic shapes): approximate the WRAP PATH with the column's bounding RECTANGLE
+    // (columnWidth x columnDepth). This is a stated geometric approximation, not a silent one --
+    // the turn positions themselves come from MKF's turnsDescription and are never moved; only the
+    // racetrack route BETWEEN crossings changes, and the bounding rect ENCLOSES the real pole, so
+    // the approximated wrap can only be farther from the core, never inside it. Without this every
+    // EFD-family design fails real-winding export outright.
+    if (columnShape == MAS::ColumnShape::IRREGULAR && !isToroidal &&
+        bobbinPd.get_column_width()) {
+        std::cerr << "[ConductorBuilder] IRREGULAR column: approximating the wrap path with the "
+                     "bounding rectangle (" << *bobbinPd.get_column_width() * 1e3 << " x "
+                  << bobbinPd.get_column_depth() * 1e3 << " mm half-dims); turn positions are "
+                     "MKF's and unchanged\n";
+        columnShape = MAS::ColumnShape::RECTANGULAR;
+    }
     const double halfD = bobbinPd.get_column_depth();
     double halfW = 0.0;
     if (!isToroidal &&
@@ -3495,13 +3510,41 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (!rectIsVertical(*s)) groups.emplace_back();   // run closes the group
             }
             if (!groups.empty() && groups.back().empty()) groups.pop_back();
-            if (groups.size() != 2) {
+            if (groups.size() == 1) {
+                // MKF drew only ONE lead (seen on 13_current_sense_er95: a 100-turn 0.1 mm
+                // secondary whose connection reserved-spaces carry a single horizontal run --
+                // the other lead was never emitted). One drawn lead is still usable: take it as
+                // the ENTRANCE, and synthesize the EXIT as the minimal "leave at own level"
+                // route MVB++ already uses when a lead group is a single rect -- a straight
+                // radial run from the last turn's station out past the winding. LOUD, because a
+                // synthesized lead is builder-invented routing, not MKF data; the missing lead
+                // itself is an MKF gap to fix upstream.
+                std::cerr << "[ConductorBuilder] " << path.name << ": MKF drew only ONE "
+                             "terminal lead; using it as the entrance and synthesizing a "
+                             "straight-out exit at the last turn's level\n";
+                entranceGroup = groups[0];
+                exitGroup.clear();
+            } else if (groups.size() != 2) {
+                // Name WHAT was seen, not just the count: the grouping keys on rect
+                // orientation (a horizontal "run" closes a group), so a miscount usually
+                // means MKF drew the leads with an orientation this heuristic misreads.
+                std::string dump;
+                for (const RSpace* s : terminalRects) {
+                    char buf[128];
+                    std::snprintf(buf, sizeof buf, " [%.3g x %.3g at (%.3g, %.3g) %s]",
+                                  s->dimensions.at(0) * 1e3, s->dimensions.at(1) * 1e3,
+                                  s->coordinates.at(0) * 1e3, s->coordinates.at(1) * 1e3,
+                                  rectIsVertical(*s) ? "V" : "H");
+                    dump += buf;
+                }
                 throw std::runtime_error(
                     "ConductorBuilder: expected 2 terminal lead groups (entrance, exit) "
-                    "for " + path.name + ", got " + std::to_string(groups.size()));
+                    "for " + path.name + ", got " + std::to_string(groups.size()) +
+                    ". Terminal rects (w x h at (x,y), V=vertical):" + dump);
+            } else {
+                entranceGroup = groups[0];
+                exitGroup = groups[1];
             }
-            entranceGroup = groups[0];
-            exitGroup = groups[1];
         }
 
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
@@ -3603,8 +3646,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
 
         // Exit: MKF's drawn route from the last station out to the border, extended out.
+        // With no drawn exit group (MKF emitted one lead; see above), the synthetic route is the
+        // minimal one: from the last station straight out radially at its own level.
         {
-            auto wp = terminalWaypoints(exitGroup, last, path.name + " exit");
+            std::vector<PlanePt> wp;
+            if (!exitGroup.empty()) {
+                wp = terminalWaypoints(exitGroup, last, path.name + " exit");
+            } else {
+                wp.push_back(last);
+                wp.push_back({leadTipRadius, last.y});
+            }
             extendBorder(wp);
             pushPlaneSegs(wp, "exit lead", turns.size() - 1);
         }
