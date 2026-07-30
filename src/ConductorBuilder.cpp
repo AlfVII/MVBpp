@@ -1269,6 +1269,13 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
                            const gp_Dir& axialEnd, double extendA = 0.0, double extendB = 0.0,
                            bool round = false, double radius = 0.0) {
     // Section profile at a point: an exact circle for round/litz wire, else the oriented rectangle.
+    // NOTE: do NOT split this into arcs. The analytic Cylinder/Torus surfaces a closed circular
+    // profile produces are exactly what gmsh meshes best here; splitting them was measured to make
+    // things WORSE -- the copper-only mesh, which builds fine, started failing with "Invalid
+    // boundary mesh (overlapping facets)", and the coated one merely swapped one periodic-surface
+    // complaint for another. Only the swept BLEND needs a split profile (see rectPrimSolid's
+    // BLEND branch), because a SWEPT closed profile makes a B-spline surface rather than an
+    // analytic one.
     auto profile = [&](const gp_Pnt& c, const gp_Dir& tan, const gp_Dir& ax) {
         return round ? wireProfileWire(c, tan, radius, 0) : rectProfileWire(c, tan, ax, w, h);
     };
