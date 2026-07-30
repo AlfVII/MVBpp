@@ -29,7 +29,14 @@ using json = nlohmann::json;
 #define MAS_DATA_DIR "."
 #endif
 
-static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t"};
+// Families whose gaps are STRUCTURAL, not user-specified, so a user gapping template is invalid
+// for them by definition -- not a build failure. "drumRing" joined this list when ShapeDrum
+// registered the family: before that it was unknown to the factory and skipped as unrecognised, so
+// the two DR+SRI shapes were never attempted. Now they are, and MVB++ correctly rejects them with
+// "drumRing cores cannot carry user gapping: their two annular clearance gaps are structural,
+// derived from A/K/D/F". Classify it alongside the others rather than letting a declared property
+// read as a regression.
+static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t", "drumRing"};
 
 namespace {
 

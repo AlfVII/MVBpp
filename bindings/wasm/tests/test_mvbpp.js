@@ -84,6 +84,17 @@ async function main() {
         const orig = mvbpp[fn].bind(mvbpp);
         mvbpp[fn] = (...a) => orig(...a, /*paintCoating=*/true);
     }
+    // drawMagnetic / drawMagneticToPath ALSO gained two trailing real-winding arguments
+    // (useRealWindingGeometry, femReady). They are documented as optional, but embind enforces
+    // exact arity, so they must be PASSED -- undefined selects the documented default (per-turn
+    // closed loops, fast drawing compound). Without this every drawMagnetic test fails with
+    // "called with 10 arguments, expected 12", which looks like a broken binding rather than a
+    // stale test.
+    for (const fn of ['drawMagnetic', 'drawMagneticToPath']) {
+        const orig = mvbpp[fn].bind(mvbpp);
+        mvbpp[fn] = (...a) => orig(...a, /*useRealWindingGeometry=*/undefined,
+                                        /*femReady=*/undefined);
+    }
 
     // Use concentric_rectangular_column_one_turn.json — concentric_basic.json
     // triggers a MKF bug (CORE_SHAPE_NOT_FOUND: EI 101/50) in the WASM build.
@@ -139,16 +150,19 @@ async function main() {
     const STL_3D = ['3D', 'XY', 0.0, 'stl', 1.0, 16, 'none', ''];
 
     test('paintCoating=false draws copper, differs from coating', () => {
-        const coating = rawDrawMagnetic(etdJson, ...STL_3D, true);
-        const copper  = rawDrawMagnetic(etdJson, ...STL_3D, false);
+        // rawDrawMagnetic is the UNWRAPPED handle, so it needs the full 12-argument signature:
+        // the two trailing real-winding args (useRealWindingGeometry, femReady) must be passed
+        // even though undefined selects their defaults -- embind enforces exact arity.
+        const coating = rawDrawMagnetic(etdJson, ...STL_3D, true,  undefined, undefined);
+        const copper  = rawDrawMagnetic(etdJson, ...STL_3D, false, undefined, undefined);
         assert(coating.length > 0 && copper.length > 0, 'both outputs non-empty');
         assert(coating.length !== copper.length,
             `copper geometry (${copper.length}) must differ from coating (${coating.length})`);
     });
 
     test('paintCoating=undefined defaults to coating (frontend default)', () => {
-        const coating = rawDrawMagnetic(etdJson, ...STL_3D, true);
-        const omitted = rawDrawMagnetic(etdJson, ...STL_3D, undefined);
+        const coating = rawDrawMagnetic(etdJson, ...STL_3D, true,      undefined, undefined);
+        const omitted = rawDrawMagnetic(etdJson, ...STL_3D, undefined, undefined, undefined);
         assert(coating.length === omitted.length,
             'omitted paintCoating must equal explicit coating (true)');
     });

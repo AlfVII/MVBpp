@@ -170,6 +170,8 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/ConductorBuilder.cpp
     ${REPO_ROOT}/src/BobbinBuilder.cpp
     ${REPO_ROOT}/src/shapes/ShapeBuilder.cpp
+    ${REPO_ROOT}/src/shapes/ShapeDrum.cpp
+    ${REPO_ROOT}/src/shapes/ShapeDrumRing.cpp
     ${REPO_ROOT}/src/shapes/ShapeE.cpp
     ${REPO_ROOT}/src/shapes/ShapeEp.cpp
     ${REPO_ROOT}/src/shapes/ShapeEpx.cpp
@@ -186,6 +188,22 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/shapes/ShapeUt.cpp
     ${REPO_ROOT}/src/shapes/Factory.cpp
 )
+
+# This source list DUPLICATES the native build's, and it has now drifted TWICE -- once missing
+# ConductorBuilder.cpp (the wasm was unbuildable from main since June) and once missing
+# ShapeDrum.cpp (wasm-ld: "undefined symbol: vtable for mvb::shapes::ShapeDrum"). Both surfaced
+# only at LINK time, long after the source landed. Fail at CONFIGURE instead: every
+# src/shapes/*.cpp on disk must be listed above.
+get_target_property(_mvb_wasm_srcs mvb++ SOURCES)
+file(GLOB _mvb_shape_srcs "${REPO_ROOT}/src/shapes/*.cpp")
+foreach(_s ${_mvb_shape_srcs})
+    if(NOT "${_s}" IN_LIST _mvb_wasm_srcs)
+        message(FATAL_ERROR
+            "bindings/wasm/CMakeLists.txt does not list ${_s}. Every src/shapes/*.cpp must appear "
+            "in the wasm mvb++ source list or the link fails with an undefined vtable.")
+    endif()
+endforeach()
+
 
 target_include_directories(mvb++ PUBLIC
     ${REPO_ROOT}/include

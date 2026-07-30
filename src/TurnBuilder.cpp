@@ -156,8 +156,27 @@ static std::pair<double, double> get_conducting_dimensions(const MAS::Wire& wire
             // Bare bundle outer diameter, treated as one solid copper conductor.
             double bundleDiameter = OpenMagnetics::Wire::get_outer_diameter_bare_litz(
                 strandConductingDiameter, numberConductors, grade, standard);
+            // PHYSICAL INVARIANT: the conducting envelope can never exceed the wire's OUTER envelope
+            // — the bundle physically fits inside the catalogued wire. The bare-litz packing formula
+            // is an ESTIMATE and can come out a few um larger than the wire's own outerDiameter
+            // (e.g. Litz 20x0.1 Unserved: estimate 644um vs catalog outer 639um); MKF's turn blocking
+            // spaces turns by the catalog outer, so an oversized estimate makes even perfectly placed
+            // turns register copper overlaps. The catalog outer is authoritative for the envelope.
+            if (auto od = wire.get_outer_diameter()) {
+                double outer = resolve_dim_or_throw(*od, "LITZ wire '" + wireName + "' outerDiameter");
+                if (bundleDiameter > outer) bundleDiameter = outer;
+            }
             return {bundleDiameter, bundleDiameter};
         }
+        case MAS::WireType::FOIL:
+            // Name the limitation instead of falling into the generic default. FOIL is a DECLARED
+            // gap (a foil turn is a thin wide sheet, not a swept section), and a message that says
+            // so is both actionable and classifiable -- the real-winding battery buckets it as the
+            // known "foil wire (unsupported)" limitation rather than an unrecognised new fault.
+            throw std::runtime_error(
+                "get_conducting_dimensions: FOIL wire '" + wireName + "' is unsupported "
+                "(only ROUND, RECTANGULAR and LITZ have a conducting section this builder can "
+                "sweep)");
         default:
             throw std::runtime_error(
                 "get_conducting_dimensions: unsupported wire type for wire '" + wireName + "'");
@@ -1026,7 +1045,8 @@ TopoDS_Shape TurnBuilder::buildTurn(const MAS::Turn& turn,
                                     bool isToroidal,
                                     int wirePolygonSegments,
                                     int wireRevolutionSegments,
-                                    bool paintCoating) {
+                                    bool paintCoating,
+                                    const std::optional<WoundColumnSpec>& woundColumn) {
     const auto& coords = turn.get_coordinates();
     if (coords.size() < 2) {
         throw std::runtime_error("TurnBuilder::buildTurn: turn '"
@@ -1044,7 +1064,56 @@ TopoDS_Shape TurnBuilder::buildTurn(const MAS::Turn& turn,
     // compound into ONE solid when fusing is enabled (FEM meshing), else returns it unchanged
     // (fast compound for visualisation). Applied here so every column shape + toroidal is covered.
     if (isToroidal) {
+        if (woundColumn) {
+            throw std::runtime_error(
+                "TurnBuilder::buildTurn: turn '" + turn.get_name()
+                + "' carries a wound-column spec on a toroidal core — toroids have a single "
+                  "column, so multi-column placement data here means inconsistent MAS");
+        }
         return maybe_fuse_turn(build_toroidal_turn(turn, wire, bobbin, paintCoating));
+    }
+
+    // Multi-column placement: the turn wraps a NON-MAIN column. Build the same turn shapes
+    // relative to that column's axis (the radial offset |x - axisX| preserves the clearance
+    // MKF computed — turn coordinates are absolute MAS data and must not be adjusted here),
+    // then translate the loop to the leg position. additionalCoordinates (the second window
+    // crossing MKF emits for 2D consumers) are intentionally unused: the closed 3D loop
+    // already passes through both crossings.
+    if (woundColumn) {
+        const double rel_radial = std::abs(radial_pos - woundColumn->axisX);
+        if (rel_radial <= woundColumn->halfWidth &&
+            woundColumn->shape == MAS::ColumnShape::ROUND) {
+            // The rect/oblong builders validate this themselves; ROUND takes no column dims.
+            throw std::runtime_error(
+                "TurnBuilder::buildTurn: turn '" + turn.get_name() + "' radial offset "
+                + std::to_string(rel_radial) + " m lies inside its wound column (half-width "
+                + std::to_string(woundColumn->halfWidth) + " m at x = "
+                + std::to_string(woundColumn->axisX) + " m) — inconsistent MAS turn/column data");
+        }
+        TopoDS_Shape loop;
+        switch (woundColumn->shape) {
+            case MAS::ColumnShape::ROUND:
+                loop = build_concentric_round_column_turn(rel_radial, wire_radius, height_pos,
+                                                          rect_wire, wire_w, wire_h,
+                                                          wirePolygonSegments, wireRevolutionSegments);
+                break;
+            case MAS::ColumnShape::OBLONG:
+                loop = build_concentric_oblong_turn(rel_radial, wire_radius, height_pos,
+                                                    woundColumn->halfWidth, woundColumn->halfDepth,
+                                                    rect_wire, wire_w, wire_h, wirePolygonSegments);
+                break;
+            default:  // RECTANGULAR / IRREGULAR — same default the main-column dispatch uses
+                loop = build_concentric_rect_column_turn(rel_radial, wire_radius, height_pos,
+                                                         woundColumn->halfWidth, woundColumn->halfDepth,
+                                                         rect_wire, wire_w, wire_h);
+                break;
+        }
+        if (!loop.IsNull() && std::abs(woundColumn->axisX) > 1e-12) {
+            gp_Trsf shift;
+            shift.SetTranslation(gp_Vec(woundColumn->axisX, 0.0, 0.0));
+            loop = BRepBuilderAPI_Transform(loop, shift).Shape();
+        }
+        return maybe_fuse_turn(loop);
     }
 
     double half_col_width = bobbin.get_column_width().value_or(0.0);
@@ -1127,15 +1196,19 @@ TopoDS_Shape TurnBuilder::buildFromTurnAlone(const MAS::Turn& turn,
         wire.set_conducting_diameter(std::optional<MAS::DimensionWithTolerance>(d));
     }
 
-    bool isToroidal = turn.get_additional_coordinates().has_value()
-                       && !turn.get_additional_coordinates()->empty();
+    bool hasSecondCrossing = turn.get_additional_coordinates().has_value()
+                              && !turn.get_additional_coordinates()->empty();
 
-    if (isToroidal) {
+    if (hasSecondCrossing) {
+        // additionalCoordinates mark either a toroidal turn's outer-ring crossing or a
+        // concentric turn's second window crossing (multi-column placement). Neither can be
+        // resolved without the surrounding bobbin/core context, so refuse loudly instead of
+        // guessing a topology.
         throw std::runtime_error(
-            "TurnBuilder::buildFromTurnAlone: toroidal turn '" + turn.get_name()
-            + "' (additional_coordinates set) needs full bobbin context "
-              "(column_depth, winding_window). Use drawWinding or drawMagnetic "
-              "with a full Magnetic JSON instead of standalone drawTurns.");
+            "TurnBuilder::buildFromTurnAlone: turn '" + turn.get_name()
+            + "' carries additional_coordinates (toroidal outer crossing or multi-column "
+              "second window crossing) which needs full bobbin/core context. Use drawWinding "
+              "or drawMagnetic with a full Magnetic JSON instead of standalone drawTurns.");
     }
 
     // Concentric round-column turn: bobbin's column_shape is the only field

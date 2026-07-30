@@ -449,6 +449,17 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
                                             bool paintCoating, bool useRealWindingGeometry,
                                             bool femReady = false) {
     auto j = json::parse(json_str);
+    // Accept EITHER a bare `magnetic` object or a full MAS file that nests one, exactly as
+    // tools/mvbpp_step_generator does. Without this, handing a full MAS file (masVersion/inputs/
+    // magnetic/outputs) parses to a Magnetic whose core and coil are BOTH nullopt and the first
+    // .value() dies with a bare std::bad_optional_access -- naming neither the field nor the JSON
+    // shape, which reads as "drawMagnetic is broken" rather than "you passed the wrong object".
+    // (build_turns must NOT do this: it legitimately accepts a bare turnsDescription ARRAY.)
+    if (j.is_object() && j.contains("magnetic")) j = j.at("magnetic");
+    if (!j.is_object() || !j.contains("core") || !j.contains("coil"))
+        throw std::runtime_error(
+            "drawMagnetic: the JSON has no 'core'/'coil'. Pass a magnetic object "
+            "({core, coil, ...}) or a full MAS file that contains one under 'magnetic'.");
     mvb::MagneticBuilder b;
     // useRealWindingGeometry: replace the per-turn closed loops with ONE continuous copper body per
     // (winding, parallel). MKF must (re)wind, so re-enrich through the real-winding autocomplete.

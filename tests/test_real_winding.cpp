@@ -44,6 +44,18 @@ json loadFixture(const std::string& name) {
     return j.contains("magnetic") ? j.at("magnetic") : j;
 }
 
+// A FEM conductor must be ONE connected solid. Counting solids is the check that was
+// missing: a compound of DISCONNECTED per-turn bodies has the right name and a perfectly
+// good volume, so name/volume assertions passed while the geometry was unusable — the
+// winding could not be meshed at all ("1D mesh seems not to be forming a closed loop",
+// ABT #332, root cause: the junction fuse ran at a 1e-7 fuzzy value and left invalid
+// seams, so the builder silently fell back to a compound).
+int solidCount(const TopoDS_Shape& s) {
+    int n = 0;
+    for (TopExp_Explorer e(s, TopAbs_SOLID); e.More(); e.Next()) ++n;
+    return n;
+}
+
 double shapeVolume(const TopoDS_Shape& s) {
     GProp_GProps props;
     BRepGProp::VolumeProperties(s, props);
@@ -102,6 +114,42 @@ void requireNoPairwiseOverlap(const std::vector<mvb::NamedShape>& named, double 
 
 } // namespace
 
+// REGRESSION (ABT #332): E 13/7/4 with 0.4 mm round wire — the EXACT geometry that failed.
+// Verified to be a real guard: it FAILS at the old MVB_FUSE_FUZZY=1e-7 and passes at the 1e-6
+// default. (A coarser E 32/16/9 fixture fuses fine even at 1e-7, so it would not have caught this.)
+// A RECT-COLUMN core with round wire takes the analytic
+// per-primitive path, whose junction fuse must weld into ONE solid. At the old 1e-7 fuzzy
+// value the union left invalid seams, BRepCheck rejected it, and the builder SILENTLY
+// returned a compound of disconnected per-turn solids — geometry that names and volumes
+// alone cannot distinguish from the real thing, and that gmsh cannot mesh at all.
+TEST_CASE("Real winding: rect-column conductor fuses into ONE connected solid",
+          "[realwinding][connectivity]") {
+    auto magneticJson = loadFixture("realwinding_e138_rectcolumn.json");  // E 13/7/4, 6 turns, 0.4 mm round
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+
+    int conductors = 0;
+    for (const auto& ns : named) {
+        // conductors are "<winding> parallel <k>"; terminal leads are
+        // "<winding> parallel <k> terminal <n>" and are not solids — skip them.
+        if (ns.name.find("parallel") == std::string::npos) continue;
+        if (ns.name.find("terminal") != std::string::npos) continue;
+        ++conductors;
+        INFO("conductor: " << ns.name << "  solids=" << solidCount(ns.shape));
+        REQUIRE(!ns.shape.IsNull());
+        REQUIRE(shapeVolume(ns.shape) > 0.0);
+        REQUIRE(solidCount(ns.shape) == 1);   // the check that was missing
+    }
+    REQUIRE(conductors > 0);
+}
+
 TEST_CASE("Real winding: single-parallel PQ33 becomes one continuous conductor",
           "[realwinding]") {
     auto magneticJson = loadFixture("realwinding_round_U.json");
@@ -128,6 +176,8 @@ TEST_CASE("Real winding: single-parallel PQ33 becomes one continuous conductor",
     REQUIRE(conductor != nullptr);
     REQUIRE(!conductor->shape.IsNull());
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
+    // CONNECTIVITY: exactly one solid — a continuous conductor, not a bag of loose turns.
+    REQUIRE(solidCount(conductor->shape) == 1);
 
     // The "nothing moves" regression guard: every MKF turn station lies INSIDE the
     // conductor's copper. Helical wraps pass the exact station at their start phase, so
@@ -224,12 +274,12 @@ TEST_CASE("Real winding: two parallels become two independent conductors", "[rea
 
 TEST_CASE("Real winding: multi-parallel throws on MKF's overlapping lead rows",
           "[realwinding]") {
-    // Under the N+1-crossing model every wrap (including layer transitions) is a spiral
-    // between consecutive crossings, so parallel conductors advance in lockstep and the
-    // former corridor problem is gone. What still blocks multi-parallel builds is that
-    // MKF draws every parallel's terminal lead at the SAME edge row (identical
-    // rectangles) — two physical wires on one line. The collision gate must refuse
-    // loudly until MKF allocates one row per lead (MKF ABT #229).
+    // MKF draws every parallel's terminal lead at the SAME edge row (identical rectangles), so a
+    // multi-parallel winding's parallel strands have COINCIDENT lead copper. That is overlapping
+    // copper — an un-meshable solid — even though the parallels are the same net, so the collision gate
+    // (which forbids ANY copper interpenetration, parallels included) correctly refuses to emit it. The
+    // per-winding seam stagger cannot separate them: parallels share a winding, hence the same angle.
+    // MKF must allocate one lead row per parallel (ABT #229/#240) before this can build.
     auto magneticJson = loadFixture("realwinding_round_2p.json");   // 8t x 2p -> multi-layer
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
 

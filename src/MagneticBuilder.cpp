@@ -236,8 +236,13 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
     if (!geoOpt) return result;
 
     for (const auto& piece : *geoOpt) {
+        // CLOSED covers single-solid cores (UT, and DRUM per ABT #331): their family
+        // builders emit the complete piece, so they go through the same path as
+        // HALF_SET. PLATE (piece-and-plate closers, ABT #264) still needs a
+        // plate-dimension build and is not handled yet.
         if (piece.get_type() != MAS::CoreGeometricalDescriptionElementType::HALF_SET
-            && piece.get_type() != MAS::CoreGeometricalDescriptionElementType::TOROIDAL) {
+            && piece.get_type() != MAS::CoreGeometricalDescriptionElementType::TOROIDAL
+            && piece.get_type() != MAS::CoreGeometricalDescriptionElementType::CLOSED) {
             continue;
         }
 
@@ -360,6 +365,152 @@ TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& c
     return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments);
 }
 
+// ---- Multi-column placement resolution -------------------------------------------------------
+// Maps each turn/insulation layer to the core column it wraps, from the MAS placement fields:
+// turn.section -> section.windingWindow (else section.group -> group.windingWindow) -> else
+// winding.windingWindow -> else window 0; then the winding window's `column` edge -> column index
+// (absent column edge = the main column, the schema default). Anything resolving to the MAIN
+// column returns nullopt and takes the unchanged legacy path, so MAS without placement fields is
+// byte-identical. Inconsistent placement data throws — no silent fallbacks.
+class WoundColumnResolver {
+public:
+    template<typename CoilT>
+    WoundColumnResolver(const CoilT& coil, const MAS::MagneticCore& core,
+                        const MAS::CoreBobbinProcessedDescription& bobbinPd) {
+        auto corePd = core.get_processed_description();
+        if (corePd) {
+            _columns = corePd->get_columns();
+            for (std::size_t i = 0; i < _columns.size(); ++i) {
+                if (_columns[i].get_type() == MAS::ColumnType::CENTRAL) {
+                    _mainColumnIndex = i;
+                    break;
+                }
+            }
+        }
+        // Same NaN/negative treatment as patchBobbinDimensions' wall_thickness: honour
+        // "no wall" instead of fabricating one.
+        _wall = bobbinPd.get_column_thickness();
+        if (std::isnan(_wall) || _wall < 0.0) _wall = 0.0;
+
+        // Winding window index -> column edge. The coil's governing bobbin wins; the core's
+        // processed windows cover MAS where only the core carries the edges.
+        const auto& bobbinWindows = bobbinPd.get_winding_windows();
+        _windowCount = bobbinWindows.size();
+        for (std::size_t i = 0; i < bobbinWindows.size(); ++i) {
+            if (auto col = bobbinWindows[i].get_column()) {
+                _windowColumn[static_cast<int64_t>(i)] = *col;
+            }
+        }
+        if (corePd) {
+            const auto coreWindows = corePd->get_winding_windows();
+            _windowCount = std::max(_windowCount, coreWindows.size());
+            for (std::size_t i = 0; i < coreWindows.size(); ++i) {
+                auto col = coreWindows[i].get_column();
+                if (col && !_windowColumn.count(static_cast<int64_t>(i))) {
+                    _windowColumn[static_cast<int64_t>(i)] = *col;
+                }
+            }
+        }
+
+        for (const auto& winding : coil.get_functional_description()) {
+            if (auto ww = winding.get_winding_window()) {
+                _windingWindow[winding.get_name()] = *ww;
+            }
+        }
+        std::map<std::string, int64_t> groupWindow;
+        if (auto groupsOpt = coil.get_groups_description()) {
+            for (const auto& group : *groupsOpt) {
+                if (auto ww = group.get_winding_window()) {
+                    groupWindow[group.get_name()] = *ww;
+                }
+            }
+        }
+        if (auto sectionsOpt = coil.get_sections_description()) {
+            for (const auto& section : *sectionsOpt) {
+                if (auto ww = section.get_winding_window()) {
+                    _sectionWindow[section.get_name()] = *ww;
+                } else if (auto grp = section.get_group()) {
+                    auto it = groupWindow.find(*grp);
+                    if (it != groupWindow.end()) {
+                        _sectionWindow[section.get_name()] = it->second;
+                    }
+                }
+            }
+        }
+    }
+
+    std::optional<TurnBuilder::WoundColumnSpec>
+    resolve(const std::optional<std::string>& sectionName, const std::string& windingName,
+            const std::string& what) const {
+        int64_t windowIndex = 0;
+        bool found = false;
+        if (sectionName) {
+            auto it = _sectionWindow.find(*sectionName);
+            if (it != _sectionWindow.end()) {
+                windowIndex = it->second;
+                found = true;
+            }
+        }
+        if (!found) {
+            auto it = _windingWindow.find(windingName);
+            if (it != _windingWindow.end()) {
+                windowIndex = it->second;
+            }
+        }
+        if (windowIndex == 0 && _windowColumn.empty()) return std::nullopt;   // no placement anywhere
+        if (windowIndex < 0 || static_cast<std::size_t>(windowIndex) >= std::max<std::size_t>(_windowCount, 1)) {
+            throw std::runtime_error(
+                "WoundColumnResolver: '" + what + "' resolves to winding window "
+                + std::to_string(windowIndex) + " but the bobbin/core only defines "
+                + std::to_string(_windowCount) + " winding windows — inconsistent MAS placement data");
+        }
+        auto colIt = _windowColumn.find(windowIndex);
+        if (colIt == _windowColumn.end()) return std::nullopt;   // no column edge = main column
+        int64_t columnIndex = colIt->second;
+        if (columnIndex < 0 || static_cast<std::size_t>(columnIndex) >= _columns.size()) {
+            throw std::runtime_error(
+                "WoundColumnResolver: winding window " + std::to_string(windowIndex)
+                + " references column " + std::to_string(columnIndex) + " but the core has "
+                + std::to_string(_columns.size()) + " columns — inconsistent MAS placement data");
+        }
+        if (static_cast<std::size_t>(columnIndex) == _mainColumnIndex) return std::nullopt;
+
+        const auto& column = _columns[static_cast<std::size_t>(columnIndex)];
+        const auto& colCoords = column.get_coordinates();
+        if (colCoords.empty()) {
+            throw std::runtime_error("WoundColumnResolver: wound column "
+                                     + std::to_string(columnIndex) + " has no coordinates");
+        }
+        if (colCoords.size() > 2 && std::abs(colCoords[2]) > 1e-12) {
+            throw std::runtime_error(
+                "WoundColumnResolver: wound column " + std::to_string(columnIndex)
+                + " is depth-displaced (z = " + std::to_string(colCoords[2])
+                + " m) — depth-displaced wound columns are not supported yet");
+        }
+        if (column.get_width() <= 0.0 || column.get_depth() <= 0.0) {
+            throw std::runtime_error(
+                "WoundColumnResolver: wound column " + std::to_string(columnIndex)
+                + " has non-positive width/depth (" + std::to_string(column.get_width()) + "/"
+                + std::to_string(column.get_depth()) + " m)");
+        }
+        TurnBuilder::WoundColumnSpec spec;
+        spec.axisX = colCoords[0];
+        spec.halfWidth = column.get_width() / 2.0 + _wall;
+        spec.halfDepth = column.get_depth() / 2.0 + _wall;
+        spec.shape = column.get_shape();
+        return spec;
+    }
+
+private:
+    std::vector<MAS::ColumnElement> _columns;
+    std::size_t _mainColumnIndex = 0;
+    std::size_t _windowCount = 0;
+    double _wall = 0.0;
+    std::map<int64_t, int64_t> _windowColumn;
+    std::map<std::string, int64_t> _windingWindow;
+    std::map<std::string, int64_t> _sectionWindow;
+};
+
 // Internal turns builder. Public surface goes through buildTurnsNamed() or
 // buildTurnsNamedFromTurns(). The template covers both the MAS and the
 // OpenMagnetics coil/wire variants used internally by buildAllNamed.
@@ -378,6 +529,7 @@ std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::MagneticC
     bool toroidal = isCoreToroidal(core);
     auto bobbinPd = getBobbinProcessed(coil);
     patchBobbinDimensions(bobbinPd, core);
+    const WoundColumnResolver woundColumns(coil, core, bobbinPd);
 
     const auto& funcDesc = coil.get_functional_description();
     std::map<std::string, MAS::Wire> wireMap;
@@ -402,9 +554,10 @@ std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::MagneticC
                   "an invented default wire");
         }
         const MAS::Wire& wire = it->second;
+        const auto woundColumn = woundColumns.resolve(turn.get_section(), turn.get_winding(), baseName);
         auto emit = [&](bool coat, const std::string& suffix) {
             TopoDS_Shape t = TurnBuilder::buildTurn(turn, wire, bobbinPd, toroidal, wirePolygonSegments,
-                                                    DEFAULT_WIRE_REVOLUTION_SEGMENTS, coat);
+                                                    DEFAULT_WIRE_REVOLUTION_SEGMENTS, coat, woundColumn);
             if (!t.IsNull()) {
                 result.push_back(t);
                 if (outNames) outNames->push_back(baseName + suffix);
@@ -437,6 +590,7 @@ std::vector<NamedShape> buildInsulationLayersImpl(const CoilT& coil, const MAS::
     const bool toroidal = isCoreToroidal(core);
     auto bobbinPd = getBobbinProcessed(coil);
     patchBobbinDimensions(bobbinPd, core);
+    const WoundColumnResolver woundColumns(coil, core, bobbinPd);
     int idx = 0;
     for (const auto& layer : *layersOpt) {
         const int i = idx++;
@@ -463,8 +617,12 @@ std::vector<NamedShape> buildInsulationLayersImpl(const CoilT& coil, const MAS::
         wire.set_outer_height(std::optional<MAS::DimensionWithTolerance>(hh));
         wire.set_conducting_width(std::optional<MAS::DimensionWithTolerance>(ww));
         wire.set_conducting_height(std::optional<MAS::DimensionWithTolerance>(hh));
+        // Insulation layers in a lateral window wrap that window's column; the layer's
+        // section carries the placement (insulation layers have no winding of their own).
+        const auto woundColumn = woundColumns.resolve(layer.get_section(), "", layer.get_name());
         TopoDS_Shape s = TurnBuilder::buildTurn(turn, wire, bobbinPd, toroidal,
-                                                wirePolygonSegments, DEFAULT_WIRE_REVOLUTION_SEGMENTS, true);
+                                                wirePolygonSegments, DEFAULT_WIRE_REVOLUTION_SEGMENTS, true,
+                                                woundColumn);
         if (!s.IsNull()) out.push_back({s, "insulation_layer_" + std::to_string(i)});
     }
     return out;
@@ -572,6 +730,15 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
     // MAS 1.x makes Magnetic.core / Magnetic.coil optional, but this builder
     // requires both present. The generated getters return the optional BY VALUE,
     // so bind COPIES (not references — a reference would dangle past the temporary).
+    // Report WHICH one is missing. A bare .value() here throws std::bad_optional_access, whose
+    // message names neither the field nor the builder, and the usual cause is a caller handing in a
+    // full MAS file (masVersion/inputs/magnetic/outputs) instead of the nested magnetic object --
+    // that parses cleanly to a Magnetic with both optionals empty.
+    if (!magnetic.get_core().has_value() || !magnetic.get_coil().has_value())
+        throw std::runtime_error(
+            std::string("buildAllNamed: the magnetic has no ") +
+            (!magnetic.get_core().has_value() ? "core" : "coil") +
+            ". Both are required. If the input is a full MAS file, pass its 'magnetic' member.");
     const MAS::MagneticCore core = magnetic.get_core().value();
     const MAS::Coil coil = magnetic.get_coil().value();
     // If geometricalDescription is already present, skip expensive MKF

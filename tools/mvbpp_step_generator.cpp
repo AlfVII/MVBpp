@@ -67,6 +67,34 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
         if (useRealWinding) {
             // Real winding requires the MKF wind (turn blocking on); no fallback.
             auto enriched = mvb::magnetic_autocomplete_safe(magnetic, true);
+            // MVB_DUMP_TURNS=<path>: dump the ENRICHED turnsDescription (exactly what MKF's wind/
+            // blocking placed and what ConductorBuilder consumes) BEFORE drawing, so turn placement
+            // can be analysed even when the 3D build throws on a collision. This is the "MKF painter"
+            // view: turn centres + per-winding wire, in window cross-section coordinates.
+            if (const char* dump = std::getenv("MVB_DUMP_TURNS")) {
+                nlohmann::json enr; OpenMagnetics::to_json(enr, enriched);
+                nlohmann::json out;
+                out["turnsDescription"] = enr["coil"].contains("turnsDescription")
+                                              ? enr["coil"]["turnsDescription"] : nlohmann::json::array();
+                out["windings"] = nlohmann::json::array();
+                OpenMagnetics::Coil coil = enriched.get_coil();
+                size_t wi = 0;
+                for (const auto& w : enr["coil"]["functionalDescription"]) {
+                    const auto wire = coil.resolve_wire(wi++);
+                    nlohmann::json ww; ww["name"] = w["name"];
+                    if (wire.get_conducting_diameter())
+                        ww["conductingDiameter"] = OpenMagnetics::resolve_dimensional_values(wire.get_conducting_diameter().value());
+                    if (wire.get_outer_diameter())
+                        ww["outerDiameter"] = OpenMagnetics::resolve_dimensional_values(wire.get_outer_diameter().value());
+                    if (wire.get_conducting_width())
+                        ww["conductingWidth"] = OpenMagnetics::resolve_dimensional_values(wire.get_conducting_width().value());
+                    if (wire.get_conducting_height())
+                        ww["conductingHeight"] = OpenMagnetics::resolve_dimensional_values(wire.get_conducting_height().value());
+                    out["windings"].push_back(ww);
+                }
+                std::ofstream df(dump); df << out.dump(1);
+                std::cerr << "[dump-turns] wrote " << dump << "\n";
+            }
             mvb::DrawConfig cfg{format, includeBobbin, scale, symmetryPlanes};
             cfg.useRealWindingGeometry = true;
             cfg.paintCoating = !copperFootprint;  // --copper => bare CONDUCTING footprint (FEM)

@@ -179,6 +179,73 @@ TEST_CASE("PQ core builds manually with non-zero volume", "[core][pq]") {
     REQUIRE(totalVolume < 5.43e-6);
 }
 
+static MAS::Magnetic make_simple_drum_magnetic() {
+    MAS::Magnetic magnetic;
+
+    MAS::CoreShape shape;
+    shape.set_family(MAS::CoreShapeFamily::DRUM);
+    shape.set_type(MAS::FunctionalDescriptionType::STANDARD);
+    std::map<std::string, MAS::Dimension> dims;
+    // TDG DRH-14X20-4C (ABT #331)
+    dims["A"] = make_dim(0.014);   // flange OD
+    dims["B"] = make_dim(0.020);   // total height
+    dims["C"] = make_dim(0.009);   // post OD
+    dims["D"] = make_dim(0.00375); // top flange thickness
+    dims["E"] = make_dim(0.0125);  // groove height
+    dims["F"] = make_dim(0.00375); // bottom flange thickness
+    dims["H"] = make_dim(0.0032);  // bore
+    shape.set_dimensions(dims);
+
+    // Single solid piece: MKF emits drums as one CLOSED element (openness is a
+    // property of the magnetic circuit, not of the solid).
+    MAS::CoreGeometricalDescriptionElement piece;
+    piece.set_type(MAS::CoreGeometricalDescriptionElementType::CLOSED);
+    piece.set_coordinates({0.0, 0.0, 0.0});
+    piece.set_rotation(std::optional<std::vector<double>>(std::vector<double>{0.0, 0.0, 0.0}));
+    piece.set_shape(std::optional<MAS::CoreShapeDataOrNameUnion>(shape));
+
+    MAS::MagneticCore core;
+    core.set_geometrical_description(std::optional<std::vector<MAS::CoreGeometricalDescriptionElement>>(
+        std::vector<MAS::CoreGeometricalDescriptionElement>{piece}));
+    magnetic.set_core(core);
+
+    MAS::Coil coil;
+    magnetic.set_coil(coil);
+
+    return magnetic;
+}
+
+TEST_CASE("Drum core builds from its CLOSED geometrical element", "[core][drum]") {
+    auto magnetic = make_simple_drum_magnetic();
+
+    mvb::MagneticBuilder builder;
+    auto pieces = builder.buildCoreNamed(magnetic.get_core().value());
+
+    // Regression: CLOSED elements used to be silently skipped, yielding a
+    // coreless magnetic (only winding + leads in the STEP).
+    REQUIRE(pieces.size() == 1);
+
+    const auto& s = pieces[0].shape;
+    REQUIRE(!s.IsNull());
+
+    Bnd_Box box;
+    BRepBndLib::Add(s, box);
+    double xmin, ymin, zmin, xmax, ymax, zmax;
+    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    // Flange OD across x/z, total height across y, centred at the origin.
+    REQUIRE_THAT(xmax - xmin, WithinRel(0.014, 0.05));
+    REQUIRE_THAT(ymax - ymin, WithinRel(0.020, 0.05));
+    REQUIRE(std::abs(ymax + ymin) < 1e-4);
+
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(s, props);
+    double volume = props.Mass();
+    // Analytic (circular): 2 flanges pi/4(A^2-H^2)D + post pi/4(C^2-H^2)E = 1.789e-6 m^3.
+    // The polygonal flange profile undercuts the circle by a few percent.
+    REQUIRE(volume > 1.60e-6);
+    REQUIRE(volume < 1.85e-6);
+}
+
 TEST_CASE("T core builds manually", "[core][t]") {
     auto magnetic = make_simple_t_magnetic();
 

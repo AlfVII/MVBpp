@@ -29,3 +29,7 @@ gmon.out
 
 __pycache__/
 *.pyc
+
+# Generated geometry galleries / demo renders (STEP+PNG+SVG, ~100 MB) -- outputs, not sources.
+mas_step_gallery/
+real_winding_demo/

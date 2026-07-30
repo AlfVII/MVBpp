@@ -1,5 +1,7 @@
 #include "mvb/shapes/ShapeBuilder.h"
 #include "mvb/shapes/ShapeC.h"
+#include "mvb/shapes/ShapeDrum.h"
+#include "mvb/shapes/ShapeDrumRing.h"
 #include "mvb/shapes/ShapeE.h"
 #include "mvb/shapes/ShapeEp.h"
 #include "mvb/shapes/ShapeLp.h"
@@ -41,6 +43,12 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
             builder = std::make_unique<ShapeEr>(); break;
         case MAS::CoreShapeFamily::T:
             builder = std::make_unique<ShapeT>(); break;
+        case MAS::CoreShapeFamily::DRUM:
+            builder = std::make_unique<ShapeDrum>();
+            break;
+        case MAS::CoreShapeFamily::DRUM_RING:  // ABT #366/#367: drum + concentric shield ring
+            builder = std::make_unique<ShapeDrumRing>();
+            break;
         case MAS::CoreShapeFamily::U:
             builder = std::make_unique<ShapeU>(); break;
         case MAS::CoreShapeFamily::UR:

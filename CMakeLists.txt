@@ -138,11 +138,11 @@ set(ENABLE_NGSPICE    OFF CACHE BOOL "" FORCE)
 # Use file:// clones from the local repos so FetchContent pulls the exact working
 # versions.  Switch both to https://github.com/OpenMagnetics/{MAS,MKF}.git once
 # the pending MAS commit is pushed.
-set(_MAS_LOCAL "https://github.com/OpenMagnetics/MAS.git")
-# Pin to the last MKF commit compatible with the public MAS schema.
-# Bump to main once MKF commits that reference BobbinFamily::T and
-# get_inner_phase_shift3 are matched by a pushed MAS schema update.
-set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
+set(_MAS_LOCAL "file:///home/alf/OpenMagnetics/MAS")
+# MKF's drum-family commits (dc046242..) are local-only too: they need the MAS
+# openShape schema, whose push is blocked on the MAS LFS budget (ABT #296).
+# Switch back to https://github.com/OpenMagnetics/MKF.git once both are pushed.
+set(_MKF_LOCAL "file:///home/alf/OpenMagnetics/MKF")
 
 FetchContent_Declare(
     MAS
@@ -241,6 +241,8 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/ConductorBuilder.cpp
     src/BobbinBuilder.cpp
     src/shapes/ShapeBuilder.cpp
+    src/shapes/ShapeDrum.cpp
+    src/shapes/ShapeDrumRing.cpp
     src/shapes/ShapeE.cpp
     src/shapes/ShapeEp.cpp
     src/shapes/ShapeEpx.cpp

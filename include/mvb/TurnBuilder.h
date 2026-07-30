@@ -3,6 +3,7 @@
 #include "MAS.hpp"
 #include "mvb/Utils.h"
 #include <TopoDS_Shape.hxx>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -10,6 +11,20 @@ namespace mvb {
 
 class TurnBuilder {
 public:
+    // Context for a turn wound around a NON-MAIN core column (MAS multi-column placement:
+    // section/winding `windingWindow` -> winding window `column` edge -> columnData). The turn
+    // loop is built with the same shape builders but RELATIVE to this column's axis, then
+    // translated to the leg position. Half dimensions include the lateral bobbin wall
+    // (columnThickness), mirroring how the main-column path uses the bobbin's columnWidth
+    // (core half-width + wall). Absent spec = main column at the origin, byte-identical
+    // legacy behaviour.
+    struct WoundColumnSpec {
+        double axisX = 0.0;        // MAS x of the wound column axis
+        double halfWidth = 0.0;    // column width/2 + bobbin columnThickness
+        double halfDepth = 0.0;    // column depth/2 + bobbin columnThickness
+        MAS::ColumnShape shape = MAS::ColumnShape::RECTANGULAR;
+    };
+
     // GLOBAL setting: fuse each turn's sub-solid compound (straight segments + corner pieces) into
     // ONE solid. A round/rect turn is built as a COMPOUND of overlapping cylinders/boxes + corner
     // tori/swept-rects -- fast, and perfectly fine for STL/STEP VISUALISATION (the web frontend), so
@@ -25,13 +40,15 @@ public:
     //                       — what FEM winding-loss extraction must mesh. For
     //                       LITZ this is the bare bundle treated as a single
     //                       solid conductor (diameter from MKF).
+    // woundColumn: present when the turn wraps a non-main column (see WoundColumnSpec).
     static TopoDS_Shape buildTurn(const MAS::Turn& turn,
                                   const MAS::Wire& wire,
                                   const MAS::CoreBobbinProcessedDescription& bobbin,
                                   bool isToroidal,
                                   int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                   int wireRevolutionSegments = DEFAULT_WIRE_REVOLUTION_SEGMENTS,
-                                  bool paintCoating = true);
+                                  bool paintCoating = true,
+                                  const std::optional<WoundColumnSpec>& woundColumn = std::nullopt);
 
     // Build a turn using ONLY the data on the Turn itself: coordinates,
     // dimensions, cross_sectional_shape, additional_coordinates and
