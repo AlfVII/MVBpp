@@ -1379,6 +1379,10 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
         for (int mode = 0; mode < 3; ++mode) {
             try {
                 BRepOffsetAPI_MakePipeShell ps(spine);
+                // NB: do NOT apply MVB_SWEEP_TOL here. Tightening the BLEND sweep merely trades
+                // one failure for another on e138: the self-overlapping -Z ramp face becomes a
+                // PERIODIC surface gmsh cannot mesh at all ("Impossible to mesh periodic surface").
+                // The split profile already prevents periodicity at the default tolerance.
                 if (mode == 0) ps.SetMode(Standard_False);       // corrected Frenet (torsion-stable)
                 else if (mode == 1) ps.SetMode(Standard_True);   // Frenet
                 else ps.SetDiscreteMode();                       // discrete
@@ -1405,6 +1409,8 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
 // brick (current would short straight through instead of spiralling), so we detect the collapse (a
 // merged brick loses almost all its faces) and keep the per-primitive COMPOUND, which shows every
 // turn as its own solid and honours every MKF position exactly.
+bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius);   // defined below
+
 TopoDS_Shape emitRectColumn(const ConductorPath& path) {
     // The straight/blend section's "axial" axis: the column axis Y for concentric columns, or the
     // toroid's AZIMUTHAL tangent (perpendicular to the poloidal plane) at the primitive's position.
@@ -1624,13 +1630,24 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         const bool notCollapsed = round || fusedFaces > compoundFaces / 2;
         if (collapsed) *collapsed = !notCollapsed;
         const bool okVol = expectedVol > 0.0 && v > 0.80 * expectedVol && v < 1.25 * expectedVol;
+        // SLIVER GUARD. The union can weld the primitives into a solid of exactly the right copper
+        // that nevertheless carries a near-degenerate SHEET face -- a wide, micron-thin patch left
+        // where two co-located primitive faces did not quite merge. It is invisible to BRepCheck
+        // and to the volume test, but a mesher cannot resolve it: gmsh reports "Invalid boundary
+        // mesh (overlapping facets) on surface N surface N" because the sheet's two sides collide.
+        // Measured on e138 after an OCCT rebuild: face 4.3 x 1.3 mm across but only 33 um thick,
+        // which took the reference design from meshing in 5 s to not meshing at all. The same
+        // detector already guards fuseAllSolids and the single-body sweep; the rect-column union
+        // was the one path without it, so a slivered result was accepted and shipped downstream.
+        // Rejecting here lets the PAIRWISE strategy (or the compound) be tried instead.
+        const bool okSliver = !hasDegenerateSheetFace(fused, path.wireRadius);
         bool valid = BRepCheck_Analyzer(fused).IsValid();
         // The fuse of the analytic per-primitive solids routinely lands ONE solid that BRepCheck
         // rejects over small tolerance/seam defects at the junctions. That is a REPAIRABLE shape,
         // not a failed union -- and silently dropping to the compound here is what left the
         // "continuous" winding as N disconnected per-turn bodies, which gmsh then cannot mesh
         // ("1D mesh seems not to be forming a closed loop", ABT #332).
-        if (nsol == 1 && notCollapsed && okVol && !valid) {
+        if (nsol == 1 && notCollapsed && okVol && okSliver && !valid) {
             // REPAIR LADDER. The union of the analytic per-primitive solids lands ONE solid of the
             // right copper volume that BRepCheck rejects over junction seams -- on e138, six
             // SelfIntersectingWire / UnorientableShape faces, one per turn. That is NOT cosmetic:
@@ -1691,7 +1708,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                 if (rok) { fused = cand; valid = true; break; }
             }
         }
-        if (nsol == 1 && notCollapsed && okVol && valid) {
+        if (nsol == 1 && notCollapsed && okVol && okSliver && valid) {
             ShapeUpgrade_UnifySameDomain unify(fused, Standard_True, Standard_True, Standard_True);
             unify.Build();
             TopoDS_Shape merged = unify.Shape();
@@ -1711,6 +1728,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         if (diag) std::cerr << "[rect-column] fuse REJECTED (" << how << "): nsol=" << nsol
                             << " notCollapsed=" << notCollapsed << " okVol=" << okVol
                             << " (v=" << v * 1e9 << "mm3 exp=" << expectedVol * 1e9 << "mm3)"
+                            << " okSliver=" << okSliver
                             << " valid=" << valid << " round=" << round << " faces=" << fusedFaces
                             << "/" << compoundFaces
                             << (valid ? std::string() : "  BRepCheck:" + checkReport(fused)) << "\n";

@@ -16,7 +16,35 @@ include(ExternalProject)
 # ============================================================================
 # OpenCASCADE 7.9.3 — build from source, minimal configuration
 # ============================================================================
-set(OCCT_PREFIX "${CMAKE_BINARY_DIR}/occt-install")
+# OCCT install location. Deliberately OUTSIDE the build tree by default: OCCT takes ~20 minutes
+# to compile, and putting it under build/ meant (a) any build-tree wipe destroyed it, and (b) every
+# clean build produced a FRESH OCCT binary -- so the geometry kernel underneath the whole pipeline
+# was not reproducible from one build to the next. A shared, built-once install makes OCCT a fixed
+# input rather than a per-build variable. Override with -DOCCT_PREFIX=... to isolate a build.
+set(OCCT_PREFIX "$ENV{HOME}/OpenMagnetics/occt-7.9.3-install"
+    CACHE PATH "OCCT 7.9.3 install prefix (shared across build trees; built once)")
+
+# The toolkits MVB++ links. This list is the SINGLE SOURCE OF TRUTH: the ExternalProject's
+# BUILD_BYPRODUCTS below is derived from it, so the two can never drift apart. They HAD drifted --
+# BUILD_BYPRODUCTS named 27 toolkits while this list links 46 -- which made a FROM-SCRATCH Ninja
+# build impossible: ninja refuses a link input that neither exists nor has a rule ("libTKV3d.a,
+# needed by libmvb++.so, missing and no known rule to make it"). It only ever worked because a
+# previously-built occt-install was already on disk; wiping the build tree exposed it.
+set(OCCT_ESSENTIAL_LIBS
+    TKernel TKMath TKG2d TKG3d TKGeomBase TKBRep
+    TKGeomAlgo TKTopAlgo TKPrim TKBO TKBool TKMesh TKShHealing
+    TKCDF TKLCAF TKXSBase TKXCAF TKCAF TKVCAF TKBin TKXml TKStd
+    TKOffset TKRWMesh TKDESTEP TKDEIGES TKDESTL
+    TKV3d TKService TKHLR TKFillet TKFeat
+    TKBinL TKStdL TKXmlL TKBinXCAF TKXmlXCAF
+    TKDE TKDECascade
+    TKTObj TKBinTObj TKXmlTObj
+    TKDEGLTF TKDEOBJ TKDEPLY TKDEVRML
+)
+set(OCCT_BYPRODUCTS "")
+foreach(_l ${OCCT_ESSENTIAL_LIBS})
+    list(APPEND OCCT_BYPRODUCTS "${OCCT_PREFIX}/lib/lib${_l}.a")
+endforeach()
 
 ExternalProject_Add(
     occt_external
@@ -41,34 +69,7 @@ ExternalProject_Add(
         -DCMAKE_INSTALL_PREFIX=${OCCT_PREFIX}
         -DINSTALL_DIR_LIB=lib
         -DINSTALL_DIR_INCLUDE=include/opencascade
-    BUILD_BYPRODUCTS
-        ${OCCT_PREFIX}/lib/libTKernel.a
-        ${OCCT_PREFIX}/lib/libTKMath.a
-        ${OCCT_PREFIX}/lib/libTKG2d.a
-        ${OCCT_PREFIX}/lib/libTKG3d.a
-        ${OCCT_PREFIX}/lib/libTKGeomBase.a
-        ${OCCT_PREFIX}/lib/libTKBRep.a
-        ${OCCT_PREFIX}/lib/libTKGeomAlgo.a
-        ${OCCT_PREFIX}/lib/libTKTopAlgo.a
-        ${OCCT_PREFIX}/lib/libTKPrim.a
-        ${OCCT_PREFIX}/lib/libTKBO.a
-        ${OCCT_PREFIX}/lib/libTKBool.a
-        ${OCCT_PREFIX}/lib/libTKMesh.a
-        ${OCCT_PREFIX}/lib/libTKShHealing.a
-        ${OCCT_PREFIX}/lib/libTKCDF.a
-        ${OCCT_PREFIX}/lib/libTKLCAF.a
-        ${OCCT_PREFIX}/lib/libTKXSBase.a
-        ${OCCT_PREFIX}/lib/libTKXCAF.a
-        ${OCCT_PREFIX}/lib/libTKCAF.a
-        ${OCCT_PREFIX}/lib/libTKVCAF.a
-        ${OCCT_PREFIX}/lib/libTKBin.a
-        ${OCCT_PREFIX}/lib/libTKXml.a
-        ${OCCT_PREFIX}/lib/libTKStd.a
-        ${OCCT_PREFIX}/lib/libTKOffset.a
-        ${OCCT_PREFIX}/lib/libTKRWMesh.a
-        ${OCCT_PREFIX}/lib/libTKDESTEP.a
-        ${OCCT_PREFIX}/lib/libTKDEIGES.a
-        ${OCCT_PREFIX}/lib/libTKDESTL.a
+    BUILD_BYPRODUCTS ${OCCT_BYPRODUCTS}
     USES_TERMINAL_BUILD TRUE
 )
 
@@ -77,17 +78,6 @@ add_dependencies(occt occt_external)
 target_include_directories(occt INTERFACE ${OCCT_PREFIX}/include/opencascade)
 target_link_directories(occt INTERFACE ${OCCT_PREFIX}/lib)
 
-set(OCCT_ESSENTIAL_LIBS
-    TKernel TKMath TKG2d TKG3d TKGeomBase TKBRep
-    TKGeomAlgo TKTopAlgo TKPrim TKBO TKBool TKMesh TKShHealing
-    TKCDF TKLCAF TKXSBase TKXCAF TKCAF TKVCAF TKBin TKXml TKStd
-    TKOffset TKRWMesh TKDESTEP TKDEIGES TKDESTL
-    TKV3d TKService TKHLR TKFillet TKFeat
-    TKBinL TKStdL TKXmlL TKBinXCAF TKXmlXCAF
-    TKDE TKDECascade
-    TKTObj TKBinTObj TKXmlTObj
-    TKDEGLTF TKDEOBJ TKDEPLY TKDEVRML
-)
 # OCCT 7.9.3 toolkits have circular dependencies (e.g. TKGeomAlgo <-> TKMath),
 # which no single left-to-right ordering of static archives can satisfy — GNU ld
 # would drop symbols pulled later (undefined references to math_FunctionSet,
