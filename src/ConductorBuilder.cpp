@@ -62,6 +62,7 @@
 #include <gp_Dir.hxx>
 #include <gp_XY.hxx>
 #include <gp_XYZ.hxx>
+#include <BRepAlgoAPI_Check.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
@@ -1299,8 +1300,19 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
     // complaint for another. Only the swept BLEND needs a split profile (see rectPrimSolid's
     // BLEND branch), because a SWEPT closed profile makes a B-spline surface rather than an
     // analytic one.
+    // MVB_SPLIT_PROFILE: build the round section from ARCS rather than one closed circle edge.
+    // A closed circular profile extrudes/revolves into a PERIODIC surface (cylinder / torus with a
+    // seam), which gmsh cannot mesh directly ("Impossible to mesh periodic surface"). The boolean
+    // union normally hides this by trimming those surfaces -- which is precisely why the union
+    // looked indispensable -- but it pays for it with seam artefacts (self-overlapping faces,
+    // sliver sheets). Splitting the profile removes periodicity AT THE SOURCE, so the primitives
+    // are meshable on their own and the fragile union becomes optional (see MVB_NO_FUSE).
+    const int splitPieces = std::getenv("MVB_SPLIT_PROFILE")
+                            ? std::atoi(std::getenv("MVB_SPLIT_PROFILE")) : 0;
     auto profile = [&](const gp_Pnt& c, const gp_Dir& tan, const gp_Dir& ax) {
-        return round ? wireProfileWire(c, tan, radius, 0) : rectProfileWire(c, tan, ax, w, h);
+        if (!round) return rectProfileWire(c, tan, ax, w, h);
+        return splitPieces > 0 ? wireProfileWireSplit(c, tan, radius, splitPieces)
+                               : wireProfileWire(c, tan, radius, 0);
     };
     try {
         if (pr.kind == Primitive::SEG) {
@@ -1641,6 +1653,32 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         // was the one path without it, so a slivered result was accepted and shipped downstream.
         // Rejecting here lets the PAIRWISE strategy (or the compound) be tried instead.
         const bool okSliver = !hasDegenerateSheetFace(fused, path.wireRadius);
+        // SELF-INTERSECTION CHECK -- the missing acceptance criterion. BRepCheck_Analyzer tests
+        // topological validity (closed shells, orientation, tolerances) and says nothing about
+        // whether the body's own faces PASS THROUGH each other. A union of ~56 nearly-tangent
+        // primitives can be BRepCheck-valid, carry exactly the right copper volume, and still
+        // self-intersect; the first thing that notices is the mesher, reporting "Invalid boundary
+        // mesh (overlapping facets) on surface N surface N" -- the same surface against itself --
+        // which no element size can repair. Because the defect lives in OCCT's boolean
+        // micro-behaviour it can appear or vanish across an OCCT rebuild: exactly the silent,
+        // environment-dependent breakage that must never reach a solver. BOPAlgo's self-interference
+        // test answers the question directly, so a self-intersecting union is treated as a FAILED
+        // union, letting the pairwise strategy (then the compound) be tried instead.
+        // REPORTED, NOT GATED. Making this an acceptance criterion was tried and rejected: it
+        // turns away unions that OCCT calls self-intersecting but that build correct, meshable
+        // geometry today (it broke the rectangular-column E-core zigzag regression). It is kept as
+        // a diagnostic because it is the only direct read on the defect class that produces
+        // "overlapping facets on surface N surface N" downstream -- and note the e138 failure does
+        // NOT trip it, which is itself the useful finding: that body is geometrically sound and the
+        // fault is in DISCRETISING a seam remnant far thinner than the element size.
+        bool okSelfInt = true;
+        try {
+            BRepAlgoAPI_Check chk(fused, /*bRunParallel=*/Standard_False,
+                                  /*bTestSelfInt=*/Standard_True);
+            okSelfInt = chk.IsValid();
+        } catch (const Standard_Failure&) {
+            okSelfInt = false;   // the checker itself failing is not a pass
+        }
         bool valid = BRepCheck_Analyzer(fused).IsValid();
         // The fuse of the analytic per-primitive solids routinely lands ONE solid that BRepCheck
         // rejects over small tolerance/seam defects at the junctions. That is a REPAIRABLE shape,
@@ -1709,7 +1747,22 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
             }
         }
         if (nsol == 1 && notCollapsed && okVol && okSliver && valid) {
+            // Merge co-domain faces, with a LINEAR TOLERANCE wide enough to absorb the seam
+            // remnants the union leaves behind. Those remnants are the real meshing hazard: the
+            // union can leave a strip only tens of microns wide where two primitives' surfaces
+            // nearly coincide (measured on e138: a 4.3 x 1.3 mm face just 33 um across). It is
+            // sound geometry -- OCCT's own self-intersection test passes -- but when the element
+            // size is an order of magnitude coarser than the strip, the 2D mesher lays triangles
+            // that fold over each other and gmsh rejects the surface against ITSELF ("overlapping
+            // facets on surface N surface N"). At the default (Precision::Confusion, ~1e-7) such
+            // faces are far too far apart to merge; a tolerance tied to the WIRE (a small fraction
+            // of its radius) merges the remnant while staying far below any real feature.
+            // MVB_UNIFY_TOL overrides (metres).
             ShapeUpgrade_UnifySameDomain unify(fused, Standard_True, Standard_True, Standard_True);
+            // NB: do NOT widen UnifySameDomain's linear tolerance to try to absorb seam remnants.
+            // Measured: at 0.25*wireRadius it merged nothing on e138 (face count unchanged at
+            // 92/198, still unmeshable) while breaking the rectangular-column E-core zigzag
+            // regression -- a tolerance that large lets legitimately distinct faces merge.
             unify.Build();
             TopoDS_Shape merged = unify.Shape();
             // UnifySameDomain merges co-domain faces; it must not change the copper.
@@ -1728,7 +1781,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         if (diag) std::cerr << "[rect-column] fuse REJECTED (" << how << "): nsol=" << nsol
                             << " notCollapsed=" << notCollapsed << " okVol=" << okVol
                             << " (v=" << v * 1e9 << "mm3 exp=" << expectedVol * 1e9 << "mm3)"
-                            << " okSliver=" << okSliver
+                            << " okSliver=" << okSliver << " okSelfInt=" << okSelfInt
                             << " valid=" << valid << " round=" << round << " faces=" << fusedFaces
                             << "/" << compoundFaces
                             << (valid ? std::string() : "  BRepCheck:" + checkReport(fused)) << "\n";
@@ -1744,6 +1797,18 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
     // pairwise strategy below, not a bigger tolerance.
     const double fuzzy = std::getenv("MVB_FUSE_FUZZY")
                          ? std::atof(std::getenv("MVB_FUSE_FUZZY")) : 1e-7;
+    // MVB_NO_FUSE: skip the boolean union entirely and return the butt-joined CHAIN of analytic
+    // primitives. The union is the single most fragile step in the whole 3D path -- welding 56
+    // nearly-tangent bodies routinely yields a solid that is topologically valid and volumetrically
+    // correct yet carries seam artefacts no mesher can resolve (self-overlapping faces, sliver
+    // sheets, periodic surfaces). The chain avoids it: consecutive primitives already share
+    // co-located end faces, and gmsh's FRAGMENT makes them conforming, so the meshed conductor is
+    // ONE connected region -- which is what FEM actually requires. A single BREP solid was never
+    // the requirement; it was an assumption.
+    if (std::getenv("MVB_NO_FUSE")) {
+        if (diag) std::cerr << "[rect-column] MVB_NO_FUSE: skipping the boolean union, returning "
+                            << solids.size() << " butt-joined primitives for fragment welding\n";
+    } else {
     // STRATEGY 1: one bulk union (arguments = first solid, tools = the rest). Fast, and it is what
     // welds a short rect chain, so it stays first.
     bool bulkCollapsed = false;
@@ -1811,6 +1876,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         }
     } catch (const Standard_Failure&) {
         if (diag) std::cerr << "[rect-column] pairwise fuse threw -> compound fallback\n";
+    }
     }
     // HARD GUARD (ABT #332): a FEM export must never receive a "continuous" winding that is
     // actually a set of DISCONNECTED per-turn solids. That is not the requested geometry (it is the
