@@ -100,14 +100,29 @@ set(INCLUDE_PYMKF     OFF CACHE BOOL "" FORCE)
 set(ENABLE_MATPLOTPP  OFF CACHE BOOL "" FORCE)
 set(ENABLE_NGSPICE    OFF CACHE BOOL "" FORCE)
 
-set(_MAS_LOCAL "https://github.com/OpenMagnetics/MAS.git")
-set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
+# Overridable so the wasm module can be built against a fork or a local clone
+# (e.g. -D MVBPP_MKF_REPOSITORY=file:///path/to/MKF -D MVBPP_MKF_TAG=my-branch).
+# Defaults are unchanged: upstream MAS/MKF main.
+#
+# Note FETCHCONTENT_SOURCE_DIR_MAS/_MKF is NOT a usable substitute here: the
+# steps below (the MAS symlink, submodule init, the SHARED->STATIC patch) all
+# address ${CMAKE_BINARY_DIR}/_deps/{mas,mkf}-src by name, so redirecting the
+# source elsewhere leaves them pointing at a directory that never gets created.
+set(MVBPP_MAS_REPOSITORY "https://github.com/OpenMagnetics/MAS.git"
+    CACHE STRING "Git repository or file:// path to fetch MAS from")
+set(MVBPP_MKF_REPOSITORY "https://github.com/OpenMagnetics/MKF.git"
+    CACHE STRING "Git repository or file:// path to fetch MKF from")
+set(MVBPP_MAS_TAG "main" CACHE STRING "Git ref to check out for MAS")
+set(MVBPP_MKF_TAG "main" CACHE STRING "Git ref to check out for MKF")
+
+set(_MAS_LOCAL "${MVBPP_MAS_REPOSITORY}")
+set(_MKF_LOCAL "${MVBPP_MKF_REPOSITORY}")
 
 FetchContent_Declare(
     MAS
     GIT_REPOSITORY "${_MAS_LOCAL}"
     # Track MAS main (kept in lockstep with the MKF main pin below).
-    GIT_TAG        main
+    GIT_TAG        "${MVBPP_MAS_TAG}"
     GIT_SHALLOW    FALSE
 )
 FetchContent_MakeAvailable(MAS)
@@ -121,7 +136,7 @@ FetchContent_Declare(
     MKF
     GIT_REPOSITORY "${_MKF_LOCAL}"
     # Track MKF main (kept in lockstep with the MAS main pin above).
-    GIT_TAG        main
+    GIT_TAG        "${MVBPP_MKF_TAG}"
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
