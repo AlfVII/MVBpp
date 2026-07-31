@@ -96,6 +96,28 @@ namespace mvb {
 
 namespace {
 
+// OPT-IN tight sweep tolerance (metres) for the single-body MakePipeShell sweep, via
+// MVB_SWEEP_TOL (0 / unset = OCCT's default 1e-4, the long-validated behaviour).
+//
+// WHY IT EXISTS: MakePipeShell's default 3D approximation tolerance is 1e-4 m -- 100 um -- while a
+// densely wound coil's inter-turn copper clearance is ~70 um (PQ5050: 38 turns of r = 0.315 mm at
+// outer-diameter pitch; ETD34 likewise). At the default tolerance adjacent sheets of the ONE swept
+// lateral surface interpenetrate IN THE CAD; BRepCheck does not catch it, and gmsh then fails with
+// "PLC Error: a segment and a facet intersect" at coarse mesh targets and "overlapping facets on
+// surface N surface N" (the surface against ITSELF) at fine ones -- measured on both designs down
+// to a 0.115 mm conductor target where chord error (~5 um) is far below the gap. MVB_SWEEP_TOL=1e-6
+// eliminates that self-intersection (ETD34's finest-rung failure signature disappeared and it
+// meshed for 95 minutes of real work instead of dying in 40 s).
+//
+// WHY IT IS NOT THE DEFAULT: the tight fit is not uniformly safe -- on the EP oblong stadium spine
+// it produced a body that passed every internal check (volume, BRepCheck) while a section had
+// collapsed off a crossing. Making it default needs a discriminator that accepts the tight body
+// only when it is genuinely sound (crossing-containment via the solid classifier was measured too
+// entangled with the fillet construction to bolt on quickly); that integration is registered work,
+// not a flag flip. Until then: set MVB_SWEEP_TOL=1e-6 for dense round-column windings.
+static const double kSweepTol3d =
+    std::getenv("MVB_SWEEP_TOL") ? std::atof(std::getenv("MVB_SWEEP_TOL")) : 0.0;
+
 constexpr double kPi = std::numbers::pi;
 constexpr double kTwoPi = 2.0 * std::numbers::pi;
 // Adjacent MKF slots are exactly one wire OD apart, so contact is normal; only
@@ -1136,6 +1158,7 @@ TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir&
         try {
             TopoDS_Wire prof = wireProfileWire(p0, t0, wireRadius, profileSegments);
             BRepOffsetAPI_MakePipeShell ps(spine);
+            if (kSweepTol3d > 0.0) ps.SetTolerance(kSweepTol3d, kSweepTol3d, 1e-2);
             if (mode == 0) ps.SetMode(Standard_True);         // Frenet
             else if (mode == 1) ps.SetMode(Standard_False);   // corrected Frenet (torsion-stable)
             else ps.SetDiscreteMode();                        // discrete
