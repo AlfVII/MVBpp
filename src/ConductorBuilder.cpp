@@ -246,6 +246,8 @@ struct ConductorPath {
     double wireHeight = 0.0;  // axial extent [m]
     bool femReady = false;    // true -> pay for the one-piece/conformal FEM geometry; false -> fast
                               // per-run compound for drawing (see ConductorBuilder::Options::femReady)
+    int zReturnLanes = 0;     // rect-column Z-return lane allocator (see appendRectWrap): each
+                              // return descends the -Z face in its OWN clearance lane
 };
 
 // --- capsule distance helpers ----------------------------------------------------------
@@ -1319,7 +1321,8 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
 // columns, whose racetrack corners defeat a single swept pipe.
 TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir& axialStart,
                            const gp_Dir& axialEnd, double extendA = 0.0, double extendB = 0.0,
-                           bool round = false, double radius = 0.0) {
+                           bool round = false, double radius = 0.0,
+                           int splitOverride = -1) {
     // Section profile at a point: an exact circle for round/litz wire, else the oriented rectangle.
     // NOTE: do NOT split this into arcs. The analytic Cylinder/Torus surfaces a closed circular
     // profile produces are exactly what gmsh meshes best here; splitting them was measured to make
@@ -1335,7 +1338,8 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
     // looked indispensable -- but it pays for it with seam artefacts (self-overlapping faces,
     // sliver sheets). Splitting the profile removes periodicity AT THE SOURCE, so the primitives
     // are meshable on their own and the fragile union becomes optional (see MVB_NO_FUSE).
-    const int splitPieces = std::getenv("MVB_SPLIT_PROFILE")
+    const int splitPieces = splitOverride >= 0 ? splitOverride
+                          : std::getenv("MVB_SPLIT_PROFILE")
                             ? std::atoi(std::getenv("MVB_SPLIT_PROFILE")) : 0;
     auto profile = [&](const gp_Pnt& c, const gp_Dir& tan, const gp_Dir& ax) {
         if (!round) return rectProfileWire(c, tan, ax, w, h);
@@ -1540,6 +1544,12 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
     }
     std::vector<TopoDS_Shape> solids;
     solids.reserve(path.prims.size());
+    // Everything needed to REBUILD each prim with a split profile if the union fails and the
+    // butt-joined chain must be meshed directly (closed-circle profiles are best for the FUSE
+    // -- analytic quadrics -- but their full-circle seam edges are unmeshable in a fragment:
+    // "distance 6.28319 [2 pi] between first and last node in 1D mesh of surface N").
+    struct SplitArg { const Primitive* pr; gp_Dir axialA, axialB; double extA, extB; };
+    std::vector<SplitArg> splitArgs;
     int compoundFaces = 0;
     for (size_t i = 0; i < path.prims.size(); ++i) {
         const Primitive& pr = path.prims[i];
@@ -1560,8 +1570,11 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         // grown straight pokes out of the neighbouring corner/blend.
         double extA = -trimStart[i], extB = -trimEnd[i];
         TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB, extA,
-                                       extB, round, radius);
+                                       extB, round, radius, /*splitOverride=*/-1);
         if (s.IsNull()) continue;
+        if (std::getenv("MVB_DIAG") && !BRepCheck_Analyzer(s).IsValid())
+            std::cerr << "[rect-column] INVALID prim solid [" << pr.label << "]\n";
+        splitArgs.push_back({&pr, axialA, axialB, extA, extB});
         solids.push_back(s);
         for (TopExp_Explorer e(s, TopAbs_FACE); e.More(); e.Next()) ++compoundFaces;
     }
@@ -1837,6 +1850,47 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         if (diag) std::cerr << "[rect-column] MVB_NO_FUSE: skipping the boolean union, returning "
                             << solids.size() << " butt-joined primitives for fragment welding\n";
     } else {
+    // MVB_FUSE_BISECT=1: binary-search the smallest prefix of the chain whose bulk union
+    // FAILS acceptance, and name the primitive at the boundary -- one run instead of a
+    // rebuild-per-guess. Diagnostic only; falls through to the normal strategies after.
+    if (std::getenv("MVB_FUSE_BISECT") && solids.size() > 2) {
+        auto tryPrefix = [&](size_t n) -> bool {
+            try {
+                TopTools_ListOfShape args, tools;
+                args.Append(solids.front());
+                for (size_t i = 1; i < n; ++i) tools.Append(solids[i]);
+                BRepAlgoAPI_Fuse f;
+                f.SetArguments(args);
+                f.SetTools(tools);
+                f.SetFuzzyValue(fuzzy);
+                f.Build();
+                if (!f.IsDone()) return false;
+                GProp_GProps gp; BRepGProp::VolumeProperties(f.Shape(), gp);
+                double expect = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    GProp_GProps g2; BRepGProp::VolumeProperties(solids[i], g2);
+                    expect += g2.Mass();
+                }
+                int nsol = 0;
+                for (TopExp_Explorer e(f.Shape(), TopAbs_SOLID); e.More(); e.Next()) ++nsol;
+                return nsol == 1 && gp.Mass() > 0.90 * expect &&
+                       BRepCheck_Analyzer(f.Shape()).IsValid();
+            } catch (const Standard_Failure&) { return false; }
+        };
+        size_t lo = 2, hi = solids.size();   // lo: works (assume); hi: fails (observed)
+        if (!tryPrefix(hi)) {
+            while (hi - lo > 1) {
+                size_t mid = (lo + hi) / 2;
+                if (tryPrefix(mid)) lo = mid; else hi = mid;
+                std::cerr << "[fuse-bisect] prefix " << mid << ": "
+                          << (lo == mid ? "OK" : "FAIL") << "\n";
+            }
+            std::cerr << "[fuse-bisect] first failing prefix = " << hi << "; boundary prim ["
+                      << path.prims[std::min(hi - 1, path.prims.size() - 1)].label << "]\n";
+        } else {
+            std::cerr << "[fuse-bisect] full bulk fuse ACCEPTS under bisect criteria\n";
+        }
+    }
     // STRATEGY 1: one bulk union (arguments = first solid, tools = the rest). Fast, and it is what
     // welds a short rect chain, so it stays first.
     bool bulkCollapsed = false;
@@ -1876,29 +1930,80 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
     try {
         if (bulkCollapsed) throw Standard_Failure();
         std::vector<TopoDS_Shape> level = solids;
-        bool ok = true;
-        while (ok && level.size() > 1) {
+        auto lvol = [](const TopoDS_Shape& sh) {
+            GProp_GProps gp; BRepGProp::VolumeProperties(sh, gp); return gp.Mass();
+        };
+        // A failed PAIR no longer abandons the whole tree: both operands carry to the next
+        // level unfused and the reduction continues until no pair makes progress. Each merge
+        // is volume-guarded (the OCC silent-drop class: on 02_flyback the 384-prim bulk
+        // union returned 6.1 of 230.5 mm3).
+        while (level.size() > 1) {
             std::vector<TopoDS_Shape> next;
             next.reserve(level.size() / 2 + 1);
+            bool progressed = false;
             for (size_t i = 0; i + 1 < level.size(); i += 2) {
-                TopTools_ListOfShape a, t;
-                a.Append(level[i]);
-                t.Append(level[i + 1]);
-                BRepAlgoAPI_Fuse f;
-                f.SetArguments(a);
-                f.SetTools(t);
-                f.SetFuzzyValue(fuzzy);
-                f.Build();
-                if (!f.IsDone() || f.Shape().IsNull()) { ok = false; break; }
-                next.push_back(f.Shape());
+                const double va = lvol(level[i]), vb = lvol(level[i + 1]);
+                TopoDS_Shape fusedPair;
+                try {
+                    TopTools_ListOfShape a, t;
+                    a.Append(level[i]);
+                    t.Append(level[i + 1]);
+                    BRepAlgoAPI_Fuse f;
+                    f.SetArguments(a);
+                    f.SetTools(t);
+                    f.SetFuzzyValue(fuzzy);
+                    f.Build();
+                    if (f.IsDone() && !f.Shape().IsNull() &&
+                        lvol(f.Shape()) >= 0.98 * (va + vb))
+                        fusedPair = f.Shape();
+                } catch (const Standard_Failure&) {}
+                if (!fusedPair.IsNull()) { next.push_back(fusedPair); progressed = true; }
+                else { next.push_back(level[i]); next.push_back(level[i + 1]); }
             }
-            if (!ok) break;
             if (level.size() % 2) next.push_back(level.back());
+            if (!progressed) break;
             level.swap(next);
         }
-        if (ok && level.size() == 1) {
+        if (level.size() == 1) {
             TopoDS_Shape merged = acceptFused(level.front(), "pairwise");
             if (!merged.IsNull()) return merged;
+        } else if (level.size() * 4 < solids.size()) {
+            // PARTIAL weld that made real progress (>= 8x fewer pieces): hand the compound of
+            // welded groups to the consumer's fragment instead of 100s of butt-joined prims
+            // (measured on 02_flyback: 384 raw prims degenerate the downstream fragment --
+            // "the 1D mesh seems not to be forming a closed loop" -- while a dozen groups
+            // mesh). Guard: total copper conserved and every group BRepCheck-valid; else the
+            // exact chain below stays the answer.
+            double total = 0.0; bool allValid = true;
+            for (auto& piece : level) {
+                if (!BRepCheck_Analyzer(piece).IsValid()) {
+                    // A weld seam can leave a locally-invalid face; give OCC's healer one
+                    // shot before abandoning the whole partial weld -- but only accept a
+                    // repair that CONSERVES the copper (the healer must not become another
+                    // silent geometry rewriter).
+                    const double before = lvol(piece);
+                    try {
+                        ShapeFix_Shape fixer(piece);
+                        fixer.Perform();
+                        TopoDS_Shape healed = fixer.Shape();
+                        if (BRepCheck_Analyzer(healed).IsValid() &&
+                            std::abs(lvol(healed) - before) <= 0.005 * before)
+                            piece = healed;
+                    } catch (const Standard_Failure&) {}
+                }
+                total += lvol(piece);
+                if (!BRepCheck_Analyzer(piece).IsValid()) { allValid = false; break; }
+            }
+            if (allValid && std::abs(total - expectedVol) <= 0.02 * expectedVol) {
+                BRep_Builder bb; TopoDS_Compound comp; bb.MakeCompound(comp);
+                for (const auto& piece : level) bb.Add(comp, piece);
+                if (diag) std::cerr << "[rect-column] PARTIAL pairwise weld: " << level.size()
+                                    << " groups from " << solids.size() << " prims (v="
+                                    << total * 1e9 << "mm3)\n";
+                return comp;
+            }
+            if (diag) std::cerr << "[rect-column] pairwise fuse: " << level.size()
+                                << " left, allValid=" << allValid << " -> chain fallback\n";
         } else if (diag) {
             std::cerr << "[rect-column] pairwise fuse failed (" << level.size() << " left)\n";
         }
@@ -1956,6 +2061,185 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                 "the boolean union was rejected, and the pieces do not touch). Refusing to return "
                 "a disconnected conductor for FEM. Re-run with MVB_DIAG=1 to see the rejection "
                 "reason; MVB_FUSE_FUZZY tunes the union tolerance (default 1e-7).");
+        }
+        // STRATEGY 2.5: LINEAR chain-order group welding. The chain is welded one neighbour
+        // at a time into maximal groups; a junction whose weld fails acceptance (single solid,
+        // copper conserved, BRepCheck valid) simply STARTS A NEW GROUP. Neighbours genuinely
+        // overlap (junction lenses), so most welds succeed; the hard boundaries -- lead
+        // junctions, layer transitions whose tubes lie near-tangent over whole faces (the
+        // 2-layer 02_flyback chain that defeats every bulk/tree union) -- become group seams.
+        // Groups butt on clean single-circle quadric discs, which the consumer's fragment
+        // glues without the phase-mismatch slivers of split-profile discs; a group left as a
+        // SINGLE prim is rebuilt with a split profile (its untrimmed quadric side face would
+        // be periodic and unmeshable).
+        {
+            auto lvol2 = [](const TopoDS_Shape& sh) {
+                GProp_GProps gp; BRepGProp::VolumeProperties(sh, gp); return gp.Mass();
+            };
+            std::vector<std::pair<TopoDS_Shape, int>> groups;   // shape, prim count
+            TopoDS_Shape acc = solids.front();
+            double accMass = lvol2(acc);
+            int accCount = 1;
+            size_t accStart = 0;
+            std::vector<size_t> singleIdx;   // splitArgs index of single-prim groups
+            auto flush = [&](size_t nextStart) {
+                if (accCount == 1) singleIdx.push_back(accStart);
+                groups.push_back({acc, accCount});
+                accStart = nextStart;
+            };
+            for (size_t i2 = 1; i2 < solids.size(); ++i2) {
+                bool welded = false;
+                const double mt = lvol2(solids[i2]);
+                try {
+                    BRepAlgoAPI_Fuse f(acc, solids[i2]);
+                    f.SetFuzzyValue(fuzzy);
+                    f.Build();
+                    if (f.IsDone() && !f.Shape().IsNull()) {
+                        int nsol = 0;
+                        for (TopExp_Explorer e(f.Shape(), TopAbs_SOLID); e.More(); e.Next()) ++nsol;
+                        const double m = lvol2(f.Shape());
+                        if (nsol == 1 && m >= 0.97 * accMass + 0.5 * mt &&
+                            BRepCheck_Analyzer(f.Shape()).IsValid()) {
+                            acc = f.Shape(); accMass = m; ++accCount; welded = true;
+                        }
+                    }
+                } catch (const Standard_Failure&) {}
+                if (!welded) {
+                    flush(i2);
+                    acc = solids[i2]; accMass = mt; accCount = 1;
+                }
+            }
+            flush(solids.size());
+            if (groups.size() > 1 && groups.size() * 6 < solids.size()) {
+                // rebuild the single-prim groups with split profiles
+                bool okSingles = true;
+                size_t gi = 0;
+                for (auto& g : groups) {
+                    if (g.second == 1) {
+                        // find which splitArgs index: singles were recorded in order
+                        (void)gi;
+                    }
+                }
+                std::vector<TopoDS_Shape> rebuilt;
+                for (size_t si : singleIdx) {
+                    TopoDS_Shape rs = rectPrimSolid(*splitArgs[si].pr, path.wireWidth,
+                                                    path.wireHeight, splitArgs[si].axialA,
+                                                    splitArgs[si].axialB, splitArgs[si].extA,
+                                                    splitArgs[si].extB, round, radius,
+                                                    /*splitOverride=*/6);
+                    if (rs.IsNull()) { okSingles = false; break; }
+                    rebuilt.push_back(rs);
+                }
+                double total = 0.0;
+                for (auto& g : groups) total += lvol2(g.first);
+                if (okSingles && std::abs(total - expectedVol) <= 0.03 * expectedVol) {
+                    BRep_Builder bb; TopoDS_Compound comp; bb.MakeCompound(comp);
+                    size_t ri = 0;
+                    size_t siPos = 0;
+                    for (auto& g : groups) {
+                        if (g.second == 1 && siPos < singleIdx.size() && ri < rebuilt.size()) {
+                            bb.Add(comp, rebuilt[ri]); ++ri; ++siPos;
+                        } else {
+                            bb.Add(comp, g.first);
+                        }
+                    }
+                    if (diag) std::cerr << "[rect-column] LINEAR group weld: " << groups.size()
+                                        << " groups (" << singleIdx.size()
+                                        << " split singles) from " << solids.size()
+                                        << " prims, v=" << total * 1e9 << "mm3\n";
+                    return comp;
+                }
+                if (diag) std::cerr << "[rect-column] linear weld rejected (groups="
+                                    << groups.size() << " v=" << total * 1e9 << " exp="
+                                    << expectedVol * 1e9 << "mm3 singlesOk=" << okSingles
+                                    << ")\n";
+            } else if (diag) {
+                std::cerr << "[rect-column] linear weld insufficient (" << groups.size()
+                          << " groups from " << solids.size() << " prims)\n";
+            }
+        }
+        // STRATEGY 3: fuse the WRAP CHAIN alone and keep the LEADS as separate pieces. The
+        // fuse-bisect diagnostic showed the union poisoned from the very first LEAD<->wrap
+        // junction (prefix 3 of 384 already fails acceptance on 02_flyback), while wrap-only
+        // chains fuse routinely. Leads butt the fused body with real perpendicular overlap
+        // lenses, so the consumer's weld/fragment joins them -- the exact configuration that
+        // meshed ETD34. Lead pieces are rebuilt with SPLIT profiles (an unfused quadric
+        // cylinder's periodic side face is unmeshable).
+        {
+            std::vector<TopoDS_Shape> wrapSolids, leadSolids;
+            bool rebuildOk = true;
+            for (size_t i2 = 0; i2 < splitArgs.size(); ++i2) {
+                const Primitive& pr2 = *splitArgs[i2].pr;
+                if (pr2.isLead || pr2.isConnection) {
+                    TopoDS_Shape rs = rectPrimSolid(pr2, path.wireWidth, path.wireHeight,
+                                                    splitArgs[i2].axialA, splitArgs[i2].axialB,
+                                                    splitArgs[i2].extA, splitArgs[i2].extB,
+                                                    round, radius, /*splitOverride=*/6);
+                    if (rs.IsNull()) { rebuildOk = false; break; }
+                    leadSolids.push_back(rs);
+                } else {
+                    wrapSolids.push_back(solids[i2]);
+                }
+            }
+            if (rebuildOk && !wrapSolids.empty() && !leadSolids.empty()) {
+                try {
+                    TopTools_ListOfShape args, tools;
+                    args.Append(wrapSolids.front());
+                    for (size_t i2 = 1; i2 < wrapSolids.size(); ++i2)
+                        tools.Append(wrapSolids[i2]);
+                    BRepAlgoAPI_Fuse f;
+                    f.SetArguments(args);
+                    f.SetTools(tools);
+                    f.SetFuzzyValue(fuzzy);
+                    f.Build();
+                    if (f.IsDone()) {
+                        GProp_GProps gp; BRepGProp::VolumeProperties(f.Shape(), gp);
+                        double expect = 0.0;
+                        for (const auto& ws : wrapSolids) {
+                            GProp_GProps g2; BRepGProp::VolumeProperties(ws, g2);
+                            expect += g2.Mass();
+                        }
+                        int nsol = 0;
+                        for (TopExp_Explorer e(f.Shape(), TopAbs_SOLID); e.More(); e.Next()) ++nsol;
+                        if (nsol == 1 && gp.Mass() > 0.90 * expect &&
+                            !hasDegenerateSheetFace(f.Shape(), path.wireRadius) &&
+                            BRepCheck_Analyzer(f.Shape()).IsValid()) {
+                            BRep_Builder bb; TopoDS_Compound comp; bb.MakeCompound(comp);
+                            bb.Add(comp, f.Shape());
+                            for (const auto& ls : leadSolids) bb.Add(comp, ls);
+                            if (diag) std::cerr << "[rect-column] WRAP-ONLY fuse accepted (v="
+                                                << gp.Mass() * 1e9 << "mm3) + "
+                                                << leadSolids.size()
+                                                << " split lead piece(s) for consumer welding\n";
+                            return comp;
+                        }
+                        if (diag) std::cerr << "[rect-column] wrap-only fuse rejected (nsol="
+                                            << nsol << " v=" << gp.Mass() * 1e9 << " exp="
+                                            << expect * 1e9 << "mm3)\n";
+                    }
+                } catch (const Standard_Failure& e2) {
+                    if (diag) std::cerr << "[rect-column] wrap-only fuse threw ("
+                                        << e2.GetMessageString() << ")\n";
+                }
+            }
+        }
+        // Rebuild every prim with a 6-arc SPLIT profile for the chain: the closed-circle
+        // originals carry periodic side faces and full-circle seam edges that a fragment
+        // cannot mesh (measured on 02_flyback: gmsh's 1D loop ends 2 pi from its start).
+        {
+            std::vector<TopoDS_Shape> resplit;
+            resplit.reserve(splitArgs.size());
+            bool okSplit = true;
+            for (const auto& saPack : splitArgs) {
+                TopoDS_Shape rs = rectPrimSolid(*saPack.pr, path.wireWidth, path.wireHeight,
+                                                saPack.axialA, saPack.axialB, saPack.extA,
+                                                saPack.extB, round, radius, /*splitOverride=*/6);
+                if (rs.IsNull()) { okSplit = false; break; }
+                resplit.push_back(rs);
+            }
+            if (okSplit && resplit.size() == solids.size()) solids.swap(resplit);
+            else if (diag) std::cerr << "[rect-column] split-profile rebuild failed -- "
+                                        "keeping quadric prims\n";
         }
         if (diag) std::cerr << "[rect-column] returning the CONNECTED butt-joined chain of "
                             << n << " primitives for FEM (fragment welds it downstream)\n";
@@ -3044,7 +3328,8 @@ RectStation rectStation(const PlanePt& p, double halfW, double halfD, double min
 }
 
 void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStation& s1,
-                    const std::string& label, size_t ordinal) {
+                    const std::string& label, size_t ordinal, double wireRadius,
+                    double yClear = 0.0, double zOutClear = 0.0) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -3097,14 +3382,57 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
     };
     if (std::abs(s1.zPos - s0.zPos) > 1e-12 && std::abs(s1.y - s0.y) > 1e-12) {
         // Layer transition that also moves axially (a Z-order return descends the whole
-        // window). One diagonal blend would cut BETWEEN the layers, clipping every ramp
-        // of the layer being crossed; a real winder pops the wire out to the new layer's
-        // clearance first and only then runs it down at that clearance. Two planar
-        // blends: radial move in the outer half of the face, axial move in the inner
-        // half — the junction tangent is -X on both sides.
-        gp_Pnt mid(+s0.segX / 2.0, y, -s1.zPos);
-        pushBlend(gp_Pnt(+s0.segX, y, -s0.zPos), mid, "ramp -Z (radial)");
-        pushBlend(mid, gp_Pnt(0, s1.y, -s1.zPos), "ramp -Z (axial)");
+        // window). Every IN-WINDOW route was measured to collide on 02_flyback_efd25: a
+        // diagonal cuts between the layers; descending at the target layer's clearance
+        // sweeps across that layer's -Z transition face and crosses its wrap ramps
+        // (centreline distance 0); a lane radially outside the TARGET layer runs into the
+        // next interleaved winding (57 um free); and an edge pop-out whose re-entry
+        // descends at the target z sweeps the same face again. The only conflict-free
+        // route is the round column's END-RUN, transliterated: pop out AXIALLY past the
+        // winding end on the source side, travel radially at that edge row to a lane
+        // OUTSIDE every placed layer of every winding, descend there, come back along the
+        // destination edge, and re-enter at the crossing. Each return gets its own rows
+        // (one OD + 15% apart); MKF's own connection model frees exactly these edge slots
+        // (turn-blocking, Coil.cpp).
+        const int lane = path.zReturnLanes++;
+        const double row = (lane + 1) * 2.3 * wireRadius;
+        const double yEsrc = (y >= 0 ? 1.0 : -1.0) * (yClear + row);
+        const double yEdst = (s1.y >= 0 ? 1.0 : -1.0) * (yClear + row);
+        const double zOut = zOutClear + row;
+        const double xm = std::min(s0.segX, s1.segX);
+        // STRAIGHT SEG legs with mitred overlaps, NOT S-blends: a pipe-shell over these long,
+        // barely-curved legs has near-zero curvature everywhere and OCC's Frenet law recurses
+        // itself into a stack overflow (GeomFill_Frenet::D0 <-> SingularD0, measured 30k frames
+        // deep on this very route). Each leg is extended 0.35 r past its interior waypoints so
+        // consecutive legs OVERLAP -- the same mitre-weld mechanism the terminal lead prisms
+        // use -- and the first/last legs likewise overlap the corner arc behind and the next
+        // wrap's face run ahead.
+        {
+            // The re-entry leg (edge row -> crossing) passes the terminal LEADS' edge rows on
+            // its way in; starting it at 0.2 segX crossed the entrance lead's level 0.31 mm
+            // away (measured on 02_flyback_efd25, gate minimum 0.40 mm). Starting at 0.4 segX
+            // moves that crossing point proportionally farther from the plane the leads run in.
+            const gp_Pnt wp[6] = {gp_Pnt(+s0.segX, y, -s0.zPos),
+                                  gp_Pnt(+s0.segX * 0.8, yEsrc, -s0.zPos),
+                                  gp_Pnt(+s0.segX * 0.6, yEsrc, -zOut),
+                                  gp_Pnt(xm * 0.62, yEdst, -zOut),
+                                  gp_Pnt(xm * 0.52, yEdst, -s1.zPos),
+                                  gp_Pnt(0, s1.y, -s1.zPos)};
+            static const char* kLeg[5] = {"ramp -Z (edge pop-out)", "ramp -Z (edge travel out)",
+                                          "ramp -Z (outer descent)", "ramp -Z (edge travel in)",
+                                          "ramp -Z (re-entry)"};
+            const double ov = 0.35 * wireRadius;
+            for (int k = 0; k < 5; ++k) {
+                gp_XYZ d = wp[k + 1].XYZ() - wp[k].XYZ();
+                const double len = d.Modulus();
+                if (len < 1e-12) continue;
+                d /= len;
+                gp_Pnt a(wp[k].XYZ() - d * ov);          // overlap the previous leg / corner
+                gp_Pnt b(wp[k + 1].XYZ() + d * ov);      // overlap the next leg / wrap face
+                pushSeg(a, b, kLeg[k]);
+            }
+        }
+
     } else {
         pushBlend(gp_Pnt(+s0.segX, y, -s0.zPos), gp_Pnt(0, s1.y, -s1.zPos), "ramp -Z");
     }
@@ -3931,10 +4259,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                    ? 0.75 * wireRadius / nxt.x : 0.0;
                 appendRoundWrap(path, s, nxt, wireRadius, label, i, azU, azO);
             } else if (columnShape == MAS::ColumnShape::RECTANGULAR) {
-                appendRectWrap(path,
-                               rectStation(s, halfW, halfD, minBend, path.name),
-                               rectStation(nxt, halfW, halfD, minBend, path.name),
-                               label, i);
+                {
+                    // Extents the end-run must clear, over EVERY winding in the window
+                    // (allRings): axial edge rows beyond all turns, and an outer lane
+                    // beyond all layers.
+                    double yClear = 0.0, xMax = 0.0;
+                    for (const auto& ring : allRings) {
+                        yClear = std::max(yClear, std::abs(ring.y) + ring.rw + wireRadius);
+                        xMax = std::max(xMax, ring.r + ring.rw + wireRadius);
+                    }
+                    const double zOutClear =
+                        rectStation({xMax, 0.0}, halfW, halfD, minBend, path.name).zPos;
+                    appendRectWrap(path,
+                                   rectStation(s, halfW, halfD, minBend, path.name),
+                                   rectStation(nxt, halfW, halfD, minBend, path.name),
+                                   label, i, wireRadius, yClear, zOutClear);
+                }
             } else {   // OBLONG with a real straight section
                 appendOblongWrap(path, s, nxt, oblongHalf, label, i);
             }
