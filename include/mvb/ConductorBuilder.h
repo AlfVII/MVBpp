@@ -4,6 +4,7 @@
 #include "mvb/NamedShape.h"
 #include "mvb/Utils.h"
 #include <TopoDS_Shape.hxx>
+#include <limits>
 #include <vector>
 
 namespace OpenMagnetics { class Coil; }
@@ -40,6 +41,18 @@ public:
         //   where a sweep closes (columns, sparse toroids), a conformal mitre-jointed compound for
         //   dense toroids, fuse for single-turns. Meshable (no self-overlap) but far slower.
         bool femReady = false;
+        // Azimuth (radians, azPointC convention: az -> (x = r cos az, z = -r sin az)) the
+        // terminal leads should EXIT through -- the core's winding-window OPENING. NAN =
+        // keep the default (az = pi/2, the -Z direction). Cores whose lateral legs cover
+        // -Z (PQ, EP, ...) MUST redirect the leads or they terminate inside the core plate
+        // (measured on 03_buck_pq3230: the lead tip landed exactly on the oblique plate
+        // face and tetgen could not recover the contact edge).
+        double leadExitAzimuth = std::numeric_limits<double>::quiet_NaN();
+        // The CORE solids, for aiming the leads at the true window opening. Column metadata
+        // under-describes real cores (a PQ's plates wrap most of the perimeter, leaving only
+        // narrow slots); classifying the actual solids around the lead-tip radius finds the
+        // genuine free arc. Empty -> no aiming beyond leadExitAzimuth.
+        std::vector<TopoDS_Shape> coreObstacles;
     };
 
     // Builds one solid per (winding, parallel), named "<winding> parallel <k>" (MAS style).

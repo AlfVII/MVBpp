@@ -633,7 +633,9 @@ TEST_CASE("Real winding: round-column RECTANGULAR wire is ONE body", "[realwindi
                                        /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
-    REQUIRE(conductorSolidCount(conductor->shape) == 1);
+    // ONE CONNECTED conductor: the per-run rect compound welds/touches into one component
+    // (the whole-spine single body creased at the wrap->lead fillet; see 03_buck).
+    REQUIRE(connectedSolidComponents(conductor->shape) == 1);
     REQUIRE(BRepCheck_Analyzer(conductor->shape).IsValid());
 }
 

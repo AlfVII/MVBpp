@@ -847,6 +847,13 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         ConductorBuilder::Options copts;
         copts.wirePolygonSegments = wirePolygonSegments;
         copts.femReady = femReady;   // OM drawing -> fast compound; FEM export -> one-piece/conformal
+        // Hand the CORE solids to the conductor builder so it can aim the terminal leads at
+        // the true window opening (classified from the real geometry -- column metadata
+        // under-describes cores like PQ whose plates wrap most of the perimeter; measured on
+        // 03_buck_pq3230, whose lead tip landed on an oblique plate face at both column-derived
+        // azimuths).
+        if (!toroidalCore)
+            for (const auto& ns : all) copts.coreObstacles.push_back(ns.shape);
         auto emitConductors = [&](bool coat, const std::string& suffix) {
             copts.paintCoating = coat;
             for (auto& ns : ConductorBuilder::buildAll(magnetic.get_coil(), bobbinPd,

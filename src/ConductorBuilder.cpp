@@ -63,6 +63,7 @@
 #include <gp_XY.hxx>
 #include <gp_XYZ.hxx>
 #include <BRepAlgoAPI_Check.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
@@ -2860,6 +2861,87 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                                path.prims.back().turnOrdinal != path.prims.front().turnOrdinal;
     const bool roundFemCompound = path.femReady && !path.isRectangular && !path.toroidal &&
                                   multiTurnPath && std::getenv("MVB_SINGLE_BODY") == nullptr;
+    // FEM RECT-WIRE windings on round/oblong columns: per-run compound + weld, like the round
+    // path -- NOT the whole-spine single body. The single body's wrap->lead junction fillet
+    // grazes the top wrap (measured on 03_buck: a 2.24-rad fragment-imprint band on the thin
+    // side face whose boundary tetgen cannot recover -- edge 1/61 on curve 513). Per-run
+    // sweeps end AT the crossings, the wrap overshoot supplies the weld lens, and the leads
+    // are exact mitred prisms.
+    const bool rectWireCompound = path.femReady && path.isRectangular && !path.toroidal &&
+                                  path.singleBodyCapable && multiTurnPath &&
+                                  std::getenv("MVB_SINGLE_BODY") == nullptr;
+    if (rectWireCompound) {
+        const bool diagR = std::getenv("MVB_DIAG") != nullptr;
+        BRep_Builder bb; TopoDS_Compound comp; bb.MakeCompound(comp);
+        bool okAll = true;
+        double total = 0.0;
+        auto vol = [](const TopoDS_Shape& sh) {
+            GProp_GProps gp; BRepGProp::VolumeProperties(sh, gp); return gp.Mass();
+        };
+        for (auto [b, e] : continuousRuns(path)) {
+            const bool leadRun = ptrs[b]->isLead || ptrs[b]->isConnection;
+            if (leadRun) {
+                // straight L-route: one oriented prism per SEG, extended 0.35 r past interior
+                // junction ends so consecutive prisms (and the wrap behind) overlap for the weld
+                for (size_t i = b; i < e; ++i) {
+                    if (ptrs[i]->kind != Primitive::SEG) { okAll = false; break; }
+                    gp_XYZ d = ptrs[i]->seg.b.XYZ() - ptrs[i]->seg.a.XYZ();
+                    const double len = d.Modulus();
+                    if (len < 1e-12) continue;
+                    d /= len;
+                    const double ovA = (i > b || b > 0) ? 0.35 * path.wireRadius : 0.0;
+                    const double ovB = (i + 1 < e || e < path.prims.size()) ? 0.35 * path.wireRadius : 0.0;
+                    gp_Pnt a2(ptrs[i]->seg.a.XYZ() - d * ovA);
+                    try {
+                        // 10% PROUD in height: the lead crosses the wrap with both rect
+                        // sections axially aligned, so exact-height prisms meet the wrap in
+                        // COPLANAR top/bottom faces -- the boolean's tangent T-junction line
+                        // is exactly the edge tetgen cannot recover (measured on 03_buck:
+                        // edge 3/3 on curve 34, at every ladder size down to 49 um). A lead
+                        // 5% proud each side turns every intersection transversal; the extra
+                        // copper is confined to the short lead runs.
+                        TopoDS_Face prof = BRepBuilderAPI_MakeFace(
+                            rectProfileWire(a2, gp_Dir(d), gp_Dir(0, 1, 0),
+                                            path.wireWidth, 1.10 * path.wireHeight)).Face();
+                        TopoDS_Shape prism =
+                            BRepPrimAPI_MakePrism(prof, gp_Vec(d) * (len + ovA + ovB)).Shape();
+                        if (prism.IsNull()) { okAll = false; break; }
+                        bb.Add(comp, prism); total += vol(prism);
+                    } catch (const Standard_Failure&) { okAll = false; break; }
+                }
+            } else {
+                try {
+                    BRepBuilderAPI_MakeWire wm;
+                    for (size_t i = b; i < e; ++i) {
+                        TopoDS_Edge pe = primEdge(*ptrs[i], path.wireRadius);
+                        if (!pe.IsNull()) wm.Add(pe);
+                        if (!wm.IsDone()) { okAll = false; break; }
+                    }
+                    if (!okAll || !wm.IsDone()) { okAll = false; break; }
+                    auto pts = samplePrim(*ptrs[b], path.wireRadius);
+                    if (pts.size() < 2) { okAll = false; break; }
+                    gp_Dir t0(pts[1].XYZ() - pts[0].XYZ());
+                    TopoDS_Shape run = sweepWire(wm.Wire(), pts.front(), t0, path.wireRadius, 0,
+                                                 /*rectangular=*/true, path.wireWidth,
+                                                 path.wireHeight, gp_Dir(0, 1, 0));
+                    if (run.IsNull()) { okAll = false; break; }
+                    bb.Add(comp, run); total += vol(run);
+                } catch (const Standard_Failure&) { okAll = false; break; }
+            }
+            if (!okAll) break;
+        }
+        if (okAll) {
+            TopoDS_Shape welded = weldSolidsPairwise(comp, 1e-7);
+            int nsol = 0;
+            for (TopExp_Explorer e2(welded, TopAbs_SOLID); e2.More(); e2.Next()) ++nsol;
+            if (diagR) std::cerr << "[rect-wire] per-run compound: " << nsol
+                                 << " solid(s) after weld, v=" << vol(welded) * 1e9
+                                 << "mm3 (runs total " << total * 1e9 << ")\n";
+            return pruneDegenerateSolids(welded);
+        }
+        if (diagR) std::cerr << "[rect-wire] per-run compound failed -- falling back to the "
+                                "whole-spine single body\n";
+    }
     if (!skipSingleBody && !roundFemCompound &&
         (path.singleBodyCapable || rectWholeSweep) && (path.isRectangular || path.femReady)) {
         const bool diag = std::getenv("MVB_DIAG") != nullptr;
@@ -4240,7 +4322,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     pendingZ.push_back({paths.size(), path.prims.size(), i, s, nxt, label});
                     continue;
                 }
-                const bool weldable = path.femReady && !rectWire && turns.size() > 1;
+                const bool weldable = path.femReady && turns.size() > 1 &&
+                                      (!rectWire || std::getenv("MVB_RECT_OVERSHOOT"));
                 // A wrap overshoots wherever the chain BREAKS at its end: terminal leads
                 // (first/last transition), serpentine U-links, and Z end-runs all butt the
                 // wrap in a flat cap at the station -- every such junction needs the lens.
@@ -4308,6 +4391,74 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // exit side by side) without touching any turn position.
         const int wi = windingIdx.at(ct.winding);
         double seamAngle = effectivelyRound ? (wi * azStagger) : ((wi % 2) * kPi);
+        // Aim the whole seam sector at the core's window OPENING (Options::leadExitAzimuth):
+        // a rigid rotation about the column axis, exactly like the stagger. ROUND columns
+        // rotate freely; RECT/OBLONG columns only map onto themselves under 180 degrees, so
+        // snap to the nearer of {0, pi} there.
+        // ROUND columns only: a rect/oblong racetrack maps onto itself solely under 180
+        // degrees, and flipping the seam side broke the EP-stadium and E-zigzag fixtures
+        // while no validated design needs it -- E-family cores already open at -Z.
+        if (std::getenv("MVB_DIAG"))
+            std::cerr << "[lead-aim] gate: effRound=" << effectivelyRound
+                      << " obstacles=" << opts.coreObstacles.size() << "\n";
+        if (effectivelyRound && (!opts.coreObstacles.empty() || !std::isnan(opts.leadExitAzimuth))) {
+            double exitAz = opts.leadExitAzimuth;
+            if (!opts.coreObstacles.empty()) {
+                // Classify the CORE around the lead-tip circle: the widest arc the core does
+                // not occupy is the real window opening. Sample a small axial band (the leads
+                // run near the winding's ends and its middle).
+                double maxTurnR = 0.0, maxAbsY = 0.0;
+                for (const MAS::Turn* t : turns) {
+                    maxTurnR = std::max(maxTurnR, station(t).x);
+                    maxAbsY = std::max(maxAbsY, std::abs(station(t).y));
+                }
+                // Probe the WHOLE radial run of the lead, not just its tip: on a PQ the tip
+                // radius clears the core entirely (fully free) while the run itself passes
+                // straight through a plate at intermediate radii.
+                const double rTip = maxTurnR + 4.0 * (2.0 * wireRadius);
+                const double r0 = maxTurnR + wireRadius;
+                const double yProbe[3] = {0.0, 0.6 * maxAbsY, -0.6 * maxAbsY};
+                const int N = 360, NR = 6;
+                std::vector<char> free_(N, 1);
+                for (const auto& obst : opts.coreObstacles) {
+                    for (TopExp_Explorer se(obst, TopAbs_SOLID); se.More(); se.Next()) {
+                        BRepClass3d_SolidClassifier cls(se.Current());
+                        for (int k = 0; k < N; ++k) {
+                            if (!free_[k]) continue;
+                            const double az = kTwoPi * k / N;
+                            for (int ri = 0; ri <= NR && free_[k]; ++ri) {
+                                const double rp = r0 + (rTip - r0) * ri / NR;
+                                for (double yp : yProbe) {
+                                    cls.Perform(azPointC(0, 0, rp, yp, az), 1e-7);
+                                    if (cls.State() == TopAbs_IN || cls.State() == TopAbs_ON) {
+                                        free_[k] = 0;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // widest free arc (circular)
+                int bestLen = 0, bestStart = 0, curLen = 0, curStart = 0;
+                for (int k = 0; k < 2 * N; ++k) {
+                    if (free_[k % N]) {
+                        if (curLen == 0) curStart = k;
+                        if (++curLen > bestLen) { bestLen = curLen; bestStart = curStart; }
+                        if (curLen >= 2 * N - 1) break;   // fully free
+                    } else curLen = 0;
+                }
+                if (bestLen > 0 && bestLen < 2 * N - 1) {
+                    exitAz = kTwoPi * (bestStart + 0.5 * bestLen) / N;
+                    if (std::getenv("MVB_DIAG"))
+                        std::cerr << "[lead-aim] " << path.name << ": core-free arc "
+                                  << (360.0 * bestLen / N) << " deg, exit az "
+                                  << (exitAz * 180.0 / kPi) << " deg (rTip=" << rTip * 1e3
+                                  << "mm)\n";
+                }   // fully free or fully blocked: keep the given/default azimuth
+            }
+            if (!std::isnan(exitAz)) seamAngle += exitAz - kPlaneAz;
+        }
         if (effectivelyRound && ct.parallel > 0) {
             double minR = 1e30;
             for (const MAS::Turn* t : turns) minR = std::min(minR, station(t).x);
