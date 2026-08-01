@@ -1344,8 +1344,27 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
                             ? std::atoi(std::getenv("MVB_SPLIT_PROFILE")) : 0;
     auto profile = [&](const gp_Pnt& c, const gp_Dir& tan, const gp_Dir& ax) {
         if (!round) return rectProfileWire(c, tan, ax, w, h);
-        return splitPieces > 0 ? wireProfileWireSplit(c, tan, radius, splitPieces)
-                               : wireProfileWire(c, tan, radius, 0);
+        if (splitPieces > 0) {
+            // EQUAL-AREA POLYGON, not split arcs: split cylindrical panels are still patches
+            // of a periodic basis surface, and after a fragment re-maps their u-range across
+            // the 2 pi seam gmsh refuses them ('Impossible to mesh periodic surface',
+            // measured on 04_forward's lead panel and 02_flyback's descent leg). Twelve
+            // PLANAR facets cannot be periodic, and the radius correction keeps the copper
+            // area exact (r' = r / sqrt(N sin(2pi/N) / (2pi))).
+            const int N = std::max(12, 2 * splitPieces);
+            const double rEq = radius / std::sqrt(N * std::sin(kTwoPi / N) / kTwoPi);
+            gp_Ax2 frame(c, tan);
+            BRepBuilderAPI_MakePolygon poly;
+            for (int k = 0; k < N; ++k) {
+                const double a2 = kTwoPi * k / N;
+                gp_XYZ pt = c.XYZ() + frame.XDirection().XYZ() * (rEq * std::cos(a2)) +
+                            frame.YDirection().XYZ() * (rEq * std::sin(a2));
+                poly.Add(gp_Pnt(pt));
+            }
+            poly.Close();
+            return poly.Wire();
+        }
+        return wireProfileWire(c, tan, radius, 0);
     };
     try {
         if (pr.kind == Primitive::SEG) {
@@ -1975,6 +1994,22 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
             // "the 1D mesh seems not to be forming a closed loop" -- while a dozen groups
             // mesh). Guard: total copper conserved and every group BRepCheck-valid; else the
             // exact chain below stays the answer.
+            // Single-prim leftovers (pieces that never welded -- identity-preserved through
+            // the carry-over) are REBUILT with a split profile: an unwelded quadric prim's
+            // closed side face is periodic and unmeshable (04_forward: 'Impossible to mesh
+            // periodic surface 655' from a 38-group partial whose singles kept full cylinders).
+            for (auto& piece : level) {
+                for (size_t si = 0; si < solids.size(); ++si) {
+                    if (!piece.IsSame(solids[si])) continue;
+                    TopoDS_Shape rs = rectPrimSolid(*splitArgs[si].pr, path.wireWidth,
+                                                    path.wireHeight, splitArgs[si].axialA,
+                                                    splitArgs[si].axialB, splitArgs[si].extA,
+                                                    splitArgs[si].extB, round, radius,
+                                                    /*splitOverride=*/6);
+                    if (!rs.IsNull()) piece = rs;
+                    break;
+                }
+            }
             double total = 0.0; bool allValid = true;
             for (auto& piece : level) {
                 if (!BRepCheck_Analyzer(piece).IsValid()) {
