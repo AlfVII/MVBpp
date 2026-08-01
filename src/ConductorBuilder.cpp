@@ -4280,10 +4280,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // are always kept.
             std::vector<PlanePt> kept;
             kept.push_back(wp.front());
+            // Absorption bound: the RADIUS inside which a jog truly disappears into the wire
+            // body. For round wire that is wireRadius; for RECT/PLANAR wire wireRadius is the
+            // half-DIAGONAL (1.09 mm on 09_planar's flat trace), and absorbing an L-corner
+            // within it turned the route into a diagonal that crossed the other lead's edge
+            // row (measured: entrance seg crossing the exit row, centreline distance 0). The
+            // conservative correct bound is the THIN half-dimension.
+            const double absorbTol = rectWire
+                ? 0.5 * std::min(path.wireWidth, path.wireHeight) : wireRadius;
             for (size_t i = 1; i + 1 < wp.size(); ++i) {
                 if (std::hypot(wp[i].x - kept.back().x, wp[i].y - kept.back().y) <
-                        wireRadius ||
-                    std::hypot(wp[i].x - wp.back().x, wp[i].y - wp.back().y) < wireRadius) {
+                        absorbTol ||
+                    std::hypot(wp[i].x - wp.back().x, wp[i].y - wp.back().y) < absorbTol) {
                     continue;
                 }
                 kept.push_back(wp[i]);
