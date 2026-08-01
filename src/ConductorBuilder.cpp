@@ -1099,7 +1099,7 @@ TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir&
                        double wireRadius, int profileSegments, bool rectangular = false,
                        double rectWidth = 0.0, double rectHeight = 0.0,
                        const gp_Dir& axialAxis = gp_Dir(0, 1, 0),
-                       bool preferSimplePipe = false) {
+                       bool preferSimplePipe = false, bool tryFixedBinormal = false) {
     if (rectangular) {
         try {
             TopoDS_Wire prof = rectProfileWire(p0, t0, axialAxis, rectWidth, rectHeight);
@@ -1154,6 +1154,34 @@ TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir&
             if (BRep_Tool::Curve(TopoDS::Edge(e.Current()), f, l).IsNull()) ++nsbad;
         }
         std::cerr << "[sweepWire] spine: edges=" << nse << " without-curve=" << nsbad << "\n";
+    }
+    // FIXED-BINORMAL frame first when requested (rect-column whole-path sweep): on a racetrack
+    // spine every wrap turns about the column axis, so the binormal IS the axis -- an exact,
+    // drift-free frame. The Frenet family reframes along the spine and was measured to displace
+    // the section 18 um on a 56-prim spine: enough to close a 19.5 um inter-wrap clearance to
+    // 1.5 um and make an otherwise sound body unmeshable. Rotation is immaterial for the round
+    // section; only the POSITIONING stability matters. Falls through to the Frenet ladder if the
+    // fixed frame cannot build (e.g. a spine edge tangent parallel to the axis).
+    if (tryFixedBinormal) {
+        try {
+            TopoDS_Wire prof = wireProfileWire(p0, t0, wireRadius, profileSegments);
+            BRepOffsetAPI_MakePipeShell ps(spine);
+            if (kSweepTol3d > 0.0) ps.SetTolerance(kSweepTol3d, kSweepTol3d, 1e-2);
+            ps.SetMode(axialAxis);
+            ps.Add(prof);
+            ps.Build();
+            if (ps.IsDone() && ps.MakeSolid()) {
+                TopoDS_Shape s = ps.Shape();
+                if (BRepCheck_Analyzer(s).IsValid()) {
+                    if (sweepDiag) std::cerr << "[sweepWire] fixed-binormal: ACCEPTED\n";
+                    return s;
+                }
+            }
+            if (sweepDiag) std::cerr << "[sweepWire] fixed-binormal: failed, falling to Frenet\n";
+        } catch (const Standard_Failure& e) {
+            if (sweepDiag) std::cerr << "[sweepWire] fixed-binormal threw ("
+                                     << e.GetMessageString() << ")\n";
+        }
     }
     for (int mode = 0; mode < 3; ++mode) {
         try {
@@ -2403,7 +2431,19 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
 TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
-    if (path.useRectSolids) return emitRectColumn(path);
+    // MVB_RECT_SINGLE_BODY: for ROUND wire on a RECTANGULAR column, attempt the whole-path
+    // single sweep FIRST -- one watertight MakePipeShell solid over the full G1 centerline, i.e.
+    // no boolean union at all -- and only fall back to the per-primitive analytic path + fuse
+    // (emitRectColumn) if the sweep is rejected. Rect columns were excluded from the single-body
+    // path because pipe framing on the long racetrack straights was seen to displace the section
+    // off the crossings ("a radius or two off"); that observation predates the centring check, so
+    // rather than excluding the class we now let the ACCEPTANCE BATTERY decide per design: volume
+    // match, BRepCheck validity, degenerate-sheet scan, and centrelineStaysCentred sampling every
+    // wrap crossing (which is precisely the guard that would catch the historical displacement).
+    // Rejected sweeps lose nothing -- the exact analytic compound is still built.
+    const bool rectWholeSweep = path.useRectSolids && path.roundProfile && !path.toroidal &&
+                                path.femReady && std::getenv("MVB_RECT_SINGLE_BODY") != nullptr;
+    if (path.useRectSolids && !rectWholeSweep) return emitRectColumn(path);
 
     // Sweep each maximal continuous run as ONE pipe (the whole wrap chain when the wire
     // never crosses itself); lead runs emit as exact cylinders + sphere elbows. Fuse the
@@ -2434,7 +2474,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // whose volume matches the swept copper; otherwise fall back to the exact per-run compound.
     // Round/litz wire only sweeps a single body when FEM geometry is asked for; rectangular wire
     // has no valid round-profile compound fallback, so it MUST take the single-body path regardless.
-    if (path.singleBodyCapable && (path.isRectangular || path.femReady)) {
+    if ((path.singleBodyCapable || rectWholeSweep) && (path.isRectangular || path.femReady)) {
         const bool diag = std::getenv("MVB_DIAG") != nullptr;
         TopoDS_Shape whole;
         TopoDS_Wire spine = buildFilletedWire(ptrs.data(), ptrs.size(), path.wireRadius);
@@ -2452,7 +2492,14 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                             : gp_Dir(1, 0, 0);
             whole = sweepWire(spine, p0pts.front(), t0, path.wireRadius, /*exact profile*/ 0,
                               path.isRectangular, path.wireWidth, path.wireHeight,
-                              /*axialAxis=*/gp_Dir(0, 1, 0), /*preferSimplePipe=*/path.toroidal);
+                              /*axialAxis=*/gp_Dir(0, 1, 0),
+                              // Simple MakePipe for toroids AND the rect-column whole sweep: on
+                              // both, MakePipeShell's corrected-Frenet framing drifts the section
+                              // off the spine (measured 18 um on a 56-prim racetrack spine -- enough
+                              // to close a 19.5 um inter-wrap clearance to 1.5 um and make the body
+                              // unmeshable); MakePipe's framing keeps the section centred.
+                              /*preferSimplePipe=*/path.toroidal,
+                              /*tryFixedBinormal=*/rectWholeSweep);
         }
         if (!whole.IsNull()) {
             int nsol = 0;
@@ -2480,7 +2527,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
             // Sample the wrap (non-lead) centrelines -- lead tips sit at the end caps (~0 clearance)
             // and would false-reject -- and require every one to clear 0.85*wireRadius.
             bool okCentre = true;
-            if (path.toroidal) {
+            if (path.toroidal || rectWholeSweep) {
                 std::vector<gp_Pnt> interior;
                 for (size_t i = 0; i < ptrs.size(); ++i) {
                     if (ptrs[i]->isLead) continue;
@@ -2500,6 +2547,9 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         } else if (diag && !spine.IsNull()) {
             std::cerr << "[single-body] sweep NULL (MakePipeShell failed on the G1 spine)\n";
         }
+        // The rect-column whole-sweep attempt did not produce an acceptable body: take the exact
+        // per-primitive analytic path it would otherwise have taken. Nothing is lost by trying.
+        if (rectWholeSweep) return emitRectColumn(path);
     }
 
     // The per-run compound below sweeps ROUND profiles; a rectangular winding must come out of the
