@@ -2060,9 +2060,29 @@ TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double 
             double len = pr.seg.a.Distance(pr.seg.b);
             if (len < 1e-12) continue;
             gp_Dir dir(gp_XYZ(pr.seg.b.XYZ() - pr.seg.a.XYZ()));
-            builder.Add(compound,
-                        BRepPrimAPI_MakeCylinder(gp_Ax2(pr.seg.a, dir), wireRadius, len)
-                            .Shape());
+            // Prism over a SPLIT (6-arc) circular profile, NOT BRepPrimAPI_MakeCylinder: the
+            // exact quadric cylinder's side face is a closed PERIODIC surface, and once this
+            // piece is WELDED into the conductor mid-body (station-overlap leads), that face
+            // survives with internal trims and gmsh refuses it ("Impossible to mesh periodic
+            // surface", measured on ETD34's entrance lead). Six cylindrical panels carry the
+            // identical geometry without periodicity.
+            if (std::getenv("MVB_SEG_QUADRIC")) {   // diagnostic: the old exact cylinder
+                builder.Add(compound,
+                            BRepPrimAPI_MakeCylinder(gp_Ax2(pr.seg.a, dir), wireRadius, len)
+                                .Shape());
+            } else {
+                TopoDS_Face segProf = BRepBuilderAPI_MakeFace(
+                    wireProfileWireSplit(pr.seg.a, dir, wireRadius, 6)).Face();
+                TopoDS_Shape prism = BRepPrimAPI_MakePrism(segProf, gp_Vec(dir) * len).Shape();
+                if (std::getenv("MVB_DIAG")) {
+                    GProp_GProps gp_; BRepGProp::VolumeProperties(prism, gp_);
+                    const double expect = kPi * wireRadius * wireRadius * len;
+                    if (std::abs(gp_.Mass() - expect) > 0.01 * expect)
+                        std::cerr << "[seg-prism] VOLUME MISMATCH [" << pr.label << "] got "
+                                  << gp_.Mass()*1e9 << " expect " << expect*1e9 << " mm3\n";
+                }
+                builder.Add(compound, prism);
+            }
             // Sphere joints keep the wire envelope continuous across the plane elbows —
             // except at a terminal end, which stays a flat cylinder cap (FEM surface).
             if (!isFlatCap(pr.seg.a))
@@ -2140,6 +2160,64 @@ bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius) {
         if (fp.Mass() < 0.2 * wireRadius * diag) return true;
     }
     return false;
+}
+
+// Pairwise, coverage-guarded weld of a compound's solids into ONE body. A single N-way
+// BRepAlgo fuse can silently DROP an input piece (measured: ETD34's exit lead, 2.75 mm3 --
+// only 0.54% of the winding, invisible to total-mass guards); welding one piece at a time,
+// biggest first, lets each step be verified (one solid out, mass conserved to the overlap
+// lens) and REJECTED piece-wise. Pieces that will not weld stay separate in the returned
+// compound -- the caller decides whether that is acceptable.
+TopoDS_Shape weldSolidsPairwise(const TopoDS_Shape& compound, double fuzzy) {
+    std::vector<TopoDS_Shape> pieces;
+    for (TopExp_Explorer e(compound, TopAbs_SOLID); e.More(); e.Next())
+        pieces.push_back(e.Current());
+    if (pieces.size() <= 1) return compound;
+    auto massOf = [](const TopoDS_Shape& sh) {
+        GProp_GProps gp; BRepGProp::VolumeProperties(sh, gp); return gp.Mass();
+    };
+    std::sort(pieces.begin(), pieces.end(),
+              [&](const TopoDS_Shape& x, const TopoDS_Shape& y){ return massOf(x) > massOf(y); });
+    TopoDS_Shape acc = pieces[0];
+    double accMass = massOf(acc);
+    std::vector<TopoDS_Shape> loose;
+    const bool weldDiag = std::getenv("MVB_DIAG") != nullptr;
+    auto weldOne = [&](const TopoDS_Shape& piece) -> bool {
+        const double mt = massOf(piece);
+        try {
+            BRepAlgoAPI_Fuse f(acc, piece);
+            if (fuzzy > 0.0) f.SetFuzzyValue(fuzzy);
+            f.Build();
+            if (!f.IsDone()) {
+                if (weldDiag) std::cerr << "[weld] fuse not done (piece " << mt*1e9 << " mm3)\n";
+                return false;
+            }
+            TopoDS_Shape out = f.Shape();
+            int nsol = 0;
+            for (TopExp_Explorer e(out, TopAbs_SOLID); e.More(); e.Next()) ++nsol;
+            const double m = massOf(out);
+            if (nsol == 1 && m >= 0.98 * accMass + 0.5 * mt && m >= 0.90 * (accMass + mt)
+                && BRepCheck_Analyzer(out).IsValid()) {   // an invalid weld is a failed weld
+                acc = out; accMass = m; return true;
+            }
+            if (weldDiag) std::cerr << "[weld] step rejected: nsol=" << nsol
+                                    << " out=" << m*1e9 << " acc=" << accMass*1e9
+                                    << " piece=" << mt*1e9 << " mm3\n";
+        } catch (const Standard_Failure& e) {
+            if (weldDiag) std::cerr << "[weld] threw (" << e.GetMessageString() << ")\n";
+        }
+        return false;
+    };
+    for (size_t i = 1; i < pieces.size(); ++i)
+        if (!weldOne(pieces[i])) loose.push_back(pieces[i]);
+    // second pass: a piece can weld once its coincident neighbours are in
+    for (auto it = loose.begin(); it != loose.end();)
+        if (weldOne(*it)) it = loose.erase(it); else ++it;
+    if (loose.empty()) return acc;
+    BRep_Builder bb; TopoDS_Compound out; bb.MakeCompound(out);
+    bb.Add(out, acc);
+    for (const auto& l : loose) bb.Add(out, l);
+    return out;
 }
 
 TopoDS_Shape fuseAllSolids(const TopoDS_Shape& compound, double wireRadius) {
@@ -2474,7 +2552,32 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // whose volume matches the swept copper; otherwise fall back to the exact per-run compound.
     // Round/litz wire only sweeps a single body when FEM geometry is asked for; rectangular wire
     // has no valid round-profile compound fallback, so it MUST take the single-body path regardless.
-    if ((path.singleBodyCapable || rectWholeSweep) && (path.isRectangular || path.femReady)) {
+    // MVB_NO_SINGLE_BODY: diagnostic switch -- skip the whole-spine single-body sweep and take
+    // the per-run compound (+ fuse) fallback directly. Used to isolate sweep-crease artefacts
+    // (the single pipe can fold onto itself at the wrap->lead fillet; measured 3.7 um between
+    // adjacent patches on ETD34 at (0.09, 10.30, -7.96) mm) from the fused alternative.
+    const bool skipSingleBody = std::getenv("MVB_NO_SINGLE_BODY") != nullptr;
+    // FEM (femReady) ROUND-wire windings now default to the EXACT per-run compound, welded into
+    // one region by the consumer's boolean fragment -- NOT the whole-spine single-body sweep.
+    // Measured (STEP face-face distances, ETD34 + e138): the single pipe folds onto itself at
+    // junctions -- 3.7 um between adjacent patches at the wrap->lead fillet (ETD34, and its
+    // 'overlapping facets surface 41 surface 41' pre-dates this change), 4.7 um at the same
+    // racetrack corner of every e138 turn -- artefacts of MakePipeShell's framing that no
+    // element size can discretise, while the analytic compound keeps the layout's true
+    // clearances. The acceptance battery cannot see these creases (volume, BRepCheck, centring
+    // all pass), so the choice cannot be made per-design after the fact. Rect WIRE still MUST
+    // take the single-body sweep (it has no round-profile fallback); MVB_SINGLE_BODY=1 forces
+    // the old behaviour for experiments.
+    // Scope: CONCENTRIC columns only. Toroids keep their existing flow (simple-MakePipe single
+    // body, else the conformal mitre compound) -- their junction geometry is poloidal, not the
+    // shallow lead/wrap wedge measured here. Single-turn conductors also keep the single body
+    // (their fuse is clean; no junction wedge exists).
+    const bool multiTurnPath = !path.prims.empty() &&
+                               path.prims.back().turnOrdinal != path.prims.front().turnOrdinal;
+    const bool roundFemCompound = path.femReady && !path.isRectangular && !path.toroidal &&
+                                  multiTurnPath && std::getenv("MVB_SINGLE_BODY") == nullptr;
+    if (!skipSingleBody && !roundFemCompound &&
+        (path.singleBodyCapable || rectWholeSweep) && (path.isRectangular || path.femReady)) {
         const bool diag = std::getenv("MVB_DIAG") != nullptr;
         TopoDS_Shape whole;
         TopoDS_Wire spine = buildFilletedWire(ptrs.data(), ptrs.size(), path.wireRadius);
@@ -2628,10 +2731,17 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // fuse only simple single-turn conductors, where the union is both cheap and clean.
     bool multiTurn = !path.prims.empty() &&
                      path.prims.back().turnOrdinal != path.prims.front().turnOrdinal;
-    // Only FEM geometry pays to fuse a single-turn conductor into one clean solid; drawing keeps the
-    // fast compound. Multi-turn conductors never fuse cleanly (seam slivers), so they stay a compound.
-    TopoDS_Shape result =
-        (path.femReady && !multiTurn) ? fuseAllSolids(compound, path.wireRadius) : compound;
+    // FEM geometry becomes ONE solid: single-turn conductors via the (cheap, clean) N-way fuse;
+    // multi-turn conductors via the PAIRWISE coverage-guarded weld -- the N-way fuse of a whole
+    // winding either leaves seam slivers or silently drops lead pieces, but welding the runs one
+    // piece at a time with each step verified builds the same single body robustly (the station-
+    // overlap leads guarantee real volumetric overlap at every junction). Drawing keeps the fast
+    // compound.
+    TopoDS_Shape result = compound;
+    if (path.femReady) {
+        result = multiTurn ? weldSolidsPairwise(compound, 1e-7)
+                           : fuseAllSolids(compound, path.wireRadius);
+    }
     return pruneDegenerateSolids(result);
 }
 
@@ -2722,7 +2832,8 @@ bool isZReturn(const PlanePt& s, const PlanePt& n, double wireRadius, double med
 // locally bulge. corridorIdx staggers the end-run lanes of a winding's parallel strands
 // (which transition in lockstep and would otherwise coincide).
 void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
-                     double wireRadius, const std::string& label, size_t ordinal) {
+                     double wireRadius, const std::string& label, size_t ordinal,
+                     double azUnder = 0.0, double azOver = 0.0) {
     if (std::abs(n.x - s.x) > wireRadius && std::abs(n.y - s.y) <= std::abs(n.x - s.x)) {
         Primitive step;
         step.kind = Primitive::SEG;
@@ -2736,7 +2847,17 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
     }
     Primitive wrap;
     wrap.kind = Primitive::SPIRAL;
-    wrap.spiral = {0, 0, s.x, s.y, kPlaneAz, n.x, n.y, kPlaneAz + kTwoPi};
+    // azUnder/azOver stretch the FIRST/LAST wrap a fraction of a radian past the connection
+    // plane, so the wrap TUBE crosses the plane where its terminal lead attaches. Without it
+    // the chain ends in a flat cap exactly AT the crossing and the lead only ever touches
+    // that cap: zero common volume, nothing for the weld to join -- fuse(chain, lead) returns
+    // two disjoint solids and the FEM winding silently loses a lead (ETD34, measured:
+    // nsolid=2 at full mass). Every in-plane lead-side extension was tried and rejected:
+    // along the lead axis it crosses a multi-layer's blocked slot (PQ33 collision); azimuthal
+    // stubs are locally coaxial with the wrap and degenerate the weld. Overshooting the wrap
+    // itself puts a HALF-TUBE lens through the lead, entirely on the wire's own centreline
+    // extension -- no clearance spent, no envelope change worth naming.
+    wrap.spiral = {0, 0, s.x, s.y, kPlaneAz - azUnder, n.x, n.y, kPlaneAz + kTwoPi + azOver};
     wrap.label = label;
     wrap.turnOrdinal = ordinal;
     path.prims.push_back(std::move(wrap));
@@ -3705,7 +3826,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
 
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
-                                 size_t ordinal) {
+                                 size_t ordinal, bool stationAtFront) {
             // Absorb intermediate waypoints closer than the wire radius to their
             // neighbour: a jog shorter than the wire's own radius lies entirely inside
             // the pipe body of the adjacent edge (and inside MKF's drawn rectangle,
@@ -3760,7 +3881,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             auto wp = terminalWaypoints(entranceGroup, first, path.name + " entrance");
             extendBorder(wp);
             std::reverse(wp.begin(), wp.end());
-            pushPlaneSegs(wp, "entrance lead", 0);
+            pushPlaneSegs(wp, "entrance lead", 0, /*stationAtFront=*/false);
         }
 
         // The conductor's typical within-layer axial advance per wrap: median |dy| over its
@@ -3791,7 +3912,24 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     pendingZ.push_back({paths.size(), path.prims.size(), i, s, nxt, label});
                     continue;
                 }
-                appendRoundWrap(path, s, nxt, wireRadius, label, i);
+                const bool weldable = path.femReady && !rectWire && turns.size() > 1;
+                // A wrap overshoots wherever the chain BREAKS at its end: terminal leads
+                // (first/last transition), serpentine U-links, and Z end-runs all butt the
+                // wrap in a flat cap at the station -- every such junction needs the lens.
+                // Between two consecutive WRAPS the chain is continuous (one swept run) and
+                // an overshoot would self-overlap the run's own spine, so none is added.
+                auto isBreakAt = [&](size_t k) -> bool {   // does transition k break the chain?
+                    if (k >= turns.size() - 1) return true;             // beyond: a lead
+                    PlanePt a = station(turns[k]), b = station(turns[k + 1]);
+                    if (std::abs(b.x - a.x) > wireRadius &&
+                        std::abs(b.y - a.y) <= std::abs(b.x - a.x)) return true;   // U-link
+                    return isZReturn(a, b, wireRadius, medianPitch);               // Z end-run
+                };
+                const double azU = (weldable && (i == 0 || isBreakAt(i - 1)) && s.x > 1e-9)
+                                   ? 0.75 * wireRadius / s.x : 0.0;
+                const double azO = (weldable && isBreakAt(i + 1) && nxt.x > 1e-9)
+                                   ? 0.75 * wireRadius / nxt.x : 0.0;
+                appendRoundWrap(path, s, nxt, wireRadius, label, i, azU, azO);
             } else if (columnShape == MAS::ColumnShape::RECTANGULAR) {
                 appendRectWrap(path,
                                rectStation(s, halfW, halfD, minBend, path.name),
@@ -3814,7 +3952,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 wp.push_back({leadTipRadius, last.y});
             }
             extendBorder(wp);
-            pushPlaneSegs(wp, "exit lead", turns.size() - 1);
+            pushPlaneSegs(wp, "exit lead", turns.size() - 1, /*stationAtFront=*/true);
         }
 
         // Stagger this winding's seam azimuth so its leads clear the other windings' leads (all drawn
@@ -3868,12 +4006,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // its only PLANAR faces (the swept lateral surface is a cylinder/torus/BSpline, the elbows
         // are spheres/tori) -- MVB++ caps them flat precisely so a solver can put a port BC there.
         // Emit each as its own named face shape "<name> terminal <k>" so the mesher tags a named
-        // surface group. Only meaningful for the single-body (femReady) conductor; a multi-solid
-        // fallback has no single pair of terminals.
+        // surface group. Works for BOTH the single-body conductor and the multi-solid compound:
+        // the free ends are known from the PATH (not guessed from "first planar face"), and the
+        // lead-tip caps are planar full-cross-section faces in either representation. (The old
+        // nsol == 1 gate assumed a compound has "no single pair of terminals" -- it does: the
+        // same two path free ends.)
         if (!opts.femReady || p.isRectangular) continue;
         int nsol = 0;
         for (TopExp_Explorer e(cond, TopAbs_SOLID); e.More(); e.Next()) ++nsol;
-        if (nsol != 1 || p.prims.empty()) continue;
+        if (nsol < 1 || p.prims.empty()) continue;
         // The two free ends are KNOWN from the path -- take them from it, never from "the first two
         // planar faces found". That guess only held for the boolean-free single-body sweep, whose
         // lateral surfaces are all curved. The analytic per-primitive conductor is welded by a
