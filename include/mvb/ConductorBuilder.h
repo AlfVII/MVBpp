@@ -4,6 +4,7 @@
 #include "mvb/NamedShape.h"
 #include "mvb/Utils.h"
 #include <TopoDS_Shape.hxx>
+#include <array>
 #include <limits>
 #include <vector>
 
@@ -54,6 +55,28 @@ public:
         // genuine free arc. Empty -> no aiming beyond leadExitAzimuth.
         std::vector<TopoDS_Shape> coreObstacles;
     };
+
+    // REAL-PATH POLYLINES: the fully-assembled, collision-checked conductor centrelines
+    // (wraps, links, Z end-runs, terminal leads -- everything emitConductor would sweep),
+    // sampled per primitive, WITHOUT building any solid. No booleans anywhere: this is the
+    // input for implicit (signed-distance / level-set) winding meshing, which sidesteps the
+    // OCC weld/fragment failure classes entirely (ABT #490/#491).
+    struct PathPolyline {
+        std::string name;                 // "<winding> parallel <k>"
+        double wireRadius = 0.0;          // round capsule radius (= half min dim for rect)
+        bool isRectangular = false;
+        double wireWidth = 0.0, wireHeight = 0.0;
+        // Per-primitive sampled points (metres). Distance = min over prims of the
+        // point-to-polyline capsule distance; per-prim grouping avoids phantom bridges
+        // between non-contiguous runs.
+        std::vector<std::vector<std::array<double, 3>>> prims;
+        std::array<double, 3> end0{}, end1{};   // free ends (terminal port centres)
+        std::array<double, 3> dir0{}, dir1{};   // OUTWARD end tangents (port normals)
+    };
+    static std::vector<PathPolyline> buildAllPaths(const OpenMagnetics::Coil& coil,
+                                                   const MAS::CoreBobbinProcessedDescription& bobbin,
+                                                   bool isToroidal,
+                                                   const Options& opts = {});
 
     // Builds one solid per (winding, parallel), named "<winding> parallel <k>" (MAS style).
     // `coil` must be an MKF-wound coil (turnsDescription present, positions final);

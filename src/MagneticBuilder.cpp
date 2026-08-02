@@ -1014,4 +1014,19 @@ std::vector<NamedShape> MagneticBuilder::buildTurnsNamedFromTurns(
     return out;
 }
 
+std::vector<ConductorBuilder::PathPolyline> MagneticBuilder::buildRealWindingPaths(
+    const OpenMagnetics::Magnetic& magnetic) const {
+    auto bobbinPd = getBobbinProcessed(magnetic.get_coil());
+    patchBobbinDimensions(bobbinPd, magnetic.get_core());
+    const bool toroidalCore = isCoreToroidal(magnetic.get_core());
+    ConductorBuilder::Options copts;
+    copts.femReady = true;
+    copts.paintCoating = false;   // centrelines + copper radius; coating handled by the consumer
+    if (!toroidalCore) {
+        auto cores = buildCoreNamed(magnetic.get_core(), DEFAULT_CORE_POLYGON_SEGMENTS);
+        for (const auto& ns : cores) copts.coreObstacles.push_back(ns.shape);
+    }
+    return ConductorBuilder::buildAllPaths(magnetic.get_coil(), bobbinPd, toroidalCore, copts);
+}
+
 } // namespace mvb

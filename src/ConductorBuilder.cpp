@@ -3772,7 +3772,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                      const MAS::CoreBobbinProcessedDescription& bobbinPd,
                                      bool isToroidal,
                                      std::vector<RSpace> allSpaces,
-                                     const ConductorBuilder::Options& opts) {
+                                     const ConductorBuilder::Options& opts,
+                                     std::vector<ConductorBuilder::PathPolyline>* polyOut = nullptr) {
     auto turnsOpt = coil.get_turns_description();
     if (!turnsOpt || turnsOpt->empty()) {
         throw std::runtime_error(
@@ -4531,6 +4532,45 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     checkCollisions(paths);
 
+    // Polyline capture mode: everything above ran (assembly, seam aiming, end-run planning,
+    // the collision gate) but NO solid is built -- return the sampled centrelines instead.
+    if (polyOut) {
+        for (const auto& p : paths) {
+            ConductorBuilder::PathPolyline pl;
+            pl.name = p.name;
+            pl.wireRadius = p.wireRadius;
+            pl.isRectangular = p.isRectangular;
+            pl.wireWidth = p.wireWidth;
+            pl.wireHeight = p.wireHeight;
+            for (const auto& pr : p.prims) {
+                auto pts = samplePrim(pr, p.wireRadius);
+                if (pts.size() < 2) continue;
+                std::vector<std::array<double, 3>> seg;
+                seg.reserve(pts.size());
+                for (const auto& q : pts) seg.push_back({q.X(), q.Y(), q.Z()});
+                pl.prims.push_back(std::move(seg));
+            }
+            if (!p.prims.empty()) {
+                auto [a0, b0] = primEndpoints(p.prims.front());
+                auto [a1, b1] = primEndpoints(p.prims.back());
+                pl.end0 = {a0.X(), a0.Y(), a0.Z()};
+                pl.end1 = {b1.X(), b1.Y(), b1.Z()};
+                auto sf = samplePrim(p.prims.front(), p.wireRadius);
+                auto sl = samplePrim(p.prims.back(), p.wireRadius);
+                if (sf.size() >= 2) {
+                    gp_XYZ d = sf.front().XYZ() - sf[1].XYZ();     // outward at the entrance tip
+                    if (d.Modulus() > 1e-12) { d /= d.Modulus(); pl.dir0 = {d.X(), d.Y(), d.Z()}; }
+                }
+                if (sl.size() >= 2) {
+                    gp_XYZ d = sl.back().XYZ() - sl[sl.size() - 2].XYZ();  // outward at the exit tip
+                    if (d.Modulus() > 1e-12) { d /= d.Modulus(); pl.dir1 = {d.X(), d.Y(), d.Z()}; }
+                }
+            }
+            polyOut->push_back(std::move(pl));
+        }
+        return {};
+    }
+
     std::vector<NamedShape> out;
     out.reserve(paths.size());
     for (const auto& p : paths) {
@@ -4603,6 +4643,17 @@ std::vector<NamedShape> ConductorBuilder::buildAll(
     auto spaces = coilCopy.get_connection_reserved_spaces();
     return buildAllImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, bobbin, isToroidal,
                                                                   std::move(spaces), opts);
+}
+
+std::vector<ConductorBuilder::PathPolyline> ConductorBuilder::buildAllPaths(
+    const OpenMagnetics::Coil& coil, const MAS::CoreBobbinProcessedDescription& bobbin,
+    bool isToroidal, const Options& opts) {
+    OpenMagnetics::Coil coilCopy = coil;
+    auto spaces = coilCopy.get_connection_reserved_spaces();
+    std::vector<PathPolyline> out;
+    buildAllImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, bobbin, isToroidal,
+                                                           std::move(spaces), opts, &out);
+    return out;
 }
 
 } // namespace mvb

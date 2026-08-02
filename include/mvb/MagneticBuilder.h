@@ -2,6 +2,7 @@
 
 #include "MAS.hpp"
 #include "Utils.h"
+#include "mvb/ConductorBuilder.h"
 #include "mvb/NamedShape.h"
 #include "mvb/Symmetry.h"
 #include <TopoDS_Shape.hxx>
@@ -118,6 +119,12 @@ public:
     // through MKF with its real-winding turn blocking on. A magnetic that already carries a
     // geometricalDescription THROWS with the flag on — MKF must (re-)wind; caller-provided
     // turn positions are never silently re-interpreted.
+    // Real-winding conductor CENTRELINES (sampled, collision-checked, seam-aimed), for
+    // implicit/level-set winding meshing. No solids are built. See
+    // ConductorBuilder::PathPolyline.
+    std::vector<ConductorBuilder::PathPolyline> buildRealWindingPaths(
+        const OpenMagnetics::Magnetic& magnetic) const;
+
     std::vector<NamedShape> buildAllNamed(const MAS::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
