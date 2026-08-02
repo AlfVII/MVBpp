@@ -844,6 +844,8 @@ static BatteryChildMode batteryChildModeHook;
 // failure (returns "UNRECOGNISED") so a new fault mode cannot hide.
 const char* realwinding_category(const std::string& msg) {
     if (msg.find("collision between") != std::string::npos)        return "collision (ABT #240/#187)";
+    if (msg.find("no clear terminal-lead route") != std::string::npos)
+        return "no lead corridor (ABT #187)";   // routed-lead validation: layout reserves none
     if (msg.find("FOIL wire") != std::string::npos ||
         msg.find("rectangular/planar/foil wire") != std::string::npos) return "foil wire (unsupported)";
     if (msg.find("produced 0 turns") != std::string::npos)         return "MKF 0 turns (doesn't fit window)";

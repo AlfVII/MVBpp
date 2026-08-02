@@ -15,6 +15,9 @@
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepTools.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -74,14 +77,81 @@ int connectedSolidComponents(const TopoDS_Shape& s) {
     std::vector<int> parent(solids.size());
     for (size_t i = 0; i < parent.size(); ++i) parent[i] = (int)i;
     std::function<int(int)> find = [&](int a) { while (parent[a] != a) a = parent[a] = parent[parent[a]]; return a; };
+    // Bounding-box prefilter: all-pairs BRepExtrema on a ~150-solid conformal compound is ~11k
+    // exact distance queries (~1 h); boxes farther apart than the touch tolerance can never touch.
+    std::vector<Bnd_Box> boxes(solids.size());
+    for (size_t i = 0; i < solids.size(); ++i) BRepBndLib::Add(solids[i], boxes[i]);
     for (size_t i = 0; i < solids.size(); ++i)
         for (size_t j = i + 1; j < solids.size(); ++j) {
+            if (find((int)i) == find((int)j)) continue;
+            if (boxes[i].Distance(boxes[j]) > 1e-6) continue;
             BRepExtrema_DistShapeShape d(solids[i], solids[j]);
             if (d.IsDone() && d.Value() < 1e-6) parent[find((int)i)] = find((int)j);
         }
     std::set<int> roots;
     for (size_t i = 0; i < solids.size(); ++i) roots.insert(find((int)i));
     return (int)roots.size();
+}
+
+bool pointStrictlyInsideShape(const TopoDS_Shape& shape, const gp_Pnt& p);
+
+// The femReady round-wire conductor contract: a CONFORMAL mitre compound. One connected chain,
+// every solid individually valid (BRepCheck), and consecutive solids abut WITHOUT volumetric
+// overlap (their contact is coincident faces, which the meshing fragment welds conformally).
+// Interpenetration is checked by CLASSIFYING A GRID over the junction region (the bbox
+// intersection), NOT with BRepAlgoAPI_Common: OCC booleans on abutting BSpline pipe solids are
+// the documented pathological input class this architecture exists to avoid, and Common ground
+// for >10 min PER PAIR in 2d-extrema root-finding on the toroid's hole-threading pipes
+// (measured via gdb backtrace). A point strictly inside BOTH neighbours = real overlap; the
+// historical per-run compound overlaps (~0.5-1 mm^3 per joint) light up dozens of grid points.
+void requireConformalConductor(const TopoDS_Shape& shape) {
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer e(shape, TopAbs_SOLID); e.More(); e.Next()) solids.push_back(e.Current());
+    REQUIRE(!solids.empty());
+    REQUIRE(connectedSolidComponents(shape) == 1);
+    for (const auto& s : solids) REQUIRE(BRepCheck_Analyzer(s).IsValid());
+    int stride = std::max<int>(1, static_cast<int>(solids.size()) / 15);
+    for (size_t i = 0; i + 1 < solids.size(); i += static_cast<size_t>(stride)) {
+        Bnd_Box ba, bb;
+        BRepBndLib::Add(solids[i], ba);
+        BRepBndLib::Add(solids[i + 1], bb);
+        double ax0, ay0, az0, ax1, ay1, az1, bx0, by0, bz0, bx1, by1, bz1;
+        ba.Get(ax0, ay0, az0, ax1, ay1, az1);
+        bb.Get(bx0, by0, bz0, bx1, by1, bz1);
+        const double x0 = std::max(ax0, bx0), x1 = std::min(ax1, bx1);
+        const double y0 = std::max(ay0, by0), y1 = std::min(ay1, by1);
+        const double z0 = std::max(az0, bz0), z1 = std::min(az1, bz1);
+        if (x0 >= x1 || y0 >= y1 || z0 >= z1) continue;   // disjoint boxes: nothing to probe
+        constexpr int N = 6;
+        int inBoth = 0;
+        gp_Pnt firstHit;
+        for (int gx = 0; gx < N; ++gx)
+            for (int gy = 0; gy < N; ++gy)
+                for (int gz = 0; gz < N; ++gz) {
+                    const gp_Pnt p(x0 + (x1 - x0) * (gx + 0.5) / N,
+                                   y0 + (y1 - y0) * (gy + 0.5) / N,
+                                   z0 + (z1 - z0) * (gz + 0.5) / N);
+                    if (pointStrictlyInsideShape(solids[i], p) && pointStrictlyInsideShape(solids[i + 1], p)) {
+                        if (inBoth == 0) firstHit = p;
+                        ++inBoth;
+                    }
+                }
+        GProp_GProps gpa, gpb;
+        BRepGProp::VolumeProperties(solids[i], gpa);
+        BRepGProp::VolumeProperties(solids[i + 1], gpb);
+        if (inBoth > 0) {   // offline forensics (CWD): the exact solids the probe flagged
+            BRepTools::Write(solids[i], ("mitre_overlap_A_" + std::to_string(i) + ".brep").c_str());
+            BRepTools::Write(solids[i + 1], ("mitre_overlap_B_" + std::to_string(i + 1) + ".brep").c_str());
+        }
+        INFO("mitre neighbours [" << i << "," << (i + 1) << "]: " << inBoth
+             << " junction-grid points inside BOTH solids (first at ("
+             << firstHit.X() << "," << firstHit.Y() << "," << firstHit.Z() << ")); A centroid=("
+             << gpa.CentreOfMass().X() << "," << gpa.CentreOfMass().Y() << ","
+             << gpa.CentreOfMass().Z() << ") vol=" << gpa.Mass() << "; B centroid=("
+             << gpb.CentreOfMass().X() << "," << gpb.CentreOfMass().Y() << ","
+             << gpb.CentreOfMass().Z() << ") vol=" << gpb.Mass());
+        REQUIRE(inBoth == 0);
+    }
 }
 
 double shapeVolume(const TopoDS_Shape& s) {
@@ -100,10 +170,23 @@ double commonVolume(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     return shapeVolume(common.Shape());
 }
 
+
 bool pointInsideShape(const TopoDS_Shape& shape, const gp_Pnt& p, double tol = 1e-9) {
     for (TopExp_Explorer exp(shape, TopAbs_SOLID); exp.More(); exp.Next()) {
         BRepClass3d_SolidClassifier cls(TopoDS::Solid(exp.Current()), p, tol);
         if (cls.State() == TopAbs_IN || cls.State() == TopAbs_ON) return true;
+    }
+    return false;
+}
+
+// STRICT interior (TopAbs_IN only): the conformal junction probe must NOT count TopAbs_ON --
+// points on the coincident abutment faces of a tangent mitre junction classify ON for BOTH
+// neighbours (that contact IS the conformal design), and counting them read as interpenetration
+// (16/216 false hits on the 12-turn toroid; a 24^3 strict-IN census of the same pair found 0).
+bool pointStrictlyInsideShape(const TopoDS_Shape& shape, const gp_Pnt& p) {
+    for (TopExp_Explorer exp(shape, TopAbs_SOLID); exp.More(); exp.Next()) {
+        BRepClass3d_SolidClassifier cls(TopoDS::Solid(exp.Current()), p, 1e-9);
+        if (cls.State() == TopAbs_IN) return true;
     }
     return false;
 }
@@ -132,29 +215,52 @@ double coreFacetWedgeBound(double wireRadius, double borderRadius, int coreSegme
 // All-pairs boolean interference among named bodies (skipping the bobbin, which is
 // deliberately cut to yield). Tolerance covers polygon-facet slivers of the cores.
 void requireNoPairwiseOverlap(const std::vector<mvb::NamedShape>& named, double tol) {
+    // Decompose every body into its solids once (with bboxes) and run booleans only on solid
+    // pairs whose boxes actually come near: Common on whole CONFORMAL COMPOUNDS (~150 solids
+    // since the femReady mitre default) took tens of minutes per pair and timed out the suite;
+    // near-pair pruning keeps the check exact while touching only real contacts.
+    struct Body {
+        std::vector<TopoDS_Shape> solids;
+        std::vector<Bnd_Box> boxes;
+    };
+    std::vector<Body> bodies(named.size());
+    for (size_t i = 0; i < named.size(); ++i)
+        for (TopExp_Explorer e(named[i].shape, TopAbs_SOLID); e.More(); e.Next()) {
+            Bnd_Box bb;
+            BRepBndLib::Add(e.Current(), bb);
+            bodies[i].solids.push_back(e.Current());
+            bodies[i].boxes.push_back(bb);
+        }
     for (size_t i = 0; i < named.size(); ++i) {
         if (named[i].name.find("Bobbin") != std::string::npos) continue;
         for (size_t j = i + 1; j < named.size(); ++j) {
             if (named[j].name.find("Bobbin") != std::string::npos) continue;
-            double v = commonVolume(named[i].shape, named[j].shape);
-            // Second opinion WITHOUT booleans: classify the common region's centroid in both
-            // bodies. OCC booleans on quadric pairs have been caught returning "empty" for
-            // genuinely overlapping solids (and could in principle fabricate the reverse), so
-            // an interference verdict must not rest on one algorithm.
+            double v = 0.0;
             std::string verify;
-            if (v > tol && v < 1e8) {
-                BRepAlgoAPI_Common common(named[i].shape, named[j].shape);
-                if (common.IsDone()) {
-                    GProp_GProps gp_;
-                    BRepGProp::VolumeProperties(common.Shape(), gp_);
-                    const gp_Pnt c = gp_.CentreOfMass();
-                    const bool inA = pointInsideShape(named[i].shape, c);
-                    const bool inB = pointInsideShape(named[j].shape, c);
-                    verify = std::string("; centroid-in-A=") + (inA?"yes":"no") +
-                             " centroid-in-B=" + (inB?"yes":"no");
-                    if (!(inA && inB)) v = 0.0;   // boolean fabricated the overlap
+            for (size_t a = 0; a < bodies[i].solids.size(); ++a)
+                for (size_t b = 0; b < bodies[j].solids.size(); ++b) {
+                    if (bodies[i].boxes[a].Distance(bodies[j].boxes[b]) > 1e-9) continue;
+                    double vv = commonVolume(bodies[i].solids[a], bodies[j].solids[b]);
+                    // Second opinion WITHOUT booleans: classify the common region's centroid in
+                    // both bodies. OCC booleans on quadric pairs have been caught returning
+                    // "empty" for genuinely overlapping solids (and fabricating the reverse), so
+                    // an interference verdict must not rest on one algorithm.
+                    if (vv > tol && vv < 1e8) {
+                        BRepAlgoAPI_Common common(bodies[i].solids[a], bodies[j].solids[b]);
+                        if (common.IsDone()) {
+                            GProp_GProps gp_;
+                            BRepGProp::VolumeProperties(common.Shape(), gp_);
+                            const gp_Pnt c = gp_.CentreOfMass();
+                            const bool inA = pointInsideShape(bodies[i].solids[a], c);
+                            const bool inB = pointInsideShape(bodies[j].solids[b], c);
+                            verify += std::string(" [") + std::to_string(a) + "," +
+                                      std::to_string(b) + " centroid-in-A=" + (inA ? "yes" : "no") +
+                                      " centroid-in-B=" + (inB ? "yes" : "no") + "]";
+                            if (!(inA && inB)) vv = 0.0;   // boolean fabricated the overlap
+                        }
+                    }
+                    v += vv;
                 }
-            }
             INFO("pairwise overlap '" << named[i].name << "' vs '" << named[j].name
                                       << "' = " << v << verify);
             REQUIRE(v <= tol);
@@ -448,13 +554,13 @@ TEST_CASE("Real winding: rectangular-column E core zigzag racetrack conductor",
 
     // E-core window walls are planar (no facet sag): tangent contact only.
     requireNoPairwiseOverlap(named, 1e-10);
-    // A rectangular column's round-wire conductor is built from per-primitive cylinders + torus
-    // elbows and fused into ONE FEM-ready solid (the swept-pipe compound would sliver on the fuse).
-    int solids = 0;
-    for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
-        ++solids;
-    REQUIRE(solids == 1);
-    REQUIRE(!hasSelfIntersections(conductor->shape));
+    // CONFORMAL CONTRACT (femReady round wire): the conductor is a mitre-jointed compound --
+    // one CONNECTED chain of individually valid solids whose neighbours abut without volumetric
+    // overlap. (The old fused-ONE-solid contract is retired: OCC booleans on winding chains are
+    // the documented self-interference failure class -- ABT #490; conformal-by-construction is
+    // the architecture. BOPAlgo_CheckerSI is NOT run: coincident abutting faces are the intended
+    // conformal contact that gmsh's fragment+glue welds.)
+    requireConformalConductor(conductor->shape);
 }
 
 TEST_CASE("Real winding: oblong-column EP core stadium conductor", "[realwinding]") {
@@ -534,15 +640,10 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
 
     // Exact bore: wall contact is true tangency, zero interference within OCCT booleans.
     requireNoPairwiseOverlap(named, 1e-12);
-    // This 12-turn toroid sweeps to ONE FEM-ready solid via the simple MakePipe (its framing keeps
-    // the round section centred on the high-torsion hole-threading spine, where MakePipeShell's
-    // corrected Frenet drifts a crossing off-centre). Denser toroids whose spine MakePipe cannot
-    // close fall back to the exact per-run compound -- still crossing-exact, just multi-solid.
-    int solids = 0;
-    for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
-        ++solids;
-    REQUIRE(solids == 1);
-    REQUIRE(!hasSelfIntersections(conductor->shape));
+    // CONFORMAL CONTRACT (femReady round wire): a connected mitre compound of valid solids,
+    // no volumetric overlap between neighbours (see requireConformalConductor). The historical
+    // single-MakePipe body is retired for femReady -- conformal-by-construction, ABT #490.
+    requireConformalConductor(conductor->shape);
 
     // FEM terminal faces: the two free ends of the conductor are flat PLANAR discs (the
     // swept lead cylinder's end cap, no sphere), so downstream FEM can assign a current
@@ -680,6 +781,26 @@ TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean"
         REQUIRE(primaryConductionLayers == 2);
     }
 
+    // TWO-LAYER sections bury the inner layer's entrance: ring 2 nests one wire OD inside
+    // ring 1 (crossings 1.47 mm apart at a 1.4 mm envelope -- the TURNS are legal), but every
+    // straight-dressed lead path from ring 1's start crossing is then blocked by ring 2's
+    // returns. A real winder lays the lead FIRST and winds layer 2 around it -- rigid MAS turn
+    // geometry cannot express that (lead-space reservation is the layout's job, MKF ABT #187),
+    // so the routed-lead builder must REFUSE loudly rather than emit overlapping copper.
+    {
+        mvb::MagneticBuilder twoLayerBuilder;
+        REQUIRE_THROWS_WITH(
+            twoLayerBuilder.buildAllNamed(enriched, false, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                          0, true, false, false, 0.0,
+                                          /*useRealWindingGeometry=*/true, /*femReady=*/false),
+            Catch::Matchers::ContainsSubstring("no clear terminal-lead route"));
+    }
+
+    // The 3-winding independence contract is exercised at SINGLE-LAYER sections (9 turns per
+    // winding on the same core/wire), where the terminal leads route cleanly.
+    for (auto& w : magneticJson["coil"]["functionalDescription"]) w["numberTurns"] = 9;
+    enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+
     mvb::MagneticBuilder builder;
     // CMC spread windings stay on the fast drawing compound (femReady=false): the test only asserts
     // the three windings don't overlap EACH OTHER, which the per-run compound already satisfies.
@@ -756,6 +877,23 @@ TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre
     // ABUT on a coincident elliptical face rather than interpenetrating. This is the FEM-meshable
     // (no double material) form of a winding that cannot be a single solid.
     auto magneticJson = loadFixture("realwinding_toroid_3in.json");
+    // At the fixture's full 60 turns the hole packs TWO layers and the inner ring's tube
+    // spacing (1.86 mm) is smaller than the wire od (2 mm): there is no od-wide lead corridor
+    // at ANY azimuth/depth, so the routed-lead builder must REFUSE loudly (turn positions are
+    // never moved; lead space is the layout's to reserve -- MKF ABT #187).
+    {
+        auto denseEnriched =
+            mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+        mvb::MagneticBuilder denseBuilder;
+        REQUIRE_THROWS_WITH(
+            denseBuilder.buildAllNamed(denseEnriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       0, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true),
+            Catch::Matchers::ContainsSubstring("no clear terminal-lead route"));
+    }
+    // The conformal mitre-compound structure is exercised at the densest ROUTABLE packing of
+    // the same core/wire: 30 turns = a full single layer (rim gap 0.3 mm).
+    magneticJson["coil"]["functionalDescription"][0]["numberTurns"] = 30;
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
 
     mvb::MagneticBuilder builder;
@@ -765,25 +903,12 @@ TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(conductor != nullptr);
 
-    std::vector<TopoDS_Solid> solids;
-    for (TopExp_Explorer e(conductor->shape, TopAbs_SOLID); e.More(); e.Next())
-        solids.push_back(TopoDS::Solid(e.Current()));
+    int nSolids = solidCount(conductor->shape);
     // MakePipe can't close one body here, so the conductor is a multi-solid conformal compound.
-    REQUIRE(solids.size() > 1);
-    // Every mitred solid is watertight/valid -- the per-solid ShapeFix makes the torus cut-curves
-    // survive a STEP round-trip (they were valid in memory but degraded on reload without it).
-    for (const auto& s : solids) REQUIRE(BRepCheck_Analyzer(s).IsValid());
-
-    // Conformal: neighbouring (consecutive-primitive) solids share a mitre face and do NOT overlap.
-    // Sample consecutive pairs across the whole winding and require ~zero common volume; a plain
-    // overlapping per-run compound would carry ~0.5-1 mm^3 (5e-10 m^3) at each joint here.
-    int checked = 0;
-    int stride = std::max<int>(1, static_cast<int>(solids.size()) / 15);
-    for (size_t i = 0; i + 1 < solids.size(); i += static_cast<size_t>(stride)) {
-        double v = commonVolume(solids[i], solids[i + 1]);
-        INFO("mitre neighbour overlap [" << i << "," << (i + 1) << "] = " << v);
-        REQUIRE(v <= 1e-12);
-        ++checked;
-    }
-    REQUIRE(checked >= 10);
+    REQUIRE(nSolids > 1);
+    // Connected + per-solid valid + neighbours abut WITHOUT interpenetration. The overlap probe
+    // is the junction-grid classifier, NOT BRepAlgoAPI_Common: Common on abutting BSpline pipe
+    // pairs of this toroid ground >10 min/pair in 2d-extrema root-finding or returned !IsDone
+    // (both measured here) -- the exact OCC-boolean pathology the conformal build avoids.
+    requireConformalConductor(conductor->shape);
 }

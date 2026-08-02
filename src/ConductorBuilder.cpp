@@ -22,6 +22,8 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
+#include <cstdio>
+#include <BRepAlgoAPI_Cut.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepAlgoAPI_Common.hxx>
@@ -467,6 +469,13 @@ std::size_t dropRedundantExcursions(ConductorPath& path) {
 }
 
 void checkCollisions(const std::vector<ConductorPath>& paths) {
+    // MVB_LEAD_NO_VALIDATE: diagnostic export mode (see emitToroLead) -- the emitted copper is
+    // EXPECTED to interpenetrate; skipping the gate lets the STEP reach disk for inspection.
+    if (std::getenv("MVB_LEAD_NO_VALIDATE")) {
+        std::cerr << "[ConductorBuilder] MVB_LEAD_NO_VALIDATE set: collision gate SKIPPED -- "
+                     "diagnostic geometry, not for FEM\n";
+        return;
+    }
     // Pre-sample every primitive once (rect/toroidal wraps are 9-10 primitives per turn;
     // re-sampling per pair would dominate the gate).
     std::vector<std::vector<std::vector<gp_Pnt>>> polys(paths.size());
@@ -2668,7 +2677,47 @@ TopoDS_Shape sweepRunChunked(const Primitive* const* prims, size_t count, double
 // point. Two equal round tubes mitred on their bisector leave IDENTICAL elliptical faces (same
 // centre, tilt and radius), so neighbouring solids ABUT on a coincident face instead of
 // overlapping: a conformal, mesh-shareable assembly. Centrelines/crossings never move.
+// ANALYTIC end tangents, not sampled chords. Chord directions from samplePrim run up to half
+// a sample step's turn away from the true tangent (a 16-sample wrap chord is ~5-6 deg off),
+// which made emitToroidConformal misread every TANGENT wrap junction as a corner and slice it
+// on a chord-tilted bisector: the mitre faces then no longer coincide and the 'conformal'
+// assembly falls apart into disconnected pieces (measured: PQ33 round column, 18 prims,
+// 34 spurious cuts, 14 components).
+static gp_Dir spiralTangent(const Spiral& sp, bool atStart) {
+    const double daz = sp.az1 - sp.az0;
+    const double az = atStart ? sp.az0 : sp.az1;
+    double rp = 0.0, yp = 0.0;
+    const double r = atStart ? sp.r0 : sp.r1;
+    if (std::fabs(daz) > 1e-12 && !sp.blend) {
+        rp = (sp.r1 - sp.r0) / daz;
+        yp = (sp.y1 - sp.y0) / daz;
+    }   // cosine-blend spirals have purely azimuthal end tangents (r' = y' = 0)
+    // P(az) = (cx + r cos az, y, cz - r sin az)  [azPointC convention]
+    gp_XYZ t(rp * std::cos(az) - r * std::sin(az), yp,
+             -rp * std::sin(az) - r * std::cos(az));
+    if (daz < 0) t *= -1.0;
+    if (t.Modulus() < 1e-15) return gp_Dir(1, 0, 0);
+    return gp_Dir(t);
+}
 static gp_Dir primFwdStart(const Primitive& p, double r) {
+    switch (p.kind) {
+        case Primitive::SEG: {
+            gp_Vec v(p.seg.a, p.seg.b);
+            if (v.Magnitude() > 1e-12) return gp_Dir(v);
+            break;
+        }
+        case Primitive::ARC3: {
+            gp_XYZ t = p.arc.axis.Crossed(p.arc.v0);
+            if (p.arc.sweep < 0) t *= -1.0;
+            if (t.Modulus() > 1e-15) return gp_Dir(t);
+            break;
+        }
+        case Primitive::SPIRAL:
+            return spiralTangent(p.spiral, /*atStart=*/true);
+        case Primitive::BLEND:
+            if (p.blendc.u.Modulus() > 1e-15) return gp_Dir(p.blendc.u);
+            break;
+    }
     auto pts = samplePrim(p, r);
     for (size_t i = 1; i < pts.size(); ++i) {
         gp_Vec v(pts.front(), pts[i]);
@@ -2677,6 +2726,25 @@ static gp_Dir primFwdStart(const Primitive& p, double r) {
     return gp_Dir(1, 0, 0);
 }
 static gp_Dir primFwdEnd(const Primitive& p, double r) {
+    switch (p.kind) {
+        case Primitive::SEG: {
+            gp_Vec v(p.seg.a, p.seg.b);
+            if (v.Magnitude() > 1e-12) return gp_Dir(v);
+            break;
+        }
+        case Primitive::ARC3: {
+            gp_XYZ ve = rotateXYZ(p.arc.v0, p.arc.axis, p.arc.sweep);
+            gp_XYZ t = p.arc.axis.Crossed(ve);
+            if (p.arc.sweep < 0) t *= -1.0;
+            if (t.Modulus() > 1e-15) return gp_Dir(t);
+            break;
+        }
+        case Primitive::SPIRAL:
+            return spiralTangent(p.spiral, /*atStart=*/false);
+        case Primitive::BLEND:
+            if (p.blendc.u.Modulus() > 1e-15) return gp_Dir(p.blendc.u);
+            break;
+    }
     auto pts = samplePrim(p, r);
     for (size_t i = pts.size(); i-- > 1;) {
         gp_Vec v(pts[i - 1], pts.back());
@@ -2711,17 +2779,32 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         BRepPrimAPI_MakeRevol rev(prof, gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)), total);
         return rev.IsDone() ? rev.Shape() : TopoDS_Shape();
     }
-    // BLEND / SPIRAL: smooth transitions meet their neighbours tangentially, so the exact pipe (no
-    // overhang) suffices -- their joints are never cut.
+    // BLEND / SPIRAL: swept as exact pipes. A pipe has no revolve/extrude axis to overhang
+    // along, so mitre growth EXTENDS THE SPINE instead: a short straight run along the analytic
+    // end tangent (G1-continuous, so MakePipeShell sweeps it as one smooth body) which the
+    // bisector cut then trims back -- identical overhang semantics to the SEG/ARC3 branches.
+    // Without this, a corner cut at a spiral/blend end carved a wedge with nothing to fill it
+    // (measured: every lead<->wrap corner on PQ33 left a gap -> 5 disconnected components).
     auto pts = samplePrim(pr, r);
     if (pts.size() < 2) return {};
     TopoDS_Edge e = primEdge(pr, r);
     if (e.IsNull()) return {};
     try {
-        TopoDS_Wire spine = BRepBuilderAPI_MakeWire(e).Wire();
-        gp_Vec t0(pts[0], pts[1]);
-        if (t0.Magnitude() < 1e-12) return {};
-        TopoDS_Wire prof = wireProfileWire(pts.front(), gp_Dir(t0), r, 0);
+        const auto ends = primEndpoints(pr);
+        const gp_Dir tA = primFwdStart(pr, r), tB = primFwdEnd(pr, r);
+        BRepBuilderAPI_MakeWire mw;
+        gp_Pnt spineStart = ends.first;
+        if (overA > 0.0) {
+            spineStart = gp_Pnt(ends.first.XYZ() - tA.XYZ() * overA);
+            mw.Add(BRepBuilderAPI_MakeEdge(spineStart, ends.first).Edge());
+        }
+        mw.Add(e);
+        if (overB > 0.0)
+            mw.Add(BRepBuilderAPI_MakeEdge(ends.second,
+                                           gp_Pnt(ends.second.XYZ() + tB.XYZ() * overB)).Edge());
+        if (!mw.IsDone()) return {};
+        TopoDS_Wire spine = mw.Wire();
+        TopoDS_Wire prof = wireProfileWire(spineStart, tA, r, 0);
         BRepOffsetAPI_MakePipeShell ps(spine);
         ps.Add(prof);
         ps.Build();
@@ -2731,26 +2814,50 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
     return {};
 }
 
-// Keep the half of `solid` on the `keepDir` side of the plane through P. The knife box is sized
-// TIGHT to the wire (lateral +-4r covers the tilted elliptical section; depth spans the solid),
-// so the boolean stays cheap -- a fat 2*diagonal box was the bulk of the per-cut cost.
-static TopoDS_Shape halfKeep(const TopoDS_Shape& solid, const gp_Pnt& P, const gp_Dir& keepDir,
-                             double r) {
-    Bnd_Box bb;
-    BRepBndLib::Add(solid, bb);
-    if (bb.IsVoid()) return solid;
-    double x0, y0, z0, x1, y1, z1;
-    bb.Get(x0, y0, z0, x1, y1, z1);
-    double lat = 4.0 * r;
-    double depth = gp_Pnt(x0, y0, z0).Distance(gp_Pnt(x1, y1, z1)) + 4.0 * r;
-    gp_Ax2 ax0(P, keepDir);
-    gp_XYZ X = ax0.XDirection().XYZ(), Y = ax0.YDirection().XYZ();
-    gp_Pnt corner(P.XYZ() - lat * X - lat * Y);  // box laterally centred on P, near face on the plane
-    TopoDS_Shape box =
-        BRepPrimAPI_MakeBox(gp_Ax2(corner, keepDir, ax0.XDirection()), 2 * lat, 2 * lat, depth).Shape();
+// Trim the grown overhang of `solid` that pokes past the mitre plane (through P, material side =
+// keepDir): SUBTRACT a small knife box sitting on the discard side, localized to the junction.
+// Neither of the two 'obvious' cuts is correct here:
+//  - a global half-space keep is WRONG for near-closed wraps -- the wrap legitimately curves back
+//    across the junction plane far from the joint, so the far side would be sliced off;
+//  - the previous 'tight beam' knife (8r-wide box, depth spanning the solid, kept via Common) was
+//    NOT a half-space: it discarded everything outside the beam laterally. Measured on PQ33: it
+//    kept 17% of the first wrap and split it into 3 solids -> disconnected slivers.
+// Locality bounds: the grown overhang lies within `grow`+r of P along -keepDir and within
+// ~2.5r+`grow` of P laterally (bisector tilt <= ~50 deg), so a (3r+grow)-lateral x (grow+2r)-deep
+// knife covers it with margin. A volume guard rejects any trim that removed more than a stub's
+// worth of material (i.e. the knife reached a neighbouring pass of the same solid).
+static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, const gp_Dir& keepDir,
+                                   const gp_Dir& stubDir, double r, double grow) {
+    // Oriented knife: the overhang stub extends along `stubDir` beyond the plane, so the box
+    // follows its lateral DRIFT direction and stays tube-radius-thin on the perpendicular
+    // (axial/pitch) axis -- a symmetric (3r+grow)-wide box nicked the neighbouring wrap pass
+    // one pitch (~3r) away and detached a 0.37 mm fragment (measured, PQ33 junction 9->10).
+    const gp_XYZ w = keepDir.XYZ() * -1.0;                              // into the discard side
+    const double cosT = std::max(0.2, std::abs(stubDir.XYZ().Dot(w)));  // clamp: tilt <= ~78 deg
+    const double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
+    const double ell = r / cosT + 0.5 * r;    // mitre ellipse semi-extent + margin
+    const double drift = (grow + r) * sinT;   // stub tip's lateral reach
+    const double depth = grow + 1.5 * r;
+    gp_XYZ u = stubDir.XYZ() - w * stubDir.XYZ().Dot(w);
+    if (u.Modulus() > 1e-9) u.Normalize();
+    else u = gp_Ax2(P, gp_Dir(w)).XDirection().XYZ();   // stub ~normal to plane: no drift
+    const gp_XYZ v = w.Crossed(u);
+    const double vHalf = 1.5 * r;
+    gp_Pnt corner(P.XYZ() - u * ell - v * vHalf);
+    TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Ax2(corner, gp_Dir(w), gp_Dir(u)),
+                                           drift + 2.0 * ell, 2.0 * vHalf, depth).Shape();
     try {
-        BRepAlgoAPI_Common cmn(solid, box);
-        if (cmn.IsDone() && !cmn.Shape().IsNull()) return cmn.Shape();
+        GProp_GProps gpBefore, gpAfter;
+        BRepGProp::VolumeProperties(solid, gpBefore);
+        BRepAlgoAPI_Cut cut(solid, box);
+        if (cut.IsDone() && !cut.Shape().IsNull()) {
+            BRepGProp::VolumeProperties(cut.Shape(), gpAfter);
+            const double removed = gpBefore.Mass() - gpAfter.Mass();
+            // stub bound: the overhang is at most a full-radius tube of length grow+2r, doubled
+            // for the tilted-ellipse wedge. More than that = the knife ate distant material.
+            const double stubMax = 2.0 * kPi * r * r * (grow + 2.0 * r);
+            if (removed <= stubMax && gpAfter.Mass() > 0.0) return cut.Shape();
+        }
     } catch (const Standard_Failure&) {
     }
     return solid;
@@ -2771,11 +2878,27 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
         fe[i] = primFwdEnd(*ptrs[i], wireRadius);
     }
     int nCut = 0, nRepaired = 0, nInvalid = 0;
+    std::vector<TopoDS_Shape> built;
     for (size_t i = 0; i < n; ++i) {
         // Bend at each end: a tangent joint (wrap SEG<->ARC) needs no growth and no boolean; only a
         // real corner (the entrance/exit leads) is grown and sliced on its angle-bisector plane.
+        // Junctions may carry an ENDPOINT MISMATCH (layouts hand out lead ends offset from the wrap
+        // start by up to a wire radius -- measured 0.36 mm on PQ33): the mitre plane goes through
+        // the MIDPOINT of the two endpoints (same plane for both sides) and the growth is widened
+        // by the mismatch so the overhang always reaches past the shared plane.
+        const double dpS = (i > 0)
+            ? primEndpoints(*ptrs[i - 1]).second.Distance(primEndpoints(*ptrs[i]).first) : 0.0;
+        const double dpE = (i + 1 < n)
+            ? primEndpoints(*ptrs[i]).second.Distance(primEndpoints(*ptrs[i + 1]).first) : 0.0;
         bool bentS = false;
         gp_Dir nS = fs[i];
+        if (diag && i > 0) {
+            static const char* kn[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
+            std::cerr << "[mitre]   junction " << i - 1 << "->" << i << " " << kn[ptrs[i - 1]->kind]
+                      << "->" << kn[ptrs[i]->kind] << " angle=" << fe[i - 1].Angle(fs[i]) * 180.0 / kPi
+                      << " deg" << (fe[i - 1].Angle(fs[i]) > tanThresh ? " CORNER" : "")
+                      << " ['" << ptrs[i - 1]->label << "' -> '" << ptrs[i]->label << "']\n";
+        }
         if (i > 0 && fe[i - 1].Angle(fs[i]) > tanThresh) {
             gp_Vec s(fe[i - 1].XYZ());
             s += gp_Vec(fs[i].XYZ());
@@ -2788,15 +2911,27 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
             s += gp_Vec(fs[i + 1].XYZ());
             if (s.Magnitude() > 1e-9) { nE = gp_Dir(s); bentE = true; }
         }
-        TopoDS_Shape solid = rawGrownSolid(*ptrs[i], wireRadius, bentS ? over : 0.0, bentE ? over : 0.0);
+        // Growth per end: corners grow by over+mismatch (then trimmed on the mitre plane);
+        // a TANGENT junction with an endpoint gap is bridged by growing the EARLIER prim's end
+        // flush forward (no cut) -- one side only, so the bridge is never doubled.
+        const double overS = bentS ? over + dpS : 0.0;
+        const double overE = bentE ? over + dpE : (dpE > 1e-9 ? dpE : 0.0);
+        TopoDS_Shape solid = rawGrownSolid(*ptrs[i], wireRadius, overS, overE);
         if (solid.IsNull()) {  // ARC clamp (near-full revolve): fall back to a flush, uncut tube
             solid = rawGrownSolid(*ptrs[i], wireRadius, 0.0, 0.0);
             bentS = bentE = false;
         }
         if (solid.IsNull()) continue;
-        if (bentS) { solid = halfKeep(solid, primEndpoints(*ptrs[i]).first, nS, wireRadius); ++nCut; }
+        if (bentS) {
+            const gp_Pnt J(0.5 * (primEndpoints(*ptrs[i - 1]).second.XYZ() +
+                                  primEndpoints(*ptrs[i]).first.XYZ()));
+            solid = localMitreTrim(solid, J, nS, gp_Dir(fs[i].XYZ() * -1.0), wireRadius, overS);
+            ++nCut;
+        }
         if (bentE) {
-            solid = halfKeep(solid, primEndpoints(*ptrs[i]).second, gp_Dir(nE.XYZ() * -1.0), wireRadius);
+            const gp_Pnt J(0.5 * (primEndpoints(*ptrs[i]).second.XYZ() +
+                                  primEndpoints(*ptrs[i + 1]).first.XYZ()));
+            solid = localMitreTrim(solid, J, gp_Dir(nE.XYZ() * -1.0), fe[i], wireRadius, overE);
             ++nCut;
         }
         // STEP round-trip robustness: the boolean's cut curve on a torus can carry an edge tolerance
@@ -2819,14 +2954,115 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
             else { ++nInvalid; continue; }
         }
         builder.Add(compound, solid);
+        if (diag) built.push_back(solid);
     }
-    if (diag)
+    if (diag) {
+        // component structure over ALL pairs (mirrors the test's union-find), with volumes
+        std::vector<int> uf(built.size());
+        for (size_t i = 0; i < uf.size(); ++i) uf[i] = (int)i;
+        std::function<int(int)> find = [&](int a) {
+            while (uf[a] != a) a = uf[a] = uf[uf[a]];
+            return a;
+        };
+        for (size_t i = 0; i < built.size(); ++i)
+            for (size_t j = i + 1; j < built.size(); ++j) {
+                try {
+                    BRepExtrema_DistShapeShape d(built[i], built[j]);
+                    if (d.IsDone() && d.Value() < 1e-6) uf[find((int)i)] = find((int)j);
+                } catch (const Standard_Failure&) {
+                }
+            }
+        for (size_t i = 0; i < built.size(); ++i) {
+            GProp_GProps gp;
+            BRepGProp::VolumeProperties(built[i], gp);
+            int nsol = 0;
+            std::string sub;
+            for (TopExp_Explorer ex(built[i], TopAbs_SOLID); ex.More(); ex.Next()) {
+                ++nsol;
+                GProp_GProps gs;
+                BRepGProp::VolumeProperties(ex.Current(), gs);
+                char vb[32]; std::snprintf(vb, sizeof(vb), " %.4g", gs.Mass()); sub += vb;
+            }
+            std::cerr << "[mitre]   solid " << i << " comp=" << find((int)i) << " vol=" << gp.Mass()
+                      << " nsolids=" << nsol << (nsol > 1 ? " subvols:" + sub : "") << "\n";
+        }
+        for (size_t i = 1; i < built.size(); ++i) {
+            const double dp = primEndpoints(*ptrs[i - 1]).second.Distance(primEndpoints(*ptrs[i]).first);
+            double ds = -1.0;
+            try {
+                BRepExtrema_DistShapeShape ext(built[i - 1], built[i]);
+                if (ext.IsDone()) ds = ext.Value();
+            } catch (const Standard_Failure&) {
+            }
+            if (dp > 1e-9 || ds > 1e-9)
+                std::cerr << "[mitre]   junction " << i - 1 << "->" << i << " endpointGap=" << dp
+                          << " solidGap=" << ds << "\n";
+        }
+        // Interpenetration sweep over ALL bbox-touching pairs (not just chain neighbours), the
+        // same junction-grid classifier as the test battery, with LABELS -- post-prune solid
+        // indices in test output cannot be mapped back to primitives.
+        {
+            std::vector<Bnd_Box> bxs(built.size());
+            for (size_t i = 0; i < built.size(); ++i) BRepBndLib::Add(built[i], bxs[i]);
+            for (size_t i = 0; i < built.size(); ++i)
+                for (size_t j = i + 1; j < built.size(); ++j) {
+                    if (bxs[i].Distance(bxs[j]) > 1e-9) continue;
+                    double x0, y0, z0, x1, y1, z1, u0, v0, w0, u1, v1, w1;
+                    bxs[i].Get(x0, y0, z0, x1, y1, z1);
+                    bxs[j].Get(u0, v0, w0, u1, v1, w1);
+                    const double ax = std::max(x0, u0), bx = std::min(x1, u1);
+                    const double ay = std::max(y0, v0), by = std::min(y1, v1);
+                    const double az = std::max(z0, w0), bz = std::min(z1, w1);
+                    if (ax >= bx || ay >= by || az >= bz) continue;
+                    // classify per SOLID: a built[] entry can be a multi-solid compound (a trim
+                    // that fragmented), and BRepClass3d_SolidClassifier on a compound silently
+                    // misclassifies -- exploding is what makes this sweep agree with the test
+                    // battery's flat-solid enumeration.
+                    auto insideAny = [](const TopoDS_Shape& sh, const gp_Pnt& pp) {
+                        for (TopExp_Explorer ex(sh, TopAbs_SOLID); ex.More(); ex.Next()) {
+                            BRepClass3d_SolidClassifier c(TopoDS::Solid(ex.Current()), pp, 1e-9);
+                            if (c.State() == TopAbs_IN) return true;
+                        }
+                        return false;
+                    };
+                    int hits = 0;
+                    gp_Pnt hit;
+                    constexpr int N = 6;
+                    for (int gx = 0; gx < N && hits == 0; ++gx)
+                        for (int gy = 0; gy < N && hits == 0; ++gy)
+                            for (int gz = 0; gz < N && hits == 0; ++gz) {
+                                gp_Pnt pp(ax + (bx - ax) * (gx + 0.5) / N,
+                                          ay + (by - ay) * (gy + 0.5) / N,
+                                          az + (bz - az) * (gz + 0.5) / N);
+                                if (insideAny(built[i], pp) && insideAny(built[j], pp)) {
+                                    ++hits;
+                                    hit = pp;
+                                }
+                            }
+                    if (hits > 0)
+                        std::cerr << "[mitre]   INTERPENETRATION prims " << i << "<->" << j
+                                  << " ['" << ptrs[i]->label << "' vs '" << ptrs[j]->label
+                                  << "'] at (" << hit.X() << "," << hit.Y() << "," << hit.Z()
+                                  << ")\n";
+                }
+        }
         std::cerr << "[mitre] prims=" << n << " boolean-cuts=" << nCut << " repaired=" << nRepaired
                   << " dropped-invalid=" << nInvalid << "\n";
+    }
     return compound;
 }
 
 TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
+    // FEM ROUND-WIRE windings (EVERY column type: round/oblong/rect columns AND toroids):
+    // the CONFORMAL MITRE ASSEMBLY, checked FIRST so no legacy strategy runs. See the block
+    // comment further down (kept with the legacy paths) and docs/: research-converged
+    // construction, no booleans on the winding.
+    if (path.femReady && !path.isRectangular) {
+        std::vector<const Primitive*> cptrs;
+        cptrs.reserve(path.prims.size());
+        for (const auto& pr : path.prims) cptrs.push_back(&pr);
+        return pruneDegenerateSolids(emitToroidConformal(cptrs, path.wireRadius));
+    }
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
     // MVB_RECT_SINGLE_BODY: for ROUND wire on a RECTANGULAR column, attempt the whole-path
@@ -2896,6 +3132,16 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                                path.prims.back().turnOrdinal != path.prims.front().turnOrdinal;
     const bool roundFemCompound = path.femReady && !path.isRectangular && !path.toroidal &&
                                   multiTurnPath && std::getenv("MVB_SINGLE_BODY") == nullptr;
+    // FEM ROUND-WIRE windings (EVERY column type, toroids included): the CONFORMAL
+    // MITRE ASSEMBLY -- each primitive its own exact analytic solid, tangent junctions
+    // abutting on flush perpendicular discs, corner junctions grown and sliced on the
+    // angle-bisector plane so neighbours share IDENTICAL elliptical faces. No fuse, no
+    // weld, no overlap anywhere: geometric coincidence is exact by construction, which is
+    // the input class OCCT's boolean spec and gmsh's fragment actually support (and what
+    // gmsh >= 4.13's OCCBooleanGlue accelerates). This retires the whole strategy zoo
+    // (whole-spine sweeps, pairwise welds, wrap overshoots) for round wire: the 2026-08
+    // research review (FiQuS Pancake3D, OCCT boolean spec, Cubit imprint/merge) converged
+    // on exactly this construction, and the toroid path had already proven it in-tree.
     // FEM RECT-WIRE windings on round/oblong columns: per-run compound + weld, like the round
     // path -- NOT the whole-spine single body. The single body's wrap->lead junction fillet
     // grazes the top wrap (measured on 03_buck: a 2.24-rad fragment-imprint band on the thin
@@ -3717,6 +3963,123 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     pushSeg(P(c1.pin, -tb), P(c1.pin, 0), "inner tube up to crossing");
 }
 
+// RING-TRANSITION wrap (the Z connection), dragback in the FREE BAND the ring stagger already
+// leaves between the two rings' returns (level 2k). The run itself is NOT the old straight
+// diagonal -- that passed within a wire OD of the destination ring's inner tubes as it cut
+// across the face. Instead it follows the CORE'S CENTRAL CIRCLE: a radial leg out of the source
+// turn's outer descent, a fillet corner onto the centre-radius arc, the azimuthal arc along the
+// core's mid-annulus (max distance from BOTH rings' inner and outer tubes), a fillet corner off
+// it, and a radial leg arriving straight in front of the destination turn. All five pieces are
+// exact tangent constructions (line-circle fillets), so the conformal mitre assembly sees only
+// tangent junctions.
+void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const ToroCross& c1,
+                              double bend, double extraDepth, double rMid,
+                              const std::string& label, size_t ordinal) {
+    auto P = [](const gp_XY& h, double y) { return gp_Pnt(h.X(), y, h.Y()); };
+    auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
+        if (a.Distance(b) < 1e-12) return;
+        Primitive pr;
+        pr.kind = Primitive::SEG;
+        pr.seg = {a, b};
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    auto pushArc90 = [&](const gp_Pnt& center, const gp_XYZ& axis, const gp_XYZ& v0,
+                         const char* what) {
+        Primitive pr;
+        pr.kind = Primitive::ARC3;
+        pr.arc.c = center;
+        pr.arc.axis = axis;
+        pr.arc.v0 = v0;
+        pr.arc.sweep = kPi / 2.0;
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    // Horizontal arc from startXY to endXY about centerXY at height y; the signed sweep about
+    // +Y is derived from the endpoints (always the < pi solution).
+    auto pushArcH = [&](const gp_XY& centerXY, double y, const gp_XY& startXY,
+                        const gp_XY& endXY, const char* what) {
+        gp_XYZ v0(startXY.X() - centerXY.X(), 0, startXY.Y() - centerXY.Y());
+        gp_XYZ v1(endXY.X() - centerXY.X(), 0, endXY.Y() - centerXY.Y());
+        double sweep = std::atan2(v0.Crossed(v1).Dot(gp_XYZ(0, 1, 0)), v0.Dot(v1));
+        if (std::abs(sweep) < 1e-12) return;
+        Primitive pr;
+        pr.kind = Primitive::ARC3;
+        pr.arc.c = gp_Pnt(centerXY.X(), y, centerXY.Y());
+        pr.arc.axis = gp_XYZ(0, 1, 0);
+        pr.arc.v0 = v0;
+        pr.arc.sweep = sweep;
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    auto pol = [](double r, double a) { return gp_XY(r * std::cos(a), r * std::sin(a)); };
+    const gp_XYZ yHat(0, 1, 0);
+    const double b = bend;
+
+    // ---- source turn's top half (identical to a normal wrap's) ----
+    gp_XY dH = c0.pout - c0.pin;
+    double lTop = dH.Modulus();
+    if (lTop <= 2.0 * b) {
+        throw std::runtime_error("ConductorBuilder: toroidal crossings of " + label +
+                                 " are closer than two bend radii (" + std::to_string(lTop) +
+                                 " m) — no room for the face run");
+    }
+    dH.Divide(lTop);
+    gp_XYZ d3(dH.X(), 0, dH.Y());
+    const double t0 = c0.tube, rh0 = t0 + b;
+    pushSeg(P(c0.pin, 0), P(c0.pin, t0), "inner tube up");
+    pushArc90(P(c0.pin + dH * b, t0), yHat.Crossed(d3), d3 * (-b), "top inner corner");
+    pushSeg(P(c0.pin + dH * b, rh0), P(c0.pout - dH * b, rh0), "top chord");
+    pushArc90(P(c0.pout - dH * b, t0), yHat.Crossed(d3), yHat * b, "top outer corner");
+
+    // ---- band depth and sweep sense ----
+    const double tb = toroWrapDepth(c0, c1, b) + extraDepth, rhb = tb + b;
+    const double rOut0 = c0.pout.Modulus(), rIn1 = c1.pin.Modulus();
+    const double az0 = std::atan2(c0.pout.Y(), c0.pout.X());
+    const double az1 = std::atan2(c1.pin.Y(), c1.pin.X());
+    const double dAz = std::remainder(az1 - az0, 2.0 * kPi);
+    const double sg = dAz < 0 ? -1.0 : 1.0;
+    // Fillet geometry: the out-leg meets the centre circle from OUTSIDE (fillet centre at
+    // rMid+b), the in-leg leaves it towards the hole (fillet centre at rMid-b). Tangency radii
+    // on the radial lines and tangency angles on the circle are exact.
+    const double d1 = std::asin(b / (rMid + b)), rt1 = std::sqrt((rMid + b) * (rMid + b) - b * b);
+    const double d2 = std::asin(b / (rMid - b)), rt2 = std::sqrt((rMid - b) * (rMid - b) - b * b);
+    if (rOut0 - b <= rt1 || rIn1 + b >= rt2 || std::abs(dAz) <= d1 + d2)
+        throw std::runtime_error(
+            "ConductorBuilder: ring-transition dragback of " + label +
+            " cannot follow the core's central radius (r=" + std::to_string(rMid) +
+            " m): the source outer / destination inner crossings leave no room for the "
+            "radial legs and fillets");
+
+    // ---- descend at the source azimuth ----
+    gp_XY e0xy = c0.pout;
+    e0xy.Divide(-rOut0);   // radial inward unit at az0
+    gp_XYZ e0(e0xy.X(), 0, e0xy.Y());
+    pushSeg(P(c0.pout, t0), P(c0.pout, -tb), "outer tube down");
+    pushArc90(P(c0.pout + e0xy * b, -tb), e0.Crossed(yHat), e0 * (-b), "bottom outer corner");
+
+    // ---- the 5-piece dragback along the core's central circle ----
+    pushSeg(P(c0.pout + e0xy * b, -rhb), P(pol(rt1, az0), -rhb), "dragback out leg");
+    pushArcH(pol(rMid + b, az0 + sg * d1), -rhb, pol(rt1, az0), pol(rMid, az0 + sg * d1),
+             "dragback outer fillet");
+    pushArcH(gp_XY(0, 0), -rhb, pol(rMid, az0 + sg * d1), pol(rMid, az1 - sg * d2),
+             "dragback central arc");
+    pushArcH(pol(rMid - b, az1 - sg * d2), -rhb, pol(rMid, az1 - sg * d2), pol(rt2, az1),
+             "dragback inner fillet");
+    gp_XY eIxy = c1.pin;
+    eIxy.Divide(-rIn1);   // radial inward unit at az1 (direction of travel)
+    gp_XYZ eI(eIxy.X(), 0, eIxy.Y());
+    pushSeg(P(pol(rt2, az1), -rhb), P(c1.pin - eIxy * b, -rhb), "dragback in leg");
+
+    // ---- arrive at the destination turn ----
+    pushArc90(P(c1.pin - eIxy * b, -tb), eI.Crossed(yHat), yHat * (-b), "bottom inner corner");
+    pushSeg(P(c1.pin, -tb), P(c1.pin, 0), "inner tube up to crossing");
+}
+
+
 // Toroidal terminal lead rect: MKF draws ONE radial rect per lead in the hole plane,
 // spanning [crossing radius, radialBorder] along the crossing's angle — its near edge IS
 // the crossing (up to MKF's 1e-9 serialisation rounding). Decode its outward unit
@@ -4079,34 +4442,44 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                        std::llround((maxInnerRadial - pin.Modulus()) / od)));
             };
 
-            // Corrected crossing: an OUTER ring's outer crossing is re-placed at the
-            // physical radial stack (ring 0's outer radius + ringIndex ODs) AND at the
-            // INNER crossing's azimuth — a toroidal turn wraps the core poloidally at one
-            // fixed azimuth, so its outer crossing must share the inner's angle. MKF's
-            // collision-avoidance staggers outer-ring outer angles OUT OF SEQUENCE (ring 1
-            // outers can step backwards while the inners step forward, MKF ABT #231), which
-            // makes consecutive turns' top chords cross — and the collision gate exempts
-            // consecutive wraps, so it slips through. The inner crossing (the turn's real
-            // position) and ring 0 are untouched, so single-ring and single-layer builds
-            // are identical to before. This is the deviation from MKF's toroidal
-            // geometry, forced because MKF's outer crossings are non-physical for outer
-            // rings (self-overlapping radius + non-sequential angle).
-            auto toroCross = [&](const MAS::Turn* t) -> ToroCross {
-                ToroCross rc = toroCrossRaw(t);
-                int k = ringIndexOfInner(rc.pin);
-                if (k > 0) {
-                    double ang = std::atan2(rc.pin.Y(), rc.pin.X());
-                    double R = minRawOuter + k * od;
-                    rc.pout = gp_XY(R * std::cos(ang), R * std::sin(ang));
-                }
-                return rc;
-            };
+            // Outer crossings are MKF's raw values, TRUSTED: since the ABT #231 fix MKF
+            // places them at the inner crossing's azimuth (no angular search) and now
+            // COMPACTS the radius continuously -- each outer-ring crossing rests tangent
+            // in the V-groove between the inner ring's crossings (or at the base radius
+            // where the face is free), exactly like the physical wire under tension. The
+            // historical builder-side re-placement at ring0-outer + k*OD is retired: it
+            // forced a full-OD stack that erased MKF's interleaving. Bad layouts are still
+            // caught loudly by the collision gate and the verification battery.
+            auto toroCross = [&](const MAS::Turn* t) -> ToroCross { return toroCrossRaw(t); };
+            (void)minRawOuter;
 
             ToroCross first = toroCross(turns.front());
             ToroCross last = toroCross(turns.back());
             int maxRingIndex = 0;
             for (const MAS::Turn* t : turns)
                 maxRingIndex = std::max(maxRingIndex, ringIndexOfInner(toroCrossRaw(t).pin));
+
+            // MVB_TORO_DIAG: per-turn toroidal layout audit (ring classification, raw-vs-
+            // corrected outer crossings, tube heights) -- the data needed to judge ring
+            // compacting and transition routing by numbers instead of eyeballing a STEP.
+            if (std::getenv("MVB_TORO_DIAG")) {
+                std::cerr << "[toro] " << path.name << ": " << turns.size() << " turns, od=" << od
+                          << " maxInnerRadial=" << maxInnerRadial << " minRawOuter=" << minRawOuter
+                          << " maxRingIndex=" << maxRingIndex << "\n";
+                for (size_t i = 0; i < turns.size(); ++i) {
+                    ToroCross raw = toroCrossRaw(turns[i]);
+                    ToroCross cor = toroCross(turns[i]);
+                    const double azIn = std::atan2(raw.pin.Y(), raw.pin.X()) * 180.0 / kPi;
+                    const double azOutRaw = std::atan2(raw.pout.Y(), raw.pout.X()) * 180.0 / kPi;
+                    const double azOutCor = std::atan2(cor.pout.Y(), cor.pout.X()) * 180.0 / kPi;
+                    std::cerr << "[toro]   turn " << i << " '" << turns[i]->get_name() << "'"
+                              << " ring=" << ringIndexOfInner(raw.pin)
+                              << " rIn=" << raw.pin.Modulus() << " azIn=" << azIn
+                              << " rOutRaw=" << raw.pout.Modulus() << " azOutRaw=" << azOutRaw
+                              << " rOutCor=" << cor.pout.Modulus() << " azOutCor=" << azOutCor
+                              << " tube=" << cor.tube << "\n";
+                }
+            }
 
             // Depth stagger (in ODs) for wrap i's bottom return. An intra-ring wrap tucks
             // under the rings inside it (ringIndex ODs deep). A RING-TRANSITION wrap whose
@@ -4123,7 +4496,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 double aOut = std::atan2(c0.pout.Y(), c0.pout.X());
                 double aIn = std::atan2(c1.pin.Y(), c1.pin.X());
                 double jump = std::abs(std::remainder(aIn - aOut, kTwoPi));
-                if (r0 != r1 && jump > kPi / 4.0) return maxRingIndex + 1;
+                // Ring-change wraps take appendToroTransitionBand (dragback in the free band
+                // at level 2k along the core's central radius); this same-ring depth rule is
+                // only consulted for intra-ring wraps.
+                if (r0 != r1 && jump > kPi / 4.0) return std::max(0, std::max(r0, r1) - 1);
                 return std::max(r0, r1);
             };
 
@@ -4172,6 +4548,31 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // from BELOW (-Z)), then turns 90 degrees and runs RADIALLY outward, over the
             // core face, past the outer diameter. The axial leg is continuous with the
             // adjoining turn's inner tube; the radial leg clears the winding envelope.
+            // ROUTED terminal leads: candidate routes are VALIDATED against the winding's own
+            // wrap obstacle field before emission -- the chord lanes (turn k outer -> turn k+1
+            // inner) sweep every azimuth the winding spans, including the terminal's own, so no
+            // single fixed route is safe for every density:
+            //   A) the classic 90-degree drop at the rim -- kept wherever it is clear (sparse
+            //      windings; preserves the historical geometry);
+            //   B) an inward slant to the free hole-centre corridor -- dense/full-circle
+            //      windings whose chord lane crosses the terminal azimuth (measured 0.33-0.42 mm
+            //      centreline clearance vs a 1.4-2.0 mm envelope with route A on the CMC and
+            //      dense-toroid fixtures); physically this matches a real part, where over-wound
+            //      layers press the terminal lead inward.
+            // If NEITHER clears, the layout genuinely reserves no lead corridor (2-layer packed
+            // holes leave no od-wide gap anywhere) -> THROW; turn positions are never moved and
+            // lead space is MKF's to reserve (MKF ABT #187).
+            double minCrossR = std::numeric_limits<double>::max();
+            for (const MAS::Turn* t : turns)
+                minCrossR = std::min(minCrossR, toroCross(t).pin.Modulus());
+            // Terminal-lead obstacle field = the EMITTED wrap primitives themselves, sampled.
+            // Leads are routed AFTER the wraps are emitted so every candidate is validated
+            // against the real geometry, whatever its topology -- the previous hand-maintained
+            // obstacle model (analytic chords/tubes) went stale the moment the ring transition
+            // changed shape. Exemption is geometric: primitives touching the lead's own
+            // crossing point are its continuation. Other windings on the shared core are still
+            // conservative vertical capsules at their crossings (their prims are not visible
+            // from this conductor's builder; the assembly collision gate remains downstream).
             auto emitToroLead = [&](const ToroCross& cross, bool isExit, size_t ordinal,
                                     const std::string& who) {
                 double crossR = cross.pin.Modulus();
@@ -4181,8 +4582,145 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 gp_XY dir = cross.pin;
                 dir.Divide(crossR);
                 gp_Pnt pCross(cross.pin.X(), 0, cross.pin.Y());
-                gp_Pnt pElbow(cross.pin.X(), level, cross.pin.Y());
                 gp_Pnt pOut(dir.X() * beyondR, level, dir.Y() * beyondR);
+                // route = pOut -> elbow -> pCross (entrance) or reversed (exit); validate the
+                // two legs against every emitted primitive except those that TOUCH pCross
+                // (the lead is their continuation).
+                struct Obst {
+                    std::vector<gp_Pnt> pts;
+                    double r;
+                    std::string what;
+                    size_t turnIdx;
+                };
+                std::vector<Obst> obst;
+                for (const auto& pr : path.prims) {
+                    auto [pa, pb] = primEndpoints(pr);
+                    if (pa.Distance(pCross) < 1e-9 || pb.Distance(pCross) < 1e-9) continue;
+                    obst.push_back({samplePrim(pr, wireRadius), wireRadius, pr.label,
+                                    pr.turnOrdinal});
+                }
+                for (const auto& [pxy, r] : allToroCrossings) {
+                    bool own = false;
+                    for (const MAS::Turn* t : turns)
+                        if ((toroCrossRaw(t).pin - pxy).Modulus() < 1e-9) { own = true; break; }
+                    if (own) continue;
+                    obst.push_back({{gp_Pnt(pxy.X(), -(windingBot + od), pxy.Y()),
+                                     gp_Pnt(pxy.X(), windingTop + od, pxy.Y())},
+                                    r, "other-winding tube", std::numeric_limits<size_t>::max()});
+                }
+                std::string worstWhat;
+                size_t worstTurn = 0;
+                int worstLeg = -1;
+                auto routeWorst2 = [&](const gp_Pnt& elbow, const gp_Pnt& out) {
+                    double worst = std::numeric_limits<double>::max();
+                    const gp_Pnt* poly[3] = {&out, &elbow, &pCross};
+                    for (int k = 0; k < 2; ++k)
+                        for (const auto& o : obst)
+                            for (size_t q = 0; q + 1 < o.pts.size(); ++q) {
+                                const double d = segSegDistance(*poly[k], *poly[k + 1],
+                                                                o.pts[q], o.pts[q + 1]);
+                                if (d - (wireRadius + o.r) < worst) {
+                                    worst = d - (wireRadius + o.r);
+                                    worstWhat = o.what;
+                                    worstTurn = o.turnIdx;
+                                    worstLeg = k;
+                                }
+                            }
+                    return worst;   // >= -kContactTol means clear under the gate's criterion
+                };
+                auto routeWorst = [&](const gp_Pnt& elbow) { return routeWorst2(elbow, pOut); };
+                const gp_Pnt elbowA(cross.pin.X(), level, cross.pin.Y());
+                // MVB_LEAD_NO_VALIDATE=1: DIAGNOSTIC ONLY -- emit the classic 90-degree drop
+                // without route validation, so a layout the router refuses can still be
+                // exported to STEP and inspected by eye. Never a production path: the emitted
+                // copper may interpenetrate the winding (that is exactly what one goes to look
+                // at). The collision gate is downstream and will still throw unless the caller
+                // also inspects with the gate relaxed.
+                const bool leadNoValidate = std::getenv("MVB_LEAD_NO_VALIDATE") != nullptr;
+                // RECT wire keeps the classic 90-degree drop unconditionally: the round-envelope
+                // obstacle model (centreline distance vs radius sums) over-rejects flat sections
+                // that legitimately nest closer than their circumscribed circles (measured 0.49 mm
+                // false interference on the rect-toroid fixture); the downstream collision gate
+                // checks rect pairs with the correct axial/in-plane split and still guards the
+                // emitted geometry.
+                if (path.isRectangular || leadNoValidate) {
+                    auto pushLeadSegR = [&](const gp_Pnt& a, const gp_Pnt& b, const char* wh) {
+                        if (a.Distance(b) < 1e-12) return;
+                        Primitive pr;
+                        pr.kind = Primitive::SEG;
+                        pr.seg = {a, b};
+                        pr.label = who + std::string(" ") + wh;
+                        pr.turnOrdinal = ordinal;
+                        pr.isLead = true;
+                        path.prims.push_back(std::move(pr));
+                    };
+                    if (isExit) {
+                        pushLeadSegR(pCross, elbowA, "lead axial");
+                        pushLeadSegR(elbowA, pOut, "lead radial");
+                    } else {
+                        pushLeadSegR(pOut, elbowA, "lead radial");
+                        pushLeadSegR(elbowA, pCross, "lead axial");
+                    }
+                    return;
+                }
+                const bool toroDiag = std::getenv("MVB_TORO_DIAG") != nullptr;
+                const double worstA = routeWorst(elbowA);
+                if (toroDiag)
+                    std::cerr << "[toro]   lead '" << who << "' routeA worst=" << worstA
+                              << " culprit=" << worstWhat << " turn=" << worstTurn
+                              << " leg=" << (worstLeg == 0 ? "radial" : "axial") << "\n";
+                gp_Pnt elbow;
+                bool routed = false;
+                double bestShort = worstA;   // least-bad shortfall, for the error message
+                if (worstA >= -kContactTol) {
+                    elbow = elbowA;
+                    routed = true;
+                } else {
+                    // Slant LADDER, depth x azimuth: clearance past rim-hugging chords/tubes
+                    // varies with slant depth (32 um short at one depth clears a hair deeper),
+                    // and the free gap sits BETWEEN neighbouring tubes, so the route may also
+                    // rotate by fractions of the wire pitch (a real part's lead is dressed into
+                    // exactly that gap; measured 9 um short at the crossing azimuth on the
+                    // full-single-layer T40 that a third of a pitch clears).
+                    const double rMax = std::min(0.55 * crossR, minCrossR - 1.5 * od);
+                    const double azPitch = od / crossR;   // one wire od at the crossing radius
+                    for (double f : {1.0, 0.75, 0.5, 0.3, 0.15}) {
+                        const double rDrop = rMax * f;
+                        if (rDrop <= wireRadius) break;
+                        for (double g : {0.0, -1.0 / 3, 1.0 / 3, -2.0 / 3, 2.0 / 3}) {
+                            const double ca = std::cos(g * azPitch), sa = std::sin(g * azPitch);
+                            const gp_XY dirR(dir.X() * ca - dir.Y() * sa,
+                                             dir.X() * sa + dir.Y() * ca);
+                            const gp_Pnt elbowB(dirR.X() * rDrop, level, dirR.Y() * rDrop);
+                            const gp_Pnt outB(dirR.X() * beyondR, level, dirR.Y() * beyondR);
+                            const double worstB = routeWorst2(elbowB, outB);
+                            if (toroDiag)
+                                std::cerr << "[toro]     slant f=" << f << " g=" << g
+                                          << " worst=" << worstB << " culprit=" << worstWhat
+                                          << " turn=" << worstTurn << "\n";
+                            bestShort = std::max(bestShort, worstB);
+                            if (worstB >= -kContactTol) {
+                                elbow = elbowB;
+                                pOut = outB;
+                                routed = true;
+                                break;
+                            }
+                        }
+                        if (routed) break;
+                    }
+                }
+                if (!routed)
+                    throw std::runtime_error(
+                        "ConductorBuilder: no clear terminal-lead route for '" + who +
+                        "': the straight 90-degree drop interferes with the winding by " +
+                        std::to_string(-worstA) +
+                        " m and every hole-centre slant depth by >= " + std::to_string(-bestShort) +
+                        " m (last-checked worst obstacle: " + worstWhat + " of turn " +
+                        std::to_string(worstTurn) + " vs " +
+                        (worstLeg == 0 ? "radial" : "axial") +
+                        " leg; bare-copper envelopes). The layout reserves no lead corridor "
+                        "(dense/multi-layer toroid hole); turn positions are never moved -- "
+                        "fix the winding data or the MKF blocking (MKF ABT #187).");
                 auto pushLeadSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* wh) {
                     if (a.Distance(b) < 1e-12) return;
                     Primitive pr;
@@ -4194,23 +4732,43 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     path.prims.push_back(std::move(pr));
                 };
                 if (isExit) {   // crossing -> up out of the hole -> radial out
-                    pushLeadSeg(pCross, pElbow, "lead axial");
-                    pushLeadSeg(pElbow, pOut, "lead radial");
+                    pushLeadSeg(pCross, elbow, "lead axial");
+                    pushLeadSeg(elbow, pOut, "lead radial");
                 } else {        // radial in -> down into the hole -> crossing (feeds turn 0)
-                    pushLeadSeg(pOut, pElbow, "lead radial");
-                    pushLeadSeg(pElbow, pCross, "lead axial");
+                    pushLeadSeg(pOut, elbow, "lead radial");
+                    pushLeadSeg(elbow, pCross, "lead axial");
                 }
             };
 
-            emitToroLead(first, /*isExit=*/false, 0, path.name + " entrance");
-
+            // WRAPS FIRST, leads after: the lead router validates candidates against the
+            // emitted primitives, so the winding must exist before its terminals are dressed.
+            // A ring change is the Z-connection transition (dragback over the top); everything
+            // else is a normal poloidal wrap.
             for (size_t i = 0; i + 1 < turns.size(); ++i) {
-                appendToroWrap(path, toroCross(turns[i]), toroCross(turns[i + 1]),
-                               wireRadius, wrapDepthOds(i) * od,
-                               "wrap '" + turns[i]->get_name() + "' -> '" +
-                                   turns[i + 1]->get_name() + "'",
-                               i);
+                const ToroCross c0 = toroCross(turns[i]), c1 = toroCross(turns[i + 1]);
+                const int r0 = ringIndexOfInner(toroCrossRaw(turns[i]).pin);
+                const int r1 = ringIndexOfInner(toroCrossRaw(turns[i + 1]).pin);
+                const std::string wlabel = "wrap '" + turns[i]->get_name() + "' -> '" +
+                                           turns[i + 1]->get_name() + "'";
+                if (std::getenv("MVB_TORO_DIAG"))
+                    std::cerr << "[toro]   wrap " << i << "->" << i + 1
+                              << (r0 != r1 ? " TRANSITION" : "") << " topH=" << c0.tube + wireRadius
+                              << " azOut=" << std::atan2(c0.pout.Y(), c0.pout.X()) * 180.0 / kPi
+                              << " azNextIn=" << std::atan2(c1.pin.Y(), c1.pin.X()) * 180.0 / kPi
+                              << "\n";
+                if (r0 != r1)
+                    appendToroTransitionBand(path, c0, c1, wireRadius,
+                                             std::max(0, std::max(r0, r1) - 1) * od,
+                                             0.5 * (maxInnerRadial + minRawOuter), wlabel, i);
+                else
+                    appendToroWrap(path, c0, c1, wireRadius, wrapDepthOds(i) * od, wlabel, i);
             }
+
+            const size_t wrapPrimCount = path.prims.size();
+            emitToroLead(first, /*isExit=*/false, 0, path.name + " entrance");
+            // The entrance is the chain's HEAD: rotate its prims (appended above) to the front
+            // so primitive order stays electrically continuous end-to-end.
+            std::rotate(path.prims.begin(), path.prims.begin() + wrapPrimCount, path.prims.end());
 
             emitToroLead(last, /*isExit=*/true, turns.size() - 1, path.name + " exit");
 
@@ -4289,6 +4847,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // conservative correct bound is the THIN half-dimension.
             const double absorbTol = rectWire
                 ? 0.5 * std::min(path.wireWidth, path.wireHeight) : wireRadius;
+            if (std::getenv("MVB_DIAG")) {
+                std::cerr << "[lead-wp] " << path.name << " " << what << " absorbTol="
+                          << absorbTol << " wr=" << wireRadius << " wp:";
+                for (const auto& q : wp) std::cerr << " (" << q.x << "," << q.y << ")";
+                std::cerr << "\n";
+            }
             for (size_t i = 1; i + 1 < wp.size(); ++i) {
                 if (std::hypot(wp[i].x - kept.back().x, wp[i].y - kept.back().y) <
                         absorbTol ||
