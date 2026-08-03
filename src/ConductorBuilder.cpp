@@ -3560,9 +3560,122 @@ bool isZReturn(const PlanePt& s, const PlanePt& n, double wireRadius, double med
 // beyond the far end. That is also how a real crossover is routed when the turns cannot
 // locally bulge. corridorIdx staggers the end-run lanes of a winding's parallel strands
 // (which transition in lockstep and would otherwise coincide).
+// A dragback the wrap must ride OVER: its azimuth, and the height the wire is lifted there.
+struct WrapBump {
+    double azimuth = 0.0;   // the dragback's azimuth; the raised half-turn is centred on it
+    // How far the wire is RAISED, as a distance. Not a count of dragbacks: the wire that laid
+    // the dragback sets the clearance needed, and different windings use different wire.
+    double distance = 0.0;
+};
+
+// Emit a helical sweep (r,y linear in azimuth) that RIDES OVER the given dragbacks: plain helix,
+// a cosine-blended ramp out, a blended ramp back in, plain helix. The blend's end tangents are
+// purely azimuthal, so the pieces meet tangentially and the conformal assembler sees no corner.
+void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart, double r1,
+                       double y1, double azEnd, const std::vector<WrapBump>& bumps,
+                       double wireRadius, const std::string& label, size_t ordinal,
+                       bool isConnection) {
+    auto radiusAt = [&](double az) {
+        const double t = (az - azStart) / (azEnd - azStart);
+        return r0 + (r1 - r0) * t;
+    };
+    auto heightAt = [&](double az) {
+        const double t = (az - azStart) / (azEnd - azStart);
+        return y0 + (y1 - y0) * t;
+    };
+    auto pushPiece = [&](double a0, double a1, double ra, double rb, double ya, double yb,
+                         bool blend, const char* suffix, double cz = 0.0) {
+        if (a1 - a0 < 1e-12) return;
+        Primitive pr;
+        // A piece at constant radius AND constant height is a plain circular arc, not a helix:
+        // the spiral machinery degenerates on it (zero pitch leaves a zero-length line in the
+        // cylinder's parameter space, and the pipe sweep then fails outright). The dragback's
+        // run-out and run-in are exactly this case whenever no bump falls inside them.
+        if (std::abs(rb - ra) < 1e-12 && std::abs(yb - ya) < 1e-12) {
+            pr.kind = Primitive::ARC3;
+            pr.arc.c = gp_Pnt(0, ya, cz);
+            pr.arc.axis = gp_XYZ(0, 1, 0);
+            pr.arc.v0 = azPointC(0, cz, ra, ya, a0).XYZ() - pr.arc.c.XYZ();
+            pr.arc.sweep = a1 - a0;
+        }
+        else {
+            pr.kind = Primitive::SPIRAL;
+            pr.spiral = {0, cz, ra, ya, a0, rb, yb, a1};
+            pr.spiral.blend = blend;
+        }
+        pr.label = label + suffix;
+        pr.turnOrdinal = ordinal;
+        pr.isConnection = isConnection;
+        path.prims.push_back(std::move(pr));
+    };
+    // Total raise for this sweep: dragbacks share the +Z azimuth, so their clearances add.
+    double raise = 0.0, azBump = 0.0;
+    for (const auto& bmp : bumps) {
+        raise += bmp.distance;
+        azBump = bmp.azimuth;
+    }
+    if (raise <= 0.0) {
+        pushPiece(azStart, azEnd, r0, r1, y0, y1, false, "");
+        return;
+    }
+    // Bring the bump azimuth into this sweep's span.
+    while (azBump < azStart) azBump += kTwoPi;
+    while (azBump > azEnd) azBump -= kTwoPi;
+    // A QUARTER at the layer's own radius, a straight radial step OUT, a HALF turn riding over
+    // the dragback, a straight step back IN, and a final quarter -- the shape a wire actually
+    // takes over a return lying under it. The raised half is centred on the dragback so the
+    // steps land a quarter turn either side of it, clear of the wire being crossed.
+    // A sweep that starts or ends AT the dragback (the return's own run-out and run-in do
+    // exactly that) cannot seat a step on that side, so it simply starts or ends already raised.
+    const double a1 = std::max(azBump - kPi / 2.0, azStart);
+    const double a2 = std::min(azBump + kPi / 2.0, azEnd);
+    const bool stepOut = a1 > azStart + 1e-9, stepIn = a2 < azEnd - 1e-9;
+    if (a2 - a1 < 1e-9) {
+        pushPiece(azStart, azEnd, r0, r1, y0, y1, false, "");
+        return;
+    }
+    // The step is along the GLOBAL Z AXIS, starting in the XY plane: at the two z=0 crossings
+    // (a quarter turn either side of the dragback) the wire lifts straight towards +Z by the
+    // bump length. The raised half turn is then the SAME circle with its centre shifted +Z, so
+    // the wire keeps its curvature and simply passes to the side of the dragback instead of
+    // bulging radially outward.
+    auto pushZStep = [&](double az, double radius, double czFrom, double czTo, const char* suffix) {
+        const double y = heightAt(az);
+        Primitive pr;
+        pr.kind = Primitive::SEG;
+        pr.seg = {azPointC(0, czFrom, radius, y, az), azPointC(0, czTo, radius, y, az)};
+        pr.label = label + suffix;
+        pr.turnOrdinal = ordinal;
+        pr.isConnection = isConnection;
+        path.prims.push_back(std::move(pr));
+    };
+    if (stepOut) {
+        pushPiece(azStart, a1, radiusAt(azStart), radiusAt(a1), heightAt(azStart), heightAt(a1),
+                  false, "");
+        pushZStep(a1, radiusAt(a1), 0.0, raise, " (bump out)");
+    }
+    pushPiece(a1, a2, radiusAt(a1), radiusAt(a2), heightAt(a1), heightAt(a2), false,
+              " (over dragback)", raise);
+    if (stepIn) {
+        pushZStep(a2, radiusAt(a2), raise, 0.0, " (bump in)");
+        pushPiece(a2, azEnd, radiusAt(a2), r1, heightAt(a2), y1, false, "");
+    }
+}
+
+// How far a sweep ends RAISED above its nominal radius (0 unless it ends inside a bump).
+double sweepEndRaise(double azStart, double azEnd, const std::vector<WrapBump>& bumps) {
+    double raise = 0.0, azBump = 0.0;
+    for (const auto& bmp : bumps) { raise += bmp.distance; azBump = bmp.azimuth; }
+    if (raise <= 0.0) return 0.0;
+    while (azBump < azStart) azBump += kTwoPi;
+    while (azBump > azEnd) azBump -= kTwoPi;
+    return (azBump + kPi / 2.0 >= azEnd - 1e-9) ? raise : 0.0;
+}
+
 void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
                      double wireRadius, const std::string& label, size_t ordinal,
-                     double azUnder = 0.0, double azOver = 0.0) {
+                     double azUnder = 0.0, double azOver = 0.0,
+                     const std::vector<WrapBump>& bumps = {}) {
     if (std::abs(n.x - s.x) > wireRadius && std::abs(n.y - s.y) <= std::abs(n.x - s.x)) {
         Primitive step;
         step.kind = Primitive::SEG;
@@ -3586,10 +3699,9 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
     // stubs are locally coaxial with the wrap and degenerate the weld. Overshooting the wrap
     // itself puts a HALF-TUBE lens through the lead, entirely on the wire's own centreline
     // extension -- no clearance spent, no envelope change worth naming.
-    wrap.spiral = {0, 0, s.x, s.y, kPlaneAz - azUnder, n.x, n.y, kPlaneAz + kTwoPi + azOver};
-    wrap.label = label;
-    wrap.turnOrdinal = ordinal;
-    path.prims.push_back(std::move(wrap));
+    const double azStart = kPlaneAz - azUnder, azEnd = kPlaneAz + kTwoPi + azOver;
+    appendBumpedSweep(path, s.x, s.y, azStart, n.x, n.y, azEnd, bumps, wireRadius, label, ordinal,
+                      /*isConnection=*/false);
 }
 
 // ---- Z-return END-RUN planning (round columns) ------------------------------------------
@@ -3701,6 +3813,44 @@ struct PendingZ {
     PlanePt s, n;
     std::string label;
 };
+
+// PHYSICAL Z DRAGBACK (round columns). When a layer finishes, the wire must get back to the
+// start of the next layer. A real winder does not detour around the whole coil: the wire keeps
+// wrapping to the far side, steps out by one wire OD onto the layer it just finished, runs
+// AXIALLY back along it -- that axial run is the dragback -- and wraps in to the next layer's
+// first station. The layer wound afterwards then rides over that dragback, which is what
+// appendRoundWrap's bumps model.
+//
+// The dragback sits on the +Z half (opposite the terminal-lead plane at kPlaneAz), and successive
+// transitions are SPREAD across that half rather than stacked on one azimuth: a stacked return
+// makes every layer above bump at the same place, compounding into a bulge of (layers-1) ODs.
+void appendZDragback(ConductorPath& path, const PlanePt& s, const PlanePt& n, double wireRadius,
+                     double azD, const std::string& label, size_t ordinal,
+                     const std::vector<WrapBump>& bumpsOut,
+                     const std::vector<WrapBump>& bumpsIn) {
+    // The run-out and run-in are themselves wraps lying on a layer, so they ride over any
+    // dragback already laid on that layer exactly as the turns do.
+    // Wrap on the finishing layer, from the station plane round to the dragback azimuth.
+    appendBumpedSweep(path, s.x, s.y, kPlaneAz, s.x, s.y, azD, bumpsOut, wireRadius,
+                      label + " (dragback run-out)", ordinal, /*isConnection=*/true);
+    // Step out onto the finished layer, run axially back, both at the dragback azimuth. Rounded
+    // corners, like every other junction.
+    // The dragback lies on a surface that earlier dragbacks have ALREADY lifted: at the +Z axis
+    // the layer below it is offset by their accumulated bump length, so this return's own Z
+    // coordinate must carry that offset too -- otherwise it is laid straight through the wire
+    // that is bumping over its predecessor.
+    const double czOut = sweepEndRaise(kPlaneAz, azD, bumpsOut);
+    double czIn = 0.0;
+    for (const auto& bmp : bumpsIn) czIn += bmp.distance;
+    std::vector<gp_Pnt> chain{azPointC(0, czOut, s.x, s.y, azD),
+                              azPointC(0, czIn, n.x, s.y, azD),
+                              azPointC(0, czIn, n.x, n.y, azD)};
+    appendFilletedPolyline(path.prims, chain, wireRadius, label + " (dragback)", ordinal,
+                           /*isLead=*/false, /*isConnection=*/true);
+    // Wrap in on the next layer, arriving at its first station.
+    appendBumpedSweep(path, n.x, n.y, azD, n.x, n.y, kPlaneAz + kTwoPi, bumpsIn, wireRadius,
+                      label + " (dragback run-in)", ordinal, /*isConnection=*/true);
+}
 
 std::vector<Primitive> buildZEndRun(const PlanePt& s, const PlanePt& n, double azA, double azOff,
                                     bool outFwd, bool homeFwd, double rOut, double yEnd,
@@ -5168,14 +5318,54 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // Wraps between consecutive crossings. Z-returns are only RECORDED here (the connecting
         // end-run is planned after every conductor is built, against the full obstacle field —
         // see planZEndRuns); ordinary wraps and serpentine links are appended directly.
+        // Z DRAGBACKS: one azimuth per transition, SPREAD over the +Z half (opposite the
+        // terminal-lead plane). Stacking every return on one azimuth would make each layer above
+        // bump at the same place, compounding into a bulge of (layers-1) wire ODs; spreading
+        // keeps every bump a single OD. Assigned up front so the wraps -- emitted in the same
+        // pass -- already know which dragbacks they must ride over.
+        std::map<size_t, double> zDragbackAzimuth;
+        if (effectivelyRound) {
+            std::vector<size_t> zAt;
+            for (size_t i = 0; i + 1 < turns.size(); ++i)
+                if (isZReturn(station(turns[i]), station(turns[i + 1]), wireRadius, medianPitch))
+                    zAt.push_back(i);
+            // ALWAYS the +Z axis (opposite the terminal-lead plane at kPlaneAz). Spreading the
+            // returns around that half was tried and dropped: a dragback is poor practice to
+            // begin with, so a design carries one or two, and the compounding a shared azimuth
+            // could cause never materialises at that count.
+            for (size_t m : zAt) zDragbackAzimuth[m] = kPlaneAz + kPi;
+        }
+        // Dragbacks already laid down (azimuth + the radius their axial run occupies). A turn
+        // rides over every dragback at or inside its own radius.
+        std::vector<std::pair<double, double>> laidDragbacks;
+        auto bumpsForTurn = [&](double turnRadius) {
+            std::vector<WrapBump> out;
+            for (const auto& [az, radius] : laidDragbacks) {
+                if (turnRadius < radius - wireRadius) continue;
+                // Raise by the dragback wire's own diameter: that is what has to be cleared.
+                out.push_back({az, 2.0 * wireRadius});
+            }
+            return out;
+        };
+        const bool dragDiag = std::getenv("MVB_DRAG_DIAG") != nullptr;
         for (size_t i = 0; i + 1 < turns.size(); ++i) {
             PlanePt s = station(turns[i]);
             PlanePt nxt = station(turns[i + 1]);
             std::string label = "wrap '" + turns[i]->get_name() + "' -> '" +
                                 turns[i + 1]->get_name() + "'";
+            if (effectivelyRound && dragDiag) {
+                double raise = 0.0;
+                for (const auto& bmp : bumpsForTurn(s.x)) raise += bmp.distance;
+                std::cerr << "[drag] turn " << i << " r=" << s.x << " y=" << s.y
+                          << (zDragbackAzimuth.count(i) ? " DRAGBACK" : "")
+                          << " bumpLength=" << raise << " laid=" << laidDragbacks.size() << "\n";
+            }
             if (effectivelyRound) {
-                if (isZReturn(s, nxt, wireRadius, medianPitch) && !allRings.empty()) {
-                    pendingZ.push_back({paths.size(), path.prims.size(), i, s, nxt, label});
+                auto zit = zDragbackAzimuth.find(i);
+                if (zit != zDragbackAzimuth.end()) {
+                    appendZDragback(path, s, nxt, wireRadius, zit->second, label, i,
+                                    bumpsForTurn(s.x), bumpsForTurn(nxt.x));
+                    laidDragbacks.push_back({zit->second, nxt.x});
                     continue;
                 }
                 const bool weldable = path.femReady && turns.size() > 1 &&
@@ -5196,7 +5386,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                    ? 0.75 * wireRadius / s.x : 0.0;
                 const double azO = (weldable && isBreakAt(i + 1) && nxt.x > 1e-9)
                                    ? 0.75 * wireRadius / nxt.x : 0.0;
-                appendRoundWrap(path, s, nxt, wireRadius, label, i, azU, azO);
+                appendRoundWrap(path, s, nxt, wireRadius, label, i, azU, azO,
+                                bumpsForTurn(s.x));
             } else if (columnShape == MAS::ColumnShape::RECTANGULAR) {
                 {
                     // Extents the end-run must clear, over EVERY winding in the window
