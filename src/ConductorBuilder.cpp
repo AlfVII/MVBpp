@@ -3879,67 +3879,9 @@ double toroWrapDepth(const ToroCross& c0, const ToroCross& c1, double /*bend*/) 
     return std::max(c0.tube, c1.tube);
 }
 
-// Shortest planar path from A to B around the clearance disc (centre T, radius R): the two
-// external tangent segments plus the wrapped arc, on the side the straight chord passes. Returns
-// {T1, T2, sweepSign} tangent points; empty when the straight chord already clears or an endpoint
-// owns the disc (the chord IS the connection's own wire).
-struct ChordDodge {
-    bool needed = false;
-    gp_XY t1, t2;
-};
-static ChordDodge computeChordDodge(const gp_XY& A, const gp_XY& B, const gp_XY& T, double R,
-                                    double triggerR, double bend, const std::string& label) {
-    ChordDodge dodge;
-    auto seg = B - A;
-    const double len2 = seg.SquareModulus();
-    if (len2 < 1e-18) return dodge;
-    double t = std::max(0.0, std::min(1.0, ((T - A).Dot(seg)) / len2));
-    gp_XY closest = A + seg * t;
-    // Dressing TRIGGERS only when the straight chord would fail the collision gate's own
-    // criterion (bare copper minus the sag allowance): a shallow coated-envelope graze that
-    // the gate accepts keeps the straight chord -- dressing it would produce a sliver arc
-    // with no room for its corners. Once triggered, the dressing restores the FULL coated
-    // clearance R (the wire lies against the connection exactly as wound).
-    if ((closest - T).Modulus() >= triggerR - kContactTol) return dodge;
-    if ((A - T).Modulus() < bend || (B - T).Modulus() < bend) return dodge;  // own connection
-    const double dA = (A - T).Modulus(), dB = (B - T).Modulus();
-    // Touching the clearance disc (d == R) is legal wire-on-wire contact; only genuine
-    // penetration is unrealizable.
-    if (dA < triggerR - kContactTol || dB < triggerR - kContactTol) {
-        throw std::runtime_error(
-            "ConductorBuilder: face run of " + label +
-            " starts/ends INSIDE the terminal connection's clearance disc (d=" +
-            std::to_string(std::min(dA, dB)) + " m < " + std::to_string(triggerR) +
-            " m); the station layout leaves no room to dress the wire around the connection");
-    }
-    // External tangent points from A and from B, on the side of the straight chord.
-    const double side = (seg.X() * (T.Y() - A.Y()) - seg.Y() * (T.X() - A.X())) >= 0 ? 1.0 : -1.0;
-    auto tangentPoint = [&](const gp_XY& P, double sideSign) {
-        gp_XY v = P - T;
-        double d = std::max(v.Modulus(), R);   // touching endpoint: tangent point IS the endpoint
-        double cosA = R / d, sinA = std::sqrt(std::max(0.0, 1.0 - cosA * cosA)) * sideSign;
-        gp_XY u = v / d;
-        return gp_XY(T.X() + R * (u.X() * cosA - u.Y() * sinA),
-                     T.Y() + R * (u.X() * sinA + u.Y() * cosA));
-    };
-    // The wrap side: the arc bulges AWAY from the straight chord's near side, i.e. the tangent
-    // points sit on the opposite side of T from `closest`. Pick each endpoint's tangent whose
-    // arc stays on that consistent side (sign of the tangency rotation follows the chord side).
-    dodge.t1 = tangentPoint(A, side);
-    dodge.t2 = tangentPoint(B, -side);
-    dodge.needed = true;
-    return dodge;
-}
-
-// dropBelowXY / dropAboveXY: the conductor's own terminal-connection verticals (entrance
-// descends BELOW the core at its first station, exit ascends ABOVE at its last). A face chord
-// passing within one wire OD of the matching vertical is DRESSED AROUND it -- tangent line,
-// clearance arc, tangent line -- exactly as a winder lays later wire around the already-placed
-// connection. Turn stations are never moved; only the run between them detours.
 void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c1,
                     double bend, double bottomExtraDepth, const std::string& label,
-                    size_t ordinal, std::optional<gp_XY> dropBelowXY = std::nullopt,
-                    std::optional<gp_XY> dropAboveXY = std::nullopt) {
+                    size_t ordinal) {
     auto P = [](const gp_XY& h, double y) { return gp_Pnt(h.X(), y, h.Y()); };
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
@@ -3978,122 +3920,9 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     double t0 = c0.tube, rh0 = t0 + b;
 
     pushSeg(P(c0.pin, 0), P(c0.pin, t0), "inner tube up");
-    // Emit a face chord from chordA to chordB at height y with entry/exit corner arcs bending
-    // from/to the vertical, dodging around a terminal vertical when one blocks the straight run.
-    auto pushChordRun = [&](const gp_XY& fullA, const gp_XY& fullB, double tubeY, double chordY,
-                            bool topSide, const std::optional<gp_XY>& dropXY,
-                            const char* cornerAName, const char* chordName,
-                            const char* cornerBName) {
-        gp_XY runDir = fullB - fullA;
-        double runLen = runDir.Modulus();
-        runDir.Divide(runLen);
-        ChordDodge dodge;
-        // RECT wire keeps the straight chord: the round clearance-disc model over-rejects flat
-        // sections that legitimately nest closer than their circumscribed circles (the collision
-        // gate checks rect pairs with the correct axial/in-plane split and still guards).
-        if (dropXY && !path.isRectangular) {
-            const double bare = path.condRadius > 0 ? path.condRadius : b;
-            const double gateClearance =
-                2.0 * bare - kMaxSagFraction * 2.0 * bare - kContactTol;
-            // Dress at 2.25b, not the bare 2b envelope: a corner that consumes an arc end sits
-            // on the CHORD of the eaten span and dips b^2/(2R) inside the dressing circle --
-            // at 2.25b the dip bottoms out at 2.03b, still clear of the coated envelope.
-            dodge = computeChordDodge(fullA, fullB, *dropXY, 2.25 * b, gateClearance, b, label);
-        }
-        const double vSign = topSide ? 1.0 : -1.0;   // corners curl up on top, down on bottom
-        auto cornerIn = [&](const gp_XY& at, const gp_XY& dirXY, const char* what) {
-            gp_XYZ d3c(dirXY.X(), 0, dirXY.Y());
-            pushArc(P(at + dirXY * b, tubeY), topSide ? yHat.Crossed(d3c) : d3c.Crossed(yHat),
-                    d3c * (-b), what);
-        };
-        auto cornerOut = [&](const gp_XY& at, const gp_XY& dirXY, const char* what) {
-            gp_XYZ d3c(dirXY.X(), 0, dirXY.Y());
-            pushArc(P(at - dirXY * b, tubeY), topSide ? yHat.Crossed(d3c) : d3c.Crossed(yHat),
-                    yHat * (vSign * b), what);
-        };
-        if (!dodge.needed) {
-            cornerIn(fullA, runDir, cornerAName);
-            pushSeg(P(fullA + runDir * b, chordY), P(fullB - runDir * b, chordY), chordName);
-            cornerOut(fullB, runDir, cornerBName);
-            return;
-        }
-        // Dressed around the terminal vertical: leg, clearance arc, leg — tangent junctions.
-        // When an endpoint TOUCHES the clearance disc the tangent leg degenerates to zero and
-        // cannot host its corner; the corner then consumes the matching END of the dressing arc
-        // (shortened by the corner's angular share b/R) and bends straight off the arc's tangent.
-        // The corner's start sits a sagitta (~b/4) off the true curved path — inside the mitre
-        // machinery's endpoint-bridging tolerance, and the junction angle is a mitre-cut corner.
-        const gp_XY& T = *dropXY;
-        const double R = 2.25 * b;
-        gp_XY dirA = dodge.t1 - fullA;
-        double lenA = dirA.Modulus();
-        gp_XY dirB = fullB - dodge.t2;
-        double lenB = dirB.Modulus();
-        gp_XYZ v0(dodge.t1.X() - T.X(), 0, dodge.t1.Y() - T.Y());
-        gp_XYZ v1(dodge.t2.X() - T.X(), 0, dodge.t2.Y() - T.Y());
-        double sweep = std::atan2(v0.Crossed(v1).Dot(gp_XYZ(0, 1, 0)), v0.Dot(v1));
-        const double sSign = sweep < 0 ? -1.0 : 1.0;
-        auto arcTravelTangent = [&](const gp_XYZ& v) {
-            gp_XY t(v.Z() * sSign, -v.X() * sSign);   // s * (Y x v), build (x,z) -> gp_XY
-            double m = t.Modulus();
-            t.Divide(m > 1e-15 ? m : 1.0);
-            return t;
-        };
-        const bool cornerEatsStart = lenA <= b;
-        const bool cornerEatsEnd = lenB <= b;
-        // A corner that cannot fit on a tangent leg anchors DIRECTLY at the endpoint, oriented
-        // along the clearance circle's tangent AT THAT ENDPOINT (perpendicular to its radius from
-        // the connection): its body then stays at sqrt(d^2 + b^2) >= d from the connection. The
-        // dressing arc is trimmed to end where the corner starts.
-        if (cornerEatsStart) {
-            dirA = arcTravelTangent(gp_XYZ(fullA.X() - T.X(), 0, fullA.Y() - T.Y()));
-            gp_XY cornerEndA = fullA + dirA * b;
-            gp_XYZ v0n(cornerEndA.X() - T.X(), 0, cornerEndA.Y() - T.Y());
-            double m0 = std::hypot(v0n.X(), v0n.Z());
-            v0 = v0n * (R / m0);
-        }
-        else {
-            dirA.Divide(lenA);
-        }
-        if (cornerEatsEnd) {
-            dirB = arcTravelTangent(gp_XYZ(fullB.X() - T.X(), 0, fullB.Y() - T.Y()));
-            gp_XY cornerStartB = fullB - dirB * b;
-            gp_XYZ v1n(cornerStartB.X() - T.X(), 0, cornerStartB.Y() - T.Y());
-            double m1 = std::hypot(v1n.X(), v1n.Z());
-            v1 = v1n * (R / m1);
-        }
-        else {
-            dirB.Divide(lenB);
-        }
-        if (cornerEatsStart || cornerEatsEnd) {
-            sweep = std::atan2(v0.Crossed(v1).Dot(gp_XYZ(0, 1, 0)), v0.Dot(v1));
-            if (sweep * sSign < 0)
-                throw std::runtime_error("ConductorBuilder: connection-dressing arc of " + label +
-                                         " vanished under its corners");
-        }
-        cornerIn(fullA, dirA, cornerAName);
-        if (!cornerEatsStart)
-            pushSeg(P(fullA + dirA * b, chordY), P(dodge.t1, chordY),
-                    (std::string(chordName) + " to dressing").c_str());
-        if (std::abs(sweep) > 1e-12) {
-            Primitive pr;
-            pr.kind = Primitive::ARC3;
-            pr.arc.c = gp_Pnt(T.X(), chordY, T.Y());
-            pr.arc.axis = gp_XYZ(0, 1, 0);
-            pr.arc.v0 = v0;
-            pr.arc.sweep = sweep;
-            pr.label = label + std::string(" ") + chordName + " dressing arc";
-            pr.turnOrdinal = ordinal;
-            path.prims.push_back(std::move(pr));
-        }
-        if (!cornerEatsEnd)
-            pushSeg(P(gp_XY(T.X() + v1.X(), T.Y() + v1.Z()), chordY), P(fullB - dirB * b, chordY),
-                    (std::string(chordName) + " from dressing").c_str());
-        cornerOut(fullB, dirB, cornerBName);
-    };
-
-    pushChordRun(c0.pin, c0.pout, t0, rh0, /*topSide=*/true, dropAboveXY,
-                 "top inner corner", "top chord", "top outer corner");
+    pushArc(P(c0.pin + dH * b, t0), yHat.Crossed(d3), d3 * (-b), "top inner corner");
+    pushSeg(P(c0.pin + dH * b, rh0), P(c0.pout - dH * b, rh0), "top chord");
+    pushArc(P(c0.pout - dH * b, t0), yHat.Crossed(d3), yHat * b, "top outer corner");
 
     // Bottom half: turn k-1's outer leg to turn k's inner leg. Both corners swing PURELY
     // RADIALLY (parallel among packed neighbours — a corner swung toward the per-turn
@@ -4128,8 +3957,9 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     // (the radial-swing + Dubins routing this replaces was for same-depth rings and
     // clipped tightly-packed neighbours).
     pushSeg(P(c0.pout, t0), P(c0.pout, -tb), "outer tube down");
-    pushChordRun(c0.pout, c1.pin, -tb, -rhb, /*topSide=*/false, dropBelowXY,
-                 "bottom outer corner", "bottom chord", "bottom inner corner");
+    pushArc(P(c0.pout + eH * b, -tb), e3.Crossed(yHat), e3 * (-b), "bottom outer corner");
+    pushSeg(P(c0.pout + eH * b, -rhb), P(c1.pin - eH * b, -rhb), "bottom chord");
+    pushArc(P(c1.pin - eH * b, -tb), e3.Crossed(yHat), yHat * (-b), "bottom inner corner");
     pushSeg(P(c1.pin, -tb), P(c1.pin, 0), "inner tube up to crossing");
 }
 
@@ -4781,12 +4611,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 std::string worstWhat;
                 size_t worstTurn = 0;
                 int worstLeg = -1;
-                // Clearance basis = the collision gate's own criterion: BARE copper envelopes
-                // minus the sag allowance. Demanding coated clearance here double-counts --
-                // enamel-on-enamel contact is exactly how the wire lies against the dressed
-                // connection -- and the sampled obstacle polylines already cut inside true arcs
-                // by their chord sagitta, so a coated-envelope test false-fails by tens of um.
-                const double bareOwn = path.condRadius > 0 ? path.condRadius : wireRadius;
                 auto routeWorst2 = [&](const gp_Pnt& elbow, const gp_Pnt& out) {
                     double worst = std::numeric_limits<double>::max();
                     const gp_Pnt* poly[3] = {&out, &elbow, &pCross};
@@ -4795,11 +4619,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                             for (size_t q = 0; q + 1 < o.pts.size(); ++q) {
                                 const double d = segSegDistance(*poly[k], *poly[k + 1],
                                                                 o.pts[q], o.pts[q + 1]);
-                                const double bareObst = std::min(o.r, bareOwn + (o.r - wireRadius));
-                                const double required =
-                                    (bareOwn + bareObst) * (1.0 - kMaxSagFraction);
-                                if (d - required < worst) {
-                                    worst = d - required;
+                                if (d - (wireRadius + o.r) < worst) {
+                                    worst = d - (wireRadius + o.r);
                                     worstWhat = o.what;
                                     worstTurn = o.turnIdx;
                                     worstLeg = k;
@@ -4940,9 +4761,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                              std::max(0, std::max(r0, r1) - 1) * od,
                                              0.5 * (maxInnerRadial + minRawOuter), wlabel, i);
                 else
-                    appendToroWrap(path, c0, c1, wireRadius, wrapDepthOds(i) * od, wlabel, i,
-                                   /*dropBelowXY=*/toroCross(turns.front()).pin,
-                                   /*dropAboveXY=*/toroCross(turns.back()).pin);
+                    appendToroWrap(path, c0, c1, wireRadius, wrapDepthOds(i) * od, wlabel, i);
             }
 
             const size_t wrapPrimCount = path.prims.size();
