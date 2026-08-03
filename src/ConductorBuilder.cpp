@@ -4611,6 +4611,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 std::string worstWhat;
                 size_t worstTurn = 0;
                 int worstLeg = -1;
+                // Clearance basis = the collision gate's own criterion: BARE copper envelopes
+                // minus the sag allowance. There is exactly ONE definition of a collision in this
+                // builder (checkCollisions); the router demanding the stricter coated envelope
+                // against SAMPLED obstacle polylines (whose chords cut inside true arcs by their
+                // sagitta) refused routes the gate itself accepts, by tens of microns.
+                const double bareOwn = path.condRadius > 0 ? path.condRadius : wireRadius;
                 auto routeWorst2 = [&](const gp_Pnt& elbow, const gp_Pnt& out) {
                     double worst = std::numeric_limits<double>::max();
                     const gp_Pnt* poly[3] = {&out, &elbow, &pCross};
@@ -4619,8 +4625,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                             for (size_t q = 0; q + 1 < o.pts.size(); ++q) {
                                 const double d = segSegDistance(*poly[k], *poly[k + 1],
                                                                 o.pts[q], o.pts[q + 1]);
-                                if (d - (wireRadius + o.r) < worst) {
-                                    worst = d - (wireRadius + o.r);
+                                const double bareObst = std::min(o.r, bareOwn + (o.r - wireRadius));
+                                const double required =
+                                    (bareOwn + bareObst) * (1.0 - kMaxSagFraction);
+                                if (d - required < worst) {
+                                    worst = d - required;
                                     worstWhat = o.what;
                                     worstTurn = o.turnIdx;
                                     worstLeg = k;

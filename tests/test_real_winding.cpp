@@ -767,8 +767,9 @@ TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean"
     // through). Ring returns are depth-staggered under the core. The three windings must
     // be fully independent bodies with two layers each.
     auto magneticJson = loadFixture("realwinding_cmc_3w_2layer.json");
-    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
-    // Confirm the fixture really is 2 rings per section (else the test is vacuous).
+    // Fixture sanity via the CLASSIC path (the real-winding enrichment refuses this layout,
+    // asserted below): 2 rings per section, else the test is vacuous.
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, false);
     {
         auto layers = enriched.get_coil().get_layers_description();
         REQUIRE(layers.has_value());
@@ -787,13 +788,14 @@ TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean"
     // returns. A real winder lays the lead FIRST and winds layer 2 around it -- rigid MAS turn
     // geometry cannot express that (lead-space reservation is the layout's job, MKF ABT #187),
     // so the routed-lead builder must REFUSE loudly rather than emit overlapping copper.
+    // The refusal now comes from MKF ITSELF: the chord-aware outer-crossing sweep exhausts
+    // every in-section azimuth and reports that the inner-station layout (ring 1 overhanging
+    // the connection corridor) is what blocks -- the fix belongs in the layer spread / turn
+    // distribution, not downstream.
     {
-        mvb::MagneticBuilder twoLayerBuilder;
         REQUIRE_THROWS_WITH(
-            twoLayerBuilder.buildAllNamed(enriched, false, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
-                                          0, true, false, false, 0.0,
-                                          /*useRealWindingGeometry=*/true, /*femReady=*/false),
-            Catch::Matchers::ContainsSubstring("no clear terminal-lead route"));
+            mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true),
+            Catch::Matchers::ContainsSubstring("NO outer-crossing azimuth exists"));
     }
 
     // The 3-winding independence contract is exercised at SINGLE-LAYER sections (9 turns per
