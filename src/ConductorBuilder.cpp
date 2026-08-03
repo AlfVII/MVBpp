@@ -572,7 +572,17 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
 // --- geometry emission ------------------------------------------------------------------
 TopoDS_Wire wireProfileWire(const gp_Pnt& center, const gp_Dir& normal, double radius,
                             int segments) {
-    gp_Ax2 plane(center, normal);
+    // DETERMINISTIC section orientation. gp_Ax2(center, normal) lets OCC choose the X
+    // direction, so two primitives meeting with the SAME tangent could still get n-gons rotated
+    // relative to each other: their abutting faces then only partially coincide, and at a mitre
+    // junction the pieces can miss entirely (measured: a 56-primitive rect-column conductor fell
+    // into 7 components with no endpoint gaps and nothing dropped). Deriving X from a fixed world
+    // reference makes the orientation a pure function of the tangent, so tangent neighbours share
+    // an exactly coincident section -- which is what conformal abutment requires.
+    gp_XYZ ref(0, 1, 0);
+    if (std::abs(normal.XYZ().Dot(ref)) > 0.9) ref = gp_XYZ(1, 0, 0);
+    gp_XYZ xdir = ref - normal.XYZ() * normal.XYZ().Dot(ref);
+    gp_Ax2 plane(center, normal, gp_Dir(xdir));
     if (segments <= 0) {
         gp_Circ circ(plane, radius);
         return BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circ).Edge()).Wire();
@@ -581,6 +591,10 @@ TopoDS_Wire wireProfileWire(const gp_Pnt& center, const gp_Dir& normal, double r
     gp_Dir dx = plane.XDirection();
     gp_Dir dy = plane.YDirection();
     double offset = kPi / segments;
+    // INSCRIBED n-gon (vertices on the nominal circle): the faceted wire never protrudes past
+    // the wire's real envelope, which is what the zero-tolerance pairwise-overlap contracts rely
+    // on. Its flats consequently sit at the apothem, r*cos(pi/n) -- 0.981*r at n=16 -- so any
+    // clearance or coverage check against a faceted section must use the apothem, not r.
     for (int i = 0; i < segments; ++i) {
         double ang = kTwoPi * i / segments + offset;
         gp_XYZ p = center.XYZ() + dx.XYZ() * (radius * std::cos(ang)) +
@@ -2815,11 +2829,18 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
                                            gp_Pnt(ends.second.XYZ() + tB.XYZ() * overB)).Edge());
         if (!mw.IsDone()) return {};
         TopoDS_Wire spine = mw.Wire();
-        TopoDS_Wire prof = wireProfileWire(spineStart, tA, r, segments);
-        BRepOffsetAPI_MakePipeShell ps(spine);
-        ps.Add(prof);
-        ps.Build();
-        if (ps.IsDone() && ps.MakeSolid()) return ps.Shape();
+        // MakePipeShell can refuse a FACETED profile on a spine it sweeps happily with the
+        // round one (the polygon's corners fight the framing on tight blends). Retry exact-round
+        // rather than lose the primitive: a couple of short round-sectioned blends are a far
+        // smaller price than missing copper, and the seam they add is local.
+        for (int prof_segments : {segments, 0}) {
+            TopoDS_Wire prof = wireProfileWire(spineStart, tA, r, prof_segments);
+            BRepOffsetAPI_MakePipeShell ps(spine);
+            ps.Add(prof);
+            ps.Build();
+            if (ps.IsDone() && ps.MakeSolid()) return ps.Shape();
+            if (prof_segments == 0) break;
+        }
     } catch (const Standard_Failure&) {
     }
     return {};
@@ -2933,7 +2954,21 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
             solid = rawGrownSolid(*ptrs[i], wireRadius, 0.0, 0.0, segments);
             bentS = bentE = false;
         }
-        if (solid.IsNull()) continue;
+        if (solid.IsNull()) {
+            // Never skip silently: a missing primitive is missing copper, and its neighbours
+            // may still touch each other so even the connectivity contract can stay satisfied
+            // (measured: faceted blend sweeps returned null and every rect-column turn quietly
+            // detached from the next).
+            static const char* kindName[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
+            const auto ends = primEndpoints(*ptrs[i]);
+            throw std::runtime_error(
+                "ConductorBuilder: the conformal assembler could not sweep primitive " +
+                std::to_string(i) + " (" + kindName[ptrs[i]->kind] + ") '" + ptrs[i]->label +
+                "' (" + std::to_string(ends.first.X()) + "," + std::to_string(ends.first.Y()) +
+                "," + std::to_string(ends.first.Z()) + ")->(" + std::to_string(ends.second.X()) +
+                "," + std::to_string(ends.second.Y()) + "," + std::to_string(ends.second.Z()) +
+                "). Refusing to emit a conductor with missing copper.");
+        }
         if (bentS) {
             const gp_Pnt J(0.5 * (primEndpoints(*ptrs[i - 1]).second.XYZ() +
                                   primEndpoints(*ptrs[i]).first.XYZ()));
@@ -3568,6 +3603,99 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
 // candidate is inserted. Turns are never moved; the return rides its own source/target ring
 // to the lane (exempt adjacent-ordinal contact), runs radially/axially in the free space
 // outside every ring, and re-enters past the winding's end.
+// ROUNDED CORNERS for a round-wire polyline: emit the run as straight legs joined by exact
+// tangent fillet arcs, the same treatment every toroidal corner gets (physical wire bends; a
+// sharp butt leaves the conformal assembler a 90-degree junction, and two tubes merely
+// overlapping there is what a mitred corner is meant to replace).
+//
+// Fillet radius must EXCEED the wire radius: a corner whose CENTRELINE radius equals the wire
+// radius sweeps a HORN TORUS, whose tube touches its own axis of revolution -- OCC cannot build
+// a valid solid from it. Where a leg is too short to host a big enough fillet, that corner is
+// left SHARP rather than rounded with an invalid radius.
+void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pnt>& raw,
+                            double wireRadius, const std::string& labelPrefix, size_t ordinal,
+                            bool isLead, bool isConnection) {
+    std::vector<gp_Pnt> p;
+    for (const auto& q : raw)
+        if (p.empty() || p.back().Distance(q) > 1e-12) p.push_back(q);
+    if (p.size() < 2) return;
+    const size_t n = p.size();
+    const double bTarget = 1.5 * wireRadius;      // > wireRadius: never a horn torus
+    const double bFloor = 1.05 * wireRadius;      // below this a fillet is not buildable
+
+    std::vector<gp_XYZ> dir(n - 1);
+    std::vector<double> len(n - 1);
+    for (size_t i = 0; i + 1 < n; ++i) {
+        gp_XYZ d = p[i + 1].XYZ() - p[i].XYZ();
+        len[i] = d.Modulus();
+        dir[i] = d / len[i];
+    }
+    // Per-corner bend radius and its tangent length, then a pass that shrinks any pair sharing
+    // a leg until both fit; a corner whose radius falls under the floor is dropped (kept sharp).
+    std::vector<double> radius(n, 0.0), tanLen(n, 0.0), halfTan(n, 0.0);
+    for (size_t i = 1; i + 1 < n; ++i) {
+        const double cosT = std::max(-1.0, std::min(1.0, dir[i - 1].Dot(dir[i])));
+        if (cosT > 1.0 - 1e-9) continue;                       // collinear: no corner
+        halfTan[i] = std::sqrt((1.0 - cosT) / (1.0 + cosT));   // tan(turn/2)
+        radius[i] = bTarget;
+        tanLen[i] = bTarget * halfTan[i];
+    }
+    // A fillet may never consume most of a leg: the straight stub that survives is what carries
+    // the run into its endpoint, and a MKF turn crossing sits exactly at a lead's end -- eat the
+    // leg and the arc curves away from the crossing, leaving it outside the copper (measured on
+    // the E-core zigzag and EP oblong leads). Each corner takes at most 40% of its shorter
+    // neighbouring leg, so every leg keeps at least 20% of its length straight.
+    for (size_t i = 1; i + 1 < n; ++i) {
+        if (halfTan[i] <= 0.0) continue;
+        const double cap = 0.4 * std::min(len[i - 1], len[i]);
+        if (tanLen[i] > cap) {
+            tanLen[i] = cap;
+            radius[i] = cap / halfTan[i];
+        }
+    }
+    for (size_t i = 1; i + 1 < n; ++i)
+        if (radius[i] < bFloor) { radius[i] = 0.0; tanLen[i] = 0.0; }
+
+    auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, size_t idx) {
+        if (a.Distance(b) < 1e-12) return;
+        Primitive pr;
+        pr.kind = Primitive::SEG;
+        pr.seg = {a, b};
+        pr.label = labelPrefix + " seg " + std::to_string(idx);
+        pr.turnOrdinal = ordinal;
+        pr.isLead = isLead;
+        pr.isConnection = isConnection;
+        out.push_back(std::move(pr));
+    };
+    for (size_t i = 0; i + 1 < n; ++i) {
+        const gp_Pnt a(p[i].XYZ() + dir[i] * tanLen[i]);
+        const gp_Pnt b(p[i + 1].XYZ() - dir[i] * tanLen[i + 1]);
+        pushSeg(a, b, i);
+        if (i + 2 >= n || tanLen[i + 1] <= 0.0) continue;
+        const size_t c = i + 1;
+        const gp_Pnt tA(p[c].XYZ() - dir[i] * tanLen[c]);
+        const double cosT = std::max(-1.0, std::min(1.0, dir[i].Dot(dir[c])));
+        gp_XYZ normal = dir[c] - dir[i] * cosT;
+        const double nm = normal.Modulus();
+        if (nm < 1e-12) continue;
+        normal /= nm;
+        gp_XYZ axis = dir[i].Crossed(dir[c]);
+        const double am = axis.Modulus();
+        if (am < 1e-12) continue;
+        Primitive pr;
+        pr.kind = Primitive::ARC3;
+        pr.arc.c = gp_Pnt(tA.XYZ() + normal * radius[c]);
+        pr.arc.axis = axis / am;
+        pr.arc.v0 = tA.XYZ() - pr.arc.c.XYZ();
+        pr.arc.sweep = std::acos(cosT);
+        pr.label = labelPrefix + " corner " + std::to_string(c);
+        pr.turnOrdinal = ordinal;
+        pr.isLead = isLead;
+        pr.isConnection = isConnection;
+        out.push_back(std::move(pr));
+    }
+}
+
 struct PendingZ {
     size_t pathIdx = 0, insertAt = 0, ordinal = 0;
     PlanePt s, n;
@@ -4974,18 +5102,26 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 kept.push_back(wp[i]);
             }
             kept.push_back(wp.back());
-            for (size_t i = 0; i + 1 < kept.size(); ++i) {
-                if (std::hypot(kept[i + 1].x - kept[i].x, kept[i + 1].y - kept[i].y) < 1e-12) {
-                    continue;
+            // ROUND wire gets rounded corners (the toroidal treatment); RECT wire keeps the
+            // mitred butt its own machinery expects.
+            std::vector<gp_Pnt> leadPts;
+            leadPts.reserve(kept.size());
+            for (const auto& q : kept) leadPts.push_back(planePoint(q.x, q.y));
+            if (!rectWire) {
+                appendFilletedPolyline(path.prims, leadPts, wireRadius, what, ordinal,
+                                       /*isLead=*/true, /*isConnection=*/false);
+            }
+            else {
+                for (size_t i = 0; i + 1 < leadPts.size(); ++i) {
+                    if (leadPts[i].Distance(leadPts[i + 1]) < 1e-12) continue;
+                    Primitive pr;
+                    pr.kind = Primitive::SEG;
+                    pr.seg = {leadPts[i], leadPts[i + 1]};
+                    pr.label = what + " seg " + std::to_string(i);
+                    pr.turnOrdinal = ordinal;
+                    pr.isLead = true;
+                    path.prims.push_back(std::move(pr));
                 }
-                Primitive pr;
-                pr.kind = Primitive::SEG;
-                pr.seg = {planePoint(kept[i].x, kept[i].y),
-                          planePoint(kept[i + 1].x, kept[i + 1].y)};
-                pr.label = what + " seg " + std::to_string(i);
-                pr.turnOrdinal = ordinal;
-                pr.isLead = true;
-                path.prims.push_back(std::move(pr));
             }
         };
 

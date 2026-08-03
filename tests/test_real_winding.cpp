@@ -488,9 +488,16 @@ void requireCrossingOnCenterline(const TopoDS_Shape& conductor, const gp_Pnt& cr
     INFO(what << " at (" << crossing.X() << "," << crossing.Y() << "," << crossing.Z()
               << "), wire radius " << wireRadius);
     REQUIRE(pointInsideShape(conductor, crossing, 1e-9));
+    // The emitted section is an INSCRIBED n-gon, so its flats lie at the apothem
+    // r*cos(pi/n), not at r (0.981*r at the default 16 segments). Probing at 0.99*r would
+    // land outside the copper along a face normal even for a perfectly centred wire, so the
+    // offset is measured against the apothem -- still a tight centring bound (the probe sits
+    // within ~1% of the real material boundary), just an honest one for a faceted section.
+    const double sectionApothem =
+        wireRadius * std::cos(std::numbers::pi / mvb::DEFAULT_WIRE_POLYGON_SEGMENTS);
     for (const gp_Dir* d : {&perpA, &perpB}) {
         for (double sgn : {1.0, -1.0}) {
-            gp_Pnt probe(crossing.XYZ() + d->XYZ() * (sgn * 0.99 * wireRadius));
+            gp_Pnt probe(crossing.XYZ() + d->XYZ() * (sgn * 0.99 * sectionApothem));
             INFO("perpendicular probe at (" << probe.X() << "," << probe.Y() << ","
                                             << probe.Z() << ")");
             REQUIRE(pointInsideShape(conductor, probe, 1e-9));
