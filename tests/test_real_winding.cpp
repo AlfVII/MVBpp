@@ -788,20 +788,16 @@ TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean"
     // returns. A real winder lays the lead FIRST and winds layer 2 around it -- rigid MAS turn
     // geometry cannot express that (lead-space reservation is the layout's job, MKF ABT #187),
     // so the routed-lead builder must REFUSE loudly rather than emit overlapping copper.
-    // The refusal now comes from MKF ITSELF: the chord-aware outer-crossing sweep exhausts
-    // every in-section azimuth and reports that the inner-station layout (ring 1 overhanging
-    // the connection corridor) is what blocks -- the fix belongs in the layer spread / turn
-    // distribution, not downstream.
-    {
-        REQUIRE_THROWS_WITH(
-            mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true),
-            Catch::Matchers::ContainsSubstring("NO outer-crossing azimuth exists"));
-    }
-
-    // The 3-winding independence contract is exercised at SINGLE-LAYER sections (9 turns per
-    // winding on the same core/wire), where the terminal leads route cleanly.
-    for (auto& w : magneticJson["coil"]["functionalDescription"]) w["numberTurns"] = 9;
-    enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+    // FULL 2-layer build, end-to-end validated. The chain that makes it possible (all in MKF's
+    // layout, per Alf's ruling that the final 3D must come out non-crossing from the winder):
+    // (1) the INPUT-CONNECTION ANGULAR CORRIDOR -- rings after the first surrender the
+    // connection parallels' angular slots at the section-start edge (span shrunk + shifted),
+    // so no later ring places a station behind the connection; (2) per-ring capacity measured
+    // at the ring's own radius (kills the ABT #563 overhang); (3) the outer-crossing sweep
+    // discards candidates whose implied 3D runs would cross a connection vertical. Measured
+    // layout here: ring 0 holds 10 stations from the entrance, ring 1 starts one corridor
+    // later -- and the leads route with the classic 90-degree drop.
+    enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
 
     mvb::MagneticBuilder builder;
     // CMC spread windings stay on the fast drawing compound (femReady=false): the test only asserts
@@ -879,19 +875,21 @@ TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre
     // ABUT on a coincident elliptical face rather than interpenetrating. This is the FEM-meshable
     // (no double material) form of a winding that cannot be a single solid.
     auto magneticJson = loadFixture("realwinding_toroid_3in.json");
-    // At the fixture's full 60 turns the hole packs TWO layers and the inner ring's tube
-    // spacing (1.86 mm) is smaller than the wire od (2 mm): there is no od-wide lead corridor
-    // at ANY azimuth/depth, so the routed-lead builder must REFUSE loudly (turn positions are
-    // never moved; lead space is the layout's to reserve -- MKF ABT #187).
+    // At the fixture's full 60 turns the hole packs TWO layers. Historically this was a hard
+    // refusal (no lead corridor anywhere); with MKF's input-connection angular corridor the
+    // second ring now starts one corridor past the entrance, the layout re-flows, and the FULL
+    // 60-turn build goes through validated -- assert exactly that.
     {
         auto denseEnriched =
             mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
         mvb::MagneticBuilder denseBuilder;
-        REQUIRE_THROWS_WITH(
+        auto denseNamed =
             denseBuilder.buildAllNamed(denseEnriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                        0, true, false, false, 0.0,
-                                       /*useRealWindingGeometry=*/true, /*femReady=*/true),
-            Catch::Matchers::ContainsSubstring("no clear terminal-lead route"));
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+        const auto* denseConductor = findConductor(denseNamed, "Primary parallel 0");
+        REQUIRE(denseConductor != nullptr);
+        requireConformalConductor(denseConductor->shape);
     }
     // The conformal mitre-compound structure is exercised at the densest ROUTABLE packing of
     // the same core/wire: 30 turns = a full single layer (rim gap 0.3 mm).
