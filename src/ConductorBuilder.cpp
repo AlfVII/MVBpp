@@ -2756,14 +2756,25 @@ static gp_Dir primFwdEnd(const Primitive& p, double r) {
 // A round solid for one primitive, grown by overA/overB past its start/end so a tilted bisector
 // plane fully crosses the tube there (SEG -> longer cylinder, ARC3 -> wider revolve, else pipe).
 // A tangent junction passes 0 -> the tube ends flush on a perpendicular cap, no growth, no cut.
-static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, double overB) {
+// segments <= 0 keeps the EXACT round section (analytic cylinders/tori); segments > 0 emits the
+// n-gon prism/revolve. This is not cosmetic: an exact round sweep produces PERIODIC surfaces
+// (seam-carrying cylinders and tori), and gmsh's "Impossible to mesh periodic surface" is a
+// known failure cluster on them -- the faceted section has no seam at all, which is why the
+// pipeline has always meshed with segments=12. The conformal assembler must honour the same
+// knob the retired sweep path did.
+static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, double overB,
+                                  int segments) {
     if (pr.kind == Primitive::SEG) {
         gp_Vec d(pr.seg.a, pr.seg.b);
         double len = d.Magnitude();
         if (len < 1e-12) return {};
         gp_Dir dir(d);
         gp_Pnt a = pr.seg.a.Translated(gp_Vec(dir) * (-overA));
-        return BRepPrimAPI_MakeCylinder(gp_Ax2(a, dir), r, len + overA + overB).Shape();
+        const double total = len + overA + overB;
+        if (segments <= 0)
+            return BRepPrimAPI_MakeCylinder(gp_Ax2(a, dir), r, total).Shape();
+        TopoDS_Face prof = wireProfile(a, dir, r, segments);
+        return BRepPrimAPI_MakePrism(prof, gp_Vec(dir) * total).Shape();
     }
     if (pr.kind == Primitive::ARC3) {
         double radius = pr.arc.v0.Modulus();
@@ -2775,7 +2786,7 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         gp_XYZ v0e = rotateXYZ(pr.arc.v0, pr.arc.axis, -ddA);
         gp_Pnt start(pr.arc.c.XYZ() + v0e);
         gp_XYZ tangent = pr.arc.axis.Crossed(v0e);
-        TopoDS_Face prof = wireProfile(start, gp_Dir(tangent), r, 0);
+        TopoDS_Face prof = wireProfile(start, gp_Dir(tangent), r, segments);
         BRepPrimAPI_MakeRevol rev(prof, gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)), total);
         return rev.IsDone() ? rev.Shape() : TopoDS_Shape();
     }
@@ -2804,7 +2815,7 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
                                            gp_Pnt(ends.second.XYZ() + tB.XYZ() * overB)).Edge());
         if (!mw.IsDone()) return {};
         TopoDS_Wire spine = mw.Wire();
-        TopoDS_Wire prof = wireProfileWire(spineStart, tA, r, 0);
+        TopoDS_Wire prof = wireProfileWire(spineStart, tA, r, segments);
         BRepOffsetAPI_MakePipeShell ps(spine);
         ps.Add(prof);
         ps.Build();
@@ -2863,7 +2874,8 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
     return solid;
 }
 
-TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, double wireRadius) {
+TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, double wireRadius,
+                                 int segments) {
     const double over = 1.3 * wireRadius;   // covers a bisector tilt up to ~50 deg half-angle
     const double tanThresh = 0.05;          // rad (~3 deg): below this a junction is tangent -> no cut
     const bool diag = std::getenv("MVB_MITRE_DIAG") != nullptr;
@@ -2916,9 +2928,9 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
         // flush forward (no cut) -- one side only, so the bridge is never doubled.
         const double overS = bentS ? over + dpS : 0.0;
         const double overE = bentE ? over + dpE : (dpE > 1e-9 ? dpE : 0.0);
-        TopoDS_Shape solid = rawGrownSolid(*ptrs[i], wireRadius, overS, overE);
+        TopoDS_Shape solid = rawGrownSolid(*ptrs[i], wireRadius, overS, overE, segments);
         if (solid.IsNull()) {  // ARC clamp (near-full revolve): fall back to a flush, uncut tube
-            solid = rawGrownSolid(*ptrs[i], wireRadius, 0.0, 0.0);
+            solid = rawGrownSolid(*ptrs[i], wireRadius, 0.0, 0.0, segments);
             bentS = bentE = false;
         }
         if (solid.IsNull()) continue;
@@ -2949,7 +2961,7 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
         // here and rebuilt as a plain flush-capped tube -- always valid, at worst a hair of overlap
         // at that single joint. Never emit an invalid solid.
         if (solid.IsNull() || !BRepCheck_Analyzer(solid).IsValid()) {
-            TopoDS_Shape flush = rawGrownSolid(*ptrs[i], wireRadius, 0.0, 0.0);
+            TopoDS_Shape flush = rawGrownSolid(*ptrs[i], wireRadius, 0.0, 0.0, segments);
             if (!flush.IsNull() && BRepCheck_Analyzer(flush).IsValid()) { solid = flush; ++nRepaired; }
             else {
                 // NEVER drop a primitive silently: the copper it carries simply disappears from
@@ -3095,7 +3107,8 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         std::vector<const Primitive*> cptrs;
         cptrs.reserve(path.prims.size());
         for (const auto& pr : path.prims) cptrs.push_back(&pr);
-        return pruneDegenerateSolids(emitToroidConformal(cptrs, path.wireRadius));
+        return pruneDegenerateSolids(
+            emitToroidConformal(cptrs, path.wireRadius, wirePolygonSegments));
     }
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
@@ -3349,7 +3362,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // assembly for the dense toroids where the single-solid sweep can't close. Drawing (femReady
     // false) skips it and keeps the fast overlapping per-run compound below.
     if (path.toroidal && path.femReady) {
-        return pruneDegenerateSolids(emitToroidConformal(ptrs, path.wireRadius));
+        return pruneDegenerateSolids(emitToroidConformal(ptrs, path.wireRadius, wirePolygonSegments));
     }
 
     BRep_Builder builder;
