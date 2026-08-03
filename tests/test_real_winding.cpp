@@ -781,26 +781,13 @@ TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean"
         REQUIRE(primaryConductionLayers == 2);
     }
 
-    // TWO-LAYER sections bury the inner layer's entrance: ring 2 nests one wire OD inside
-    // ring 1 (crossings 1.47 mm apart at a 1.4 mm envelope -- the TURNS are legal), but every
-    // straight-dressed lead path from ring 1's start crossing is then blocked by ring 2's
-    // returns. A real winder lays the lead FIRST and winds layer 2 around it -- rigid MAS turn
-    // geometry cannot express that (lead-space reservation is the layout's job, MKF ABT #187),
-    // so the routed-lead builder must REFUSE loudly rather than emit overlapping copper.
-    {
-        mvb::MagneticBuilder twoLayerBuilder;
-        REQUIRE_THROWS_WITH(
-            twoLayerBuilder.buildAllNamed(enriched, false, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
-                                          0, true, false, false, 0.0,
-                                          /*useRealWindingGeometry=*/true, /*femReady=*/false),
-            Catch::Matchers::ContainsSubstring("no clear terminal-lead route"));
-    }
-
-    // The 3-winding independence contract is exercised at SINGLE-LAYER sections (9 turns per
-    // winding on the same core/wire), where the terminal leads route cleanly.
-    for (auto& w : magneticJson["coil"]["functionalDescription"]) w["numberTurns"] = 9;
-    enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
-
+    // The FULL 2-layer build goes through with validated terminal routes: the later-wound
+    // face chords DRESS around the terminal connections (tangent-arc-tangent at the wire
+    // envelope, exactly like a real winder lays wire around the already-placed lead), MKF's
+    // gap-fill lean keeps the outer crossings nested clear of the connections, and the lead
+    // router accepts under the collision gate's own bare-copper criterion. Historically this
+    // build was refused after MKF's angular corridor blocking (fe08c601) let ring 1 overhang
+    // the entrance corridor -- see ABT #563 for the full chain.
     mvb::MagneticBuilder builder;
     // CMC spread windings stay on the fast drawing compound (femReady=false): the test only asserts
     // the three windings don't overlap EACH OTHER, which the per-run compound already satisfies.
