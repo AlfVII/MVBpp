@@ -2951,12 +2951,42 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
         if (solid.IsNull() || !BRepCheck_Analyzer(solid).IsValid()) {
             TopoDS_Shape flush = rawGrownSolid(*ptrs[i], wireRadius, 0.0, 0.0);
             if (!flush.IsNull() && BRepCheck_Analyzer(flush).IsValid()) { solid = flush; ++nRepaired; }
-            else { ++nInvalid; continue; }
+            else {
+                // NEVER drop a primitive silently: the copper it carries simply disappears from
+                // the conductor, and downstream checks can miss it (a short corner's neighbours
+                // may still touch, so even the connectivity contract stays satisfied -- that is
+                // exactly how a missing dragback corner reached a STEP). Fail loudly instead,
+                // naming the primitive so the geometry that produced it can be fixed.
+                static const char* kindName[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
+                const auto ends = primEndpoints(*ptrs[i]);
+                std::ostringstream detail;
+                detail << "ConductorBuilder: the conformal assembler cannot build a valid solid for "
+                       << "primitive " << i << " (" << kindName[ptrs[i]->kind] << ") '"
+                       << ptrs[i]->label << "' (" << ends.first.X() << "," << ends.first.Y() << ","
+                       << ends.first.Z() << ")->(" << ends.second.X() << "," << ends.second.Y()
+                       << "," << ends.second.Z() << ")";
+                if (ptrs[i]->kind == Primitive::ARC3) {
+                    detail << " sweep=" << ptrs[i]->arc.sweep
+                           << " centrelineRadius=" << ptrs[i]->arc.v0.Modulus()
+                           << " wireRadius=" << wireRadius;
+                    if (ptrs[i]->arc.v0.Modulus() <= wireRadius * (1.0 + 1e-6)) {
+                        detail << " -- the centreline radius does not exceed the wire radius, so the "
+                                  "swept tube is a HORN TORUS touching its own axis of revolution "
+                                  "(no valid solid exists; give the corner a larger bend radius)";
+                    }
+                }
+                detail << ". Refusing to emit a conductor with missing copper.";
+                throw std::runtime_error(detail.str());
+            }
         }
         builder.Add(compound, solid);
         if (diag) built.push_back(solid);
     }
-    if (diag) {
+    // Per-solid analysis (union-find connectivity, volumes, interpenetration) is O(n^2) EXACT
+    // BRepExtrema/classification -- ~15k queries on a 170-prim toroid, tens of minutes. Keep it
+    // behind its own flag so plain MVB_MITRE_DIAG (junction angles, DROPPED prims, the counters)
+    // stays usable during normal iteration.
+    if (diag && std::getenv("MVB_MITRE_INTERPEN")) {
         // component structure over ALL pairs (mirrors the test's union-find), with volumes
         std::vector<int> uf(built.size());
         for (size_t i = 0; i < uf.size(); ++i) uf[i] = (int)i;
@@ -3000,7 +3030,9 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
         }
         // Interpenetration sweep over ALL bbox-touching pairs (not just chain neighbours), the
         // same junction-grid classifier as the test battery, with LABELS -- post-prune solid
-        // indices in test output cannot be mapped back to primitives.
+        // indices in test output cannot be mapped back to primitives. O(n^2) solid
+        // classification dominates the run (tens of minutes on a 170-prim toroid), so it needs
+        // its OWN flag: plain MVB_MITRE_DIAG stays fast enough for routine use.
         {
             std::vector<Bnd_Box> bxs(built.size());
             for (size_t i = 0; i < built.size(); ++i) BRepBndLib::Add(built[i], bxs[i]);
@@ -3046,6 +3078,8 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
                                   << ")\n";
                 }
         }
+    }
+    if (diag) {
         std::cerr << "[mitre] prims=" << n << " boolean-cuts=" << nCut << " repaired=" << nRepaired
                   << " dropped-invalid=" << nInvalid << "\n";
     }
@@ -4008,9 +4042,12 @@ void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const To
         Primitive pr;
         pr.kind = Primitive::ARC3;
         pr.arc.c = gp_Pnt(centerXY.X(), y, centerXY.Y());
-        pr.arc.axis = gp_XYZ(0, 1, 0);
+        // ALWAYS a positive sweep about the matching axis: OCC's revolve/edge builders refuse
+        // negative angles, so a clockwise arc emitted with sweep<0 produced an invalid solid
+        // that the conformal assembler DROPPED -- the visibly missing dragback corner.
+        pr.arc.axis = sweep < 0 ? gp_XYZ(0, -1, 0) : gp_XYZ(0, 1, 0);
         pr.arc.v0 = v0;
-        pr.arc.sweep = sweep;
+        pr.arc.sweep = std::abs(sweep);
         pr.label = label + std::string(" ") + what;
         pr.turnOrdinal = ordinal;
         path.prims.push_back(std::move(pr));
@@ -4018,6 +4055,13 @@ void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const To
     auto pol = [](double r, double a) { return gp_XY(r * std::cos(a), r * std::sin(a)); };
     const gp_XYZ yHat(0, 1, 0);
     const double b = bend;
+    // Fillet bend radius. It must be STRICTLY GREATER than the wire radius: a corner whose
+    // centreline radius equals the wire radius sweeps a HORN TORUS -- the tube touches its own
+    // axis of revolution, so OCC returns a self-touching (invalid) solid and the conformal
+    // assembler drops it, which is exactly the "missing dragback corner" seen in the STEP.
+    // 1.5x is also the more physical figure: real wire cannot bend to its own radius without
+    // crushing the inner fibre.
+    const double bf = 1.5 * bend;
 
     // ---- source turn's top half (identical to a normal wrap's) ----
     gp_XY dH = c0.pout - c0.pin;
@@ -4045,8 +4089,8 @@ void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const To
     // Fillet geometry: the out-leg meets the centre circle from OUTSIDE (fillet centre at
     // rMid+b), the in-leg leaves it towards the hole (fillet centre at rMid-b). Tangency radii
     // on the radial lines and tangency angles on the circle are exact.
-    const double d1 = std::asin(b / (rMid + b)), rt1 = std::sqrt((rMid + b) * (rMid + b) - b * b);
-    const double d2 = std::asin(b / (rMid - b)), rt2 = std::sqrt((rMid - b) * (rMid - b) - b * b);
+    const double d1 = std::asin(bf / (rMid + bf)), rt1 = std::sqrt((rMid + bf) * (rMid + bf) - bf * bf);
+    const double d2 = std::asin(bf / (rMid - bf)), rt2 = std::sqrt((rMid - bf) * (rMid - bf) - bf * bf);
     if (rOut0 - b <= rt1 || rIn1 + b >= rt2 || std::abs(dAz) <= d1 + d2)
         throw std::runtime_error(
             "ConductorBuilder: ring-transition dragback of " + label +
@@ -4063,11 +4107,11 @@ void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const To
 
     // ---- the 5-piece dragback along the core's central circle ----
     pushSeg(P(c0.pout + e0xy * b, -rhb), P(pol(rt1, az0), -rhb), "dragback out leg");
-    pushArcH(pol(rMid + b, az0 + sg * d1), -rhb, pol(rt1, az0), pol(rMid, az0 + sg * d1),
+    pushArcH(pol(rMid + bf, az0 + sg * d1), -rhb, pol(rt1, az0), pol(rMid, az0 + sg * d1),
              "dragback outer fillet");
     pushArcH(gp_XY(0, 0), -rhb, pol(rMid, az0 + sg * d1), pol(rMid, az1 - sg * d2),
              "dragback central arc");
-    pushArcH(pol(rMid - b, az1 - sg * d2), -rhb, pol(rMid, az1 - sg * d2), pol(rt2, az1),
+    pushArcH(pol(rMid - bf, az1 - sg * d2), -rhb, pol(rMid, az1 - sg * d2), pol(rt2, az1),
              "dragback inner fillet");
     gp_XY eIxy = c1.pin;
     eIxy.Divide(-rIn1);   // radial inward unit at az1 (direction of travel)
@@ -4740,12 +4784,58 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     pr.isLead = true;
                     path.prims.push_back(std::move(pr));
                 };
+                // ROUND corner at the elbow, like every wrap corner: shorten both legs by the
+                // fillet's tangent length and bend through an exact arc (works for the slanted
+                // drop candidates too -- the fillet is generic in the two leg directions). The
+                // old bare two-seg corner left a 90-degree junction for the mitre machinery,
+                // whose trim on the short lead stubs sometimes fell back to flush overlapping
+                // tubes instead of a clean joint.
+                auto pushLeadRun = [&](const gp_Pnt& start, const gp_Pnt& mid, const gp_Pnt& end,
+                                       const char* whA, const char* whB) {
+                    gp_Vec inVec(start, mid), outVec(mid, end);
+                    const double lenIn = inVec.Magnitude(), lenOut = outVec.Magnitude();
+                    if (lenIn < 1e-12 || lenOut < 1e-12) {
+                        pushLeadSeg(start, mid, whA);
+                        pushLeadSeg(mid, end, whB);
+                        return;
+                    }
+                    const gp_XYZ u = inVec.XYZ() / lenIn, v = outVec.XYZ() / lenOut;
+                    const double cosTurn = u.Dot(v);
+                    // > wireRadius, never == : an equal-radius corner is a horn torus (the tube
+                    // touches its own revolution axis) and OCC rejects the solid.
+                    const double b = 1.5 * wireRadius;
+                    const double tangentLen =
+                        b * std::sqrt(std::max(0.0, (1.0 - cosTurn) / (1.0 + cosTurn)));
+                    if (cosTurn > 1.0 - 1e-9 || tangentLen > 0.49 * std::min(lenIn, lenOut)) {
+                        pushLeadSeg(start, mid, whA);   // straight or no room: plain segs
+                        pushLeadSeg(mid, end, whB);
+                        return;
+                    }
+                    const gp_Pnt tangentA(mid.XYZ() - u * tangentLen);
+                    const gp_Pnt tangentB(mid.XYZ() + v * tangentLen);
+                    gp_XYZ normal = v - u * cosTurn;
+                    normal /= normal.Modulus();
+                    const gp_Pnt center(tangentA.XYZ() + normal * b);
+                    pushLeadSeg(start, tangentA, whA);
+                    {
+                        Primitive pr;
+                        pr.kind = Primitive::ARC3;
+                        pr.arc.c = center;
+                        gp_XYZ axis = u.Crossed(v);
+                        pr.arc.axis = axis / axis.Modulus();
+                        pr.arc.v0 = tangentA.XYZ() - center.XYZ();
+                        pr.arc.sweep = std::acos(std::clamp(cosTurn, -1.0, 1.0));
+                        pr.label = who + std::string(" lead corner");
+                        pr.turnOrdinal = ordinal;
+                        pr.isLead = true;
+                        path.prims.push_back(std::move(pr));
+                    }
+                    pushLeadSeg(tangentB, end, whB);
+                };
                 if (isExit) {   // crossing -> up out of the hole -> radial out
-                    pushLeadSeg(pCross, elbow, "lead axial");
-                    pushLeadSeg(elbow, pOut, "lead radial");
+                    pushLeadRun(pCross, elbow, pOut, "lead axial", "lead radial");
                 } else {        // radial in -> down into the hole -> crossing (feeds turn 0)
-                    pushLeadSeg(pOut, elbow, "lead radial");
-                    pushLeadSeg(elbow, pCross, "lead axial");
+                    pushLeadRun(pOut, elbow, pCross, "lead radial", "lead axial");
                 }
             };
 
