@@ -131,6 +131,14 @@ constexpr double kContactTol = 1e-7;
 // chosen so each chord sags inward by at most this fraction of the wire radius. The same
 // bound is granted back as contact allowance in the gate.
 constexpr double kMaxSagFraction = 0.02;
+// THE one collision criterion: the minimum centreline separation two wires must keep, on
+// their BARE (conducting) radii, exactly as the collision gate enforces it. Every layout
+// decision (vertical-fan slots, drift windows, lead corridors) demands precisely this --
+// no local safety factors, so the fan is as tight as the gate itself allows and a pair the
+// fan accepts can never fail the gate.
+constexpr double gateMinSeparation(double bareA, double bareB) {
+    return (bareA + bareB) * (1.0 - kMaxSagFraction) - kContactTol;
+}
 // The connection plane ("connections radial, 90 degrees from the turns, in the YZ
 // plane"). MKF's 2D winding-window cross-section maps into 3D on the -Z side of the
 // column: 2D (x = radial, y = axial) -> 3D (0, y, -(x + zoff)), where zoff = 0 for round
@@ -249,8 +257,6 @@ struct ConductorPath {
     double wireHeight = 0.0;  // axial extent [m]
     bool femReady = false;    // true -> pay for the one-piece/conformal FEM geometry; false -> fast
                               // per-run compound for drawing (see ConductorBuilder::Options::femReady)
-    int zReturnLanes = 0;     // rect-column Z-return lane allocator (see appendRectWrap): each
-                              // return descends the -Z face in its OWN clearance lane
 };
 
 // --- capsule distance helpers ----------------------------------------------------------
@@ -492,8 +498,7 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
             // Gate on the CONDUCTING (copper) envelope: overlapping copper is the real fault (short /
             // un-meshable solid); enamel touching on a tight winding is fine. Insulated (paintCoating)
             // radii would false-reject every tightly-wound layer.
-            double sagAllowance = kMaxSagFraction * (A.condRadius + B.condRadius);
-            double minGap = A.condRadius + B.condRadius - sagAllowance - kContactTol;
+            double minGap = gateMinSeparation(A.condRadius, B.condRadius);
             for (size_t i = 0; i < A.prims.size(); ++i) {
                 size_t jStart = (ci == cj) ? i + 1 : 0;
                 for (size_t j = jStart; j < B.prims.size(); ++j) {
@@ -1271,6 +1276,10 @@ TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir&
     return TopoDS_Shape();
 }
 
+// Forward: the run's junction tangents decide the sweep's transition mode (see sweepRun).
+static gp_Dir primFwdStart(const Primitive& p, double r);
+static gp_Dir primFwdEnd(const Primitive& p, double r);
+
 TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRadius,
                       int wirePolygonSegments) {
     if (count == 0) return TopoDS_Shape();
@@ -1298,10 +1307,30 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
         TopoDS_Wire prof = wireProfileWire(firstPts.front(), gp_Dir(t0), wireRadius, 0);
 
         BRepOffsetAPI_MakePipeShell ps(spine);
-        // Mitre corners: RoundCorner's trim machinery needs edges longer than its
-        // rounding radius and segfaults on the short MKF link segments
-        // (BRepFill_TrimShellCorner::Perform, OCCT 7.9).
-        ps.SetTransitionMode(BRepBuilderAPI_RightCorner);
+        // TRANSITION MODE. Corner machinery is only correct where there IS a corner, and both of
+        // OCCT 7.9's corner modes crash on spines that have none:
+        //   RoundCorner  -- trim machinery needs edges longer than its rounding radius and
+        //                   segfaults on the short MKF link segments
+        //                   (BRepFill_TrimShellCorner::Perform).
+        //   RightCorner  -- at a TANGENT junction the two section edges it compares are parallel;
+        //                   for non line/circle sections (our swept BSplines) OCCT's
+        //                   Extrema_ExtCC::PrepareParallelResult appends to mySqDist WITHOUT
+        //                   appending to mypoints, so NbExt() reports 1 while mypoints is empty
+        //                   and Points(1) reads out of bounds -- a SIGSEGV in a release build,
+        //                   through BRepFill_TrimShellCorner::ChooseSection. Reproduced on
+        //                   06_llc_xfmr_eq4128: two consecutive 'over dragback' spirals meet at
+        //                   9e-7 deg across the station plane.
+        // A run whose every junction is tangent has no corner to trim, so sweep it with the plain
+        // Transformed mode -- no TrimShellCorner, no crash, and the result is identical because
+        // there is nothing to mitre. Runs with a genuine corner keep RightCorner.
+        bool anyCorner = false;
+        for (size_t i = 0; i + 1 < count && !anyCorner; ++i) {
+            const gp_Dir a = primFwdEnd(*prims[i], wireRadius);
+            const gp_Dir b = primFwdStart(*prims[i + 1], wireRadius);
+            if (a.Angle(b) > 0.05) anyCorner = true;   // same tangency threshold as the mitre path
+        }
+        ps.SetTransitionMode(anyCorner ? BRepBuilderAPI_RightCorner
+                                       : BRepBuilderAPI_Transformed);
         ps.Add(prof);
         ps.Build();
         if (!ps.IsDone()) return TopoDS_Shape();
@@ -2867,17 +2896,34 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
     const gp_XYZ w = keepDir.XYZ() * -1.0;                              // into the discard side
     const double cosT = std::max(0.2, std::abs(stubDir.XYZ().Dot(w)));  // clamp: tilt <= ~78 deg
     const double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
-    const double ell = r / cosT + 0.5 * r;    // mitre ellipse semi-extent + margin
+    // Knife extent. It must cover the overhang and NOTHING else: a CURVED piece bends back
+    // into the far part of the box and gets a rectangular notch gouged out of its keep side
+    // (visible as square voids beside every dragback). Depth is therefore just the overhang plus
+    // the tube radius -- what the tilted section actually needs -- and the perpendicular half is
+    // barely wider than the tube.
+    const double ell = r / cosT + 0.25 * r;   // mitre ellipse semi-extent + margin
     const double drift = (grow + r) * sinT;   // stub tip's lateral reach
-    const double depth = grow + 1.5 * r;
+    const double depth = grow + r;
     gp_XYZ u = stubDir.XYZ() - w * stubDir.XYZ().Dot(w);
     if (u.Modulus() > 1e-9) u.Normalize();
     else u = gp_Ax2(P, gp_Dir(w)).XDirection().XYZ();   // stub ~normal to plane: no drift
     const gp_XYZ v = w.Crossed(u);
-    const double vHalf = 1.5 * r;
+    const double vHalf = 1.05 * r;
     gp_Pnt corner(P.XYZ() - u * ell - v * vHalf);
     TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Ax2(corner, gp_Dir(w), gp_Dir(u)),
                                            drift + 2.0 * ell, 2.0 * vHalf, depth).Shape();
+    // BOUND THE KNIFE TO THE JUNCTION. A box has straight sides, so on a CURVED piece the tube
+    // bends back into its far region and the box bites a rectangular notch out of material that
+    // should have stayed -- the square voids beside every dragback. Intersecting the box with a
+    // sphere centred on the joint keeps the cut strictly local: nothing further from the corner
+    // than the overhang itself can be reached, whatever the piece does downstream.
+    try {
+        TopoDS_Shape ball =
+            BRepPrimAPI_MakeSphere(P, grow + 1.5 * r).Shape();
+        BRepAlgoAPI_Common local(box, ball);
+        if (local.IsDone() && !local.Shape().IsNull()) box = local.Shape();
+    } catch (const Standard_Failure&) {
+    }
     try {
         GProp_GProps gpBefore, gpAfter;
         BRepGProp::VolumeProperties(solid, gpBefore);
@@ -3027,7 +3073,21 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
             }
         }
         builder.Add(compound, solid);
-        if (diag) built.push_back(solid);
+        if (diag) {
+            built.push_back(solid);
+            GProp_GProps gpr;
+            BRepGProp::VolumeProperties(solid, gpr);
+            Bnd_Box bb;
+            BRepBndLib::Add(solid, bb);
+            double x0, y0, z0, x1, y1, z1;
+            bb.Get(x0, y0, z0, x1, y1, z1);
+            const double len = primEndpoints(*ptrs[i]).first.Distance(primEndpoints(*ptrs[i]).second);
+            const double nominal = kPi * wireRadius * wireRadius * len;
+            std::cerr << "[prim] " << i << " '" << ptrs[i]->label << "' vol=" << gpr.Mass()
+                      << " nominal=" << nominal
+                      << " ratio=" << (nominal > 0 ? gpr.Mass() / nominal : 0.0)
+                      << " y=[" << y0 << "," << y1 << "]\n";
+        }
     }
     // Per-solid analysis (union-find connectivity, volumes, interpenetration) is O(n^2) EXACT
     // BRepExtrema/classification -- ~15k queries on a 170-prim toroid, tens of minutes. Keep it
@@ -3167,6 +3227,21 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     std::vector<const Primitive*> ptrs;
     ptrs.reserve(path.prims.size());
     for (const auto& pr : path.prims) ptrs.push_back(&pr);
+
+    // MVB_SOLID_DUMP: the PRIMITIVE map. A CAD tree flattens the compound's piecewise runs, so
+    // the index a viewer shows against "<conductor> N" is the primitive index -- print each one's
+    // label and endpoints in mm so a solid picked by eye can be named in code.
+    if (std::getenv("MVB_SOLID_DUMP")) {
+        for (size_t i = 0; i < ptrs.size(); ++i) {
+            auto [pa, pb] = primEndpoints(*ptrs[i]);
+            static const char* kn[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
+            std::cerr << "[prim] " << path.name << " " << i << " " << kn[ptrs[i]->kind]
+                      << " '" << ptrs[i]->label << "' a=(" << pa.X() * 1e3 << ","
+                      << pa.Y() * 1e3 << "," << pa.Z() * 1e3 << ") b=(" << pb.X() * 1e3 << ","
+                      << pb.Y() * 1e3 << "," << pb.Z() * 1e3 << ") len_mm="
+                      << pa.Distance(pb) * 1e3 << "\n";
+        }
+    }
 
     // The conductor's two free ends (the terminal faces): the start of the first
     // primitive (the entrance lead's outboard end) and the end of the last (the exit
@@ -3403,6 +3478,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     BRep_Builder builder;
     TopoDS_Compound compound;
     builder.MakeCompound(compound);
+    size_t solidIndex = 0;
     for (auto [b, e] : continuousRuns(path)) {
         bool closedRing = (e - b == 1) && ptrs[b]->kind != Primitive::SEG &&
                           [&] {
@@ -3412,6 +3488,10 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         // runs never mix lead/link and wrap primitives (continuousRuns splits at both)
         bool leadRun = ptrs[b]->isLead || ptrs[b]->isConnection;
         TopoDS_Shape run;
+        if (std::getenv("MVB_DEBUG_RUNS"))
+            std::cerr << "[sweep] " << path.name << " run[" << b << "," << e << ") first='"
+                      << ptrs[b]->label << "' last='" << ptrs[e - 1]->label << "'"
+                      << (leadRun ? " LEAD" : "") << (closedRing ? " RING" : "") << std::endl;
         if (!closedRing && !leadRun) {
             run = sweepRun(ptrs.data() + b, e - b, path.wireRadius, wirePolygonSegments);
         }
@@ -3451,6 +3531,41 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                           << "] excess " << excess << " m\n";
             }
         }
+        // MVB_SOLID_DUMP: map the VIEWER's solid index back to the primitives that made it.
+        // The drawing compound emits one solid per continuous RUN, not per primitive, so
+        // "<conductor> 55" in a CAD tree is run 55 -- unmappable without this.
+        if (!run.IsNull() && std::getenv("MVB_SOLID_DUMP")) {
+            // Explode the run: a piecewise sweep returns a COMPOUND of one solid per primitive,
+            // and a CAD tree lists those individually. Numbering them here in emission order is
+            // what makes "<conductor> 58" in a viewer resolvable to a label.
+            size_t k = 0;
+            for (TopExp_Explorer ex(run, TopAbs_SOLID); ex.More(); ex.Next(), ++k) {
+                Bnd_Box bb;
+                BRepBndLib::AddOptimal(ex.Current(), bb, Standard_False, Standard_False);
+                double x0, y0, z0, x1, y1, z1;
+                bb.Get(x0, y0, z0, x1, y1, z1);
+                // Attribute by GEOMETRY, never by position: a piecewise run emits a cylinder
+                // AND sphere elbows per primitive, so solid k is not primitive b+k. Match the
+                // solid's bbox centre to the nearest primitive centreline.
+                const gp_Pnt mid(0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.5 * (z0 + z1));
+                const Primitive* src = ptrs[b];
+                double bestD = 1e30;
+                for (size_t q = b; q < e; ++q) {
+                    for (const auto& sp : samplePrim(*ptrs[q], path.wireRadius)) {
+                        const double d = sp.Distance(mid);
+                        if (d < bestD) { bestD = d; src = ptrs[q]; }
+                    }
+                }
+                GProp_GProps gp;
+                BRepGProp::VolumeProperties(ex.Current(), gp);
+                std::cerr << "[solid] " << path.name << " " << solidIndex++
+                          << " vol_mm3=" << gp.Mass() * 1e9
+                          << " run[" << b << "," << e << ") '" << src->label
+                          << "' bbox_mm x=[" << x0 * 1e3 << "," << x1 * 1e3
+                          << "] y=[" << y0 * 1e3 << "," << y1 * 1e3
+                          << "] z=[" << z0 * 1e3 << "," << z1 * 1e3 << "]\n";
+            }
+        }
         if (!run.IsNull()) builder.Add(compound, run);
     }
     // A real multi-turn winding's swept pipes always leave degenerate seam faces when the
@@ -3471,7 +3586,41 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         result = multiTurn ? weldSolidsPairwise(compound, 1e-7)
                            : fuseAllSolids(compound, path.wireRadius);
     }
-    return pruneDegenerateSolids(result);
+    result = pruneDegenerateSolids(result);
+
+    // MVB_COVERAGE_CHECK: is the conductor FULLY CONDUCTING? Walk every primitive's centreline
+    // and classify each sample against the emitted solids. A sample that lies in no solid is a
+    // gap in the copper -- a run whose sweep failed and whose fallback also dropped it, a piece
+    // pruned as degenerate, or a chunk the pipe silently lost. Nothing else in the pipeline
+    // notices: the compound is still "valid", it is just missing wire.
+    if (std::getenv("MVB_COVERAGE_CHECK")) {
+        // BRepClass3d_SolidClassifier is non-copyable (its explorer is), so hold them by pointer.
+        std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> cls;
+        for (TopExp_Explorer ex(result, TopAbs_SOLID); ex.More(); ex.Next())
+            cls.push_back(std::make_unique<BRepClass3d_SolidClassifier>(ex.Current()));
+        size_t miss = 0, total = 0;
+        std::string worst;
+        for (const auto& pr : path.prims) {
+            for (const auto& q : samplePrim(pr, path.wireRadius)) {
+                ++total;
+                bool in = false;
+                for (auto& c : cls) {
+                    c->Perform(q, 1e-9);
+                    if (c->State() == TopAbs_IN || c->State() == TopAbs_ON) { in = true; break; }
+                }
+                if (!in) {
+                    if (!miss)
+                        worst = pr.label + " at (" + std::to_string(q.X() * 1e3) + "," +
+                                std::to_string(q.Y() * 1e3) + "," + std::to_string(q.Z() * 1e3) + ") mm";
+                    ++miss;
+                }
+            }
+        }
+        std::cerr << "[coverage] " << path.name << ": " << (miss ? "GAP" : "ok") << " -- " << miss
+                  << "/" << total << " centreline samples outside the copper"
+                  << (miss ? ("; first: " + worst) : "") << "\n";
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3531,10 +3680,20 @@ struct RingInv {
 // axially is a return (the serpentine link's axial move stays under a pitch); a SAME-radius
 // jump (section-interleaved order) is a return only when it far exceeds the conductor's own
 // median pitch — sparse windings legitimately advance several wire-ODs per ordinary wrap.
-bool isZReturn(const PlanePt& s, const PlanePt& n, double wireRadius, double medianPitch) {
+// zOrderAdvance: the conductor's SIGNED within-layer advance when every same-radius step moves
+// the same way (a z-order winding); 0.0 when the direction alternates (classic serpentine).
+bool isZReturn(const PlanePt& s, const PlanePt& n, double wireRadius, double medianPitch,
+               double zOrderAdvance = 0.0) {
     if (std::abs(n.x - s.x) > wireRadius && std::abs(n.y - s.y) <= std::abs(n.x - s.x))
         return false;   // serpentine U-link
     const bool layerChange = std::abs(n.x - s.x) > wireRadius;
+    // A layer change moving AGAINST a consistently-advancing winding's own direction is a
+    // return no matter how short: the diagonal cone it would otherwise get sweeps backwards
+    // through the band the sibling parallels occupy (23_interleaved: s0's 1.2 mm back-move
+    // crossed s1's helix 0.38 mm off centre).
+    if (layerChange && zOrderAdvance != 0.0 &&
+        (n.y - s.y) * (zOrderAdvance > 0.0 ? 1.0 : -1.0) < -2.0 * wireRadius)
+        return true;
     const double thr = layerChange ? std::max(medianPitch, 2.0 * wireRadius)
                                    : std::max(6.0 * wireRadius, 1.6 * medianPitch);
     return std::abs(n.y - s.y) > thr;
@@ -3567,6 +3726,31 @@ struct WrapBump {
     // the dragback sets the clearance needed, and different windings use different wire.
     double distance = 0.0;
 };
+
+// The tallest azimuth COLUMN in a bump list. Dragbacks SHARING an azimuth stack radially --
+// their clearances add (a return lies in its destination layer's space, the step over it
+// displaces the next layer, and so on outward) -- while returns in DIFFERENT fan slots sit
+// side by side, so a wire riding over the whole fan only needs to clear the tallest stack.
+// Every junction raise (wrap ends, dragback chain ends, the exit lead's lift) MUST come from
+// this one helper on the same bump list, so abutting pieces land on exactly the same offset.
+std::pair<double, double> tallestBumpColumn(const std::vector<WrapBump>& bumps) {
+    std::vector<std::pair<double, double>> cols;   // (azimuth, summed distance)
+    for (const auto& bmp : bumps) {
+        bool found = false;
+        for (auto& c : cols) {
+            if (std::abs(std::remainder(bmp.azimuth - c.first, kTwoPi)) < 1e-9) {
+                c.second += bmp.distance;
+                found = true;
+                break;
+            }
+        }
+        if (!found) cols.push_back({bmp.azimuth, bmp.distance});
+    }
+    double raise = 0.0, az = 0.0;
+    for (const auto& c : cols)
+        if (c.second > raise) { raise = c.second; az = c.first; }
+    return {raise, az};
+}
 
 // Emit a helical sweep (r,y linear in azimuth) that RIDES OVER the given dragbacks: plain helix,
 // a cosine-blended ramp out, a blended ramp back in, plain helix. The blend's end tangents are
@@ -3608,100 +3792,107 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
         pr.isConnection = isConnection;
         path.prims.push_back(std::move(pr));
     };
-    // Total raise for this sweep: dragbacks share the +Z azimuth, so their clearances add.
-    double raise = 0.0, azBump = 0.0;
-    for (const auto& bmp : bumps) {
-        raise += bmp.distance;
-        azBump = bmp.azimuth;
-    }
+    // The verticals live in a TIGHT FAN of a few degrees around the station plane (each vertical
+    // takes the feasible azimuth closest to the plane, see the vertical-fan pre-scan), so ONE
+    // raised treatment centred on the plane clears every one of them: same-azimuth columns
+    // stack (clearances add), columns side by side do not, and the ride-over only needs the
+    // tallest stack.
+    const double raise = tallestBumpColumn(bumps).first;
     if (raise <= 0.0) {
         pushPiece(azStart, azEnd, r0, r1, y0, y1, false, "");
         return;
     }
-    // Bring the bump azimuth into this sweep's span.
-    while (azBump < azStart) azBump += kTwoPi;
-    while (azBump > azEnd) azBump -= kTwoPi;
-    // A QUARTER at the layer's own radius, a straight radial step OUT, a HALF turn riding over
-    // the dragback, a straight step back IN, and a final quarter -- the shape a wire actually
-    // takes over a return lying under it. The raised half is centred on the dragback so the
-    // steps land a quarter turn either side of it, clear of the wire being crossed.
-    // A sweep that starts or ends AT the dragback (the return's own run-out and run-in do
-    // exactly that) cannot seat a step on that side, so it simply starts or ends already raised.
-    const double a1 = std::max(azBump - kPi / 2.0, azStart);
-    const double a2 = std::min(azBump + kPi / 2.0, azEnd);
-    const bool stepOut = a1 > azStart + 1e-9, stepIn = a2 < azEnd - 1e-9;
-    if (a2 - a1 < 1e-9) {
-        pushPiece(azStart, azEnd, r0, r1, y0, y1, false, "");
+    // ALF'S RULE (2026-08-05): the bump affects the -Z HALF ONLY. The +Z half is always the
+    // plain 180-degree arc of the wrap's own circle, from XY plane to XY plane. The raised -Z
+    // half is the circle with its centre DROPPED by the raise (cz = -raise) and its radius
+    // grown to hypot(r, raise), which re-enters the XY plane at exactly (+-r, 0) -- so every
+    // raised arc starts and ends ON the XY plane, whatever its radius, and no step segments
+    // exist at all. At the station side the wire dips to ~(r + raise), clearing the stack; at
+    // the plane crossings it meets the level half at a shallow ~raise/r kink the assembler
+    // mitres.
+    const double c = raise;
+    auto rShift = [&](double az) { return std::hypot(radiusAt(az), c); };
+    // A sweep short enough to live entirely inside the -Z half is emitted raised end to end.
+    if (azEnd - azStart <= kPi + 1e-9) {
+        pushPiece(azStart, azEnd, rShift(azStart), rShift(azEnd), y0, y1, false,
+                  " (over dragback)", -c);
         return;
     }
-    // The step is along the GLOBAL Z AXIS, starting in the XY plane: at the two z=0 crossings
-    // (a quarter turn either side of the dragback) the wire lifts straight towards +Z by the
-    // bump length. The raised half turn is then the SAME circle with its centre shifted +Z, so
-    // the wire keeps its curvature and simply passes to the side of the dragback instead of
-    // bulging radially outward.
-    auto pushZStep = [&](double az, double radius, double czFrom, double czTo, const char* suffix) {
-        const double y = heightAt(az);
-        Primitive pr;
-        pr.kind = Primitive::SEG;
-        pr.seg = {azPointC(0, czFrom, radius, y, az), azPointC(0, czTo, radius, y, az)};
-        pr.label = label + suffix;
-        pr.turnOrdinal = ordinal;
-        pr.isConnection = isConnection;
-        path.prims.push_back(std::move(pr));
-    };
-    if (stepOut) {
-        pushPiece(azStart, a1, radiusAt(azStart), radiusAt(a1), heightAt(azStart), heightAt(a1),
-                  false, "");
-        pushZStep(a1, radiusAt(a1), 0.0, raise, " (bump out)");
+    // Full wrap: raised head [station .. XY plane at x=-r], level +Z half [exactly pi..2pi in
+    // the wrap's own frame], raised tail [XY plane at x=+r .. station]. The boundaries are the
+    // GLOBAL XY-plane crossings, never offsets from this wrap's own span, so every layer's
+    // raised half covers the same azimuths.
+    double aHead = kPlaneAz + kPi / 2.0;          // z = 0, x = -r
+    double aTail = kPlaneAz + kTwoPi - kPi / 2.0; // z = 0, x = +r
+    while (aHead <= azStart + 1e-9) aHead += kTwoPi;
+    while (aTail >= azEnd - 1e-9) aTail -= kTwoPi;
+    if (!(aHead < aTail)) {   // fan wider than the half-turn between the plane crossings
+        throw std::runtime_error("ConductorBuilder: bump region boundaries inverted for '" +
+                                 label + "' (vertical fan too wide for the ride-over model)");
     }
-    pushPiece(a1, a2, radiusAt(a1), radiusAt(a2), heightAt(a1), heightAt(a2), false,
-              " (over dragback)", raise);
-    if (stepIn) {
-        pushZStep(a2, radiusAt(a2), raise, 0.0, " (bump in)");
-        pushPiece(a2, azEnd, radiusAt(a2), r1, heightAt(a2), y1, false, "");
-    }
+    // On the dropped-centre circle the XY plane is reached phi = asin(c/R) PAST the nominal
+    // crossing, exactly where x = -+r again -- the head/tail spans extend by phi so their
+    // endpoints land on the level half's endpoints to machine precision.
+    const double phiH = std::asin(c / rShift(aHead));
+    const double phiT = std::asin(c / rShift(aTail));
+    pushPiece(azStart, aHead + phiH, rShift(azStart), rShift(aHead), heightAt(azStart),
+              heightAt(aHead), false, " (over dragback)", -c);
+    pushPiece(aHead, aTail, radiusAt(aHead), radiusAt(aTail), heightAt(aHead), heightAt(aTail),
+              false, "");
+    pushPiece(aTail - phiT, azEnd, rShift(aTail), rShift(azEnd), heightAt(aTail), y1, false,
+              " (over dragback)", -c);
 }
 
-// How far a sweep ends RAISED above its nominal radius (0 unless it ends inside a bump).
-double sweepEndRaise(double azStart, double azEnd, const std::vector<WrapBump>& bumps) {
-    double raise = 0.0, azBump = 0.0;
-    for (const auto& bmp : bumps) { raise += bmp.distance; azBump = bmp.azimuth; }
-    if (raise <= 0.0) return 0.0;
-    while (azBump < azStart) azBump += kTwoPi;
-    while (azBump > azEnd) azBump -= kTwoPi;
-    return (azBump + kPi / 2.0 >= azEnd - 1e-9) ? raise : 0.0;
-}
-
+// azS / azE are the CROSSING azimuths at the wrap's two stations: kPlaneAz normally, a fan
+// slot when the crossing belongs to a dragback or terminal lead spread off the plane.
 void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
                      double wireRadius, const std::string& label, size_t ordinal,
-                     double azUnder = 0.0, double azOver = 0.0,
-                     const std::vector<WrapBump>& bumps = {}) {
+                     const std::vector<WrapBump>& bumps = {}, double azS = kPlaneAz,
+                     double azE = kPlaneAz, const std::vector<WrapBump>& bumpsEnd = {}) {
     if (std::abs(n.x - s.x) > wireRadius && std::abs(n.y - s.y) <= std::abs(n.x - s.x)) {
+        // The link lives at the fan azimuths, INSIDE the raised region: both its stations are
+        // ridden up over the returns beneath them, so it connects the RAISED endpoints
+        // (dropped-centre rule, matching the wraps) -- a bare link ran level with a
+        // neighbour's raised run (23_interleaved: the secondary's radial climb 0.45 mm off
+        // the primary's ridden-up tail). The radial step happens AT ONE azimuth (the incoming
+        // crossing's); when the outgoing crossing sits in a different fan slot, a short
+        // azimuthal run along the NEW ring covers the difference -- a single chord swung
+        // across the fan and clipped a sibling's descent (0.45 mm off on 23).
+        const double rsRaise = tallestBumpColumn(bumps).first;
+        const double reRaise = tallestBumpColumn(bumpsEnd).first;
         Primitive step;
         step.kind = Primitive::SEG;
-        step.seg = {azPointC(0, 0, s.x, s.y, kPlaneAz),
-                    azPointC(0, 0, n.x, n.y, kPlaneAz)};
+        step.seg = {azPointC(0, -rsRaise, std::hypot(s.x, rsRaise), s.y, azS),
+                    azPointC(0, -reRaise, std::hypot(n.x, reRaise), n.y, azS)};
         step.label = label + " (layer link)";
         step.turnOrdinal = ordinal;
         step.isConnection = true;
         path.prims.push_back(std::move(step));
+        const double dAz = azE - azS;
+        if (std::abs(dAz) > 1e-9) {
+            const double R = std::hypot(n.x, reRaise);
+            Primitive arc;
+            arc.kind = Primitive::ARC3;
+            arc.arc.c = gp_Pnt(0, n.y, -reRaise);
+            // +Y advances azimuth in the azPointC frame; a backward run flips the axis so the
+            // sweep stays positive (OCC refuses negative revolve sweeps).
+            arc.arc.axis = dAz > 0.0 ? gp_XYZ(0, 1, 0) : gp_XYZ(0, -1, 0);
+            arc.arc.v0 = azPointC(0, -reRaise, R, n.y, azS).XYZ() - arc.arc.c.XYZ();
+            arc.arc.sweep = std::abs(dAz);
+            arc.label = label + " (layer link run)";
+            arc.turnOrdinal = ordinal;
+            arc.isConnection = true;
+            path.prims.push_back(std::move(arc));
+        }
         return;
     }
-    Primitive wrap;
-    wrap.kind = Primitive::SPIRAL;
-    // azUnder/azOver stretch the FIRST/LAST wrap a fraction of a radian past the connection
-    // plane, so the wrap TUBE crosses the plane where its terminal lead attaches. Without it
-    // the chain ends in a flat cap exactly AT the crossing and the lead only ever touches
-    // that cap: zero common volume, nothing for the weld to join -- fuse(chain, lead) returns
-    // two disjoint solids and the FEM winding silently loses a lead (ETD34, measured:
-    // nsolid=2 at full mass). Every in-plane lead-side extension was tried and rejected:
-    // along the lead axis it crosses a multi-layer's blocked slot (PQ33 collision); azimuthal
-    // stubs are locally coaxial with the wrap and degenerate the weld. Overshooting the wrap
-    // itself puts a HALF-TUBE lens through the lead, entirely on the wire's own centreline
-    // extension -- no clearance spent, no envelope change worth naming.
-    const double azStart = kPlaneAz - azUnder, azEnd = kPlaneAz + kTwoPi + azOver;
-    appendBumpedSweep(path, s.x, s.y, azStart, n.x, n.y, azEnd, bumps, wireRadius, label, ordinal,
-                      /*isConnection=*/false);
+    // The wrap spans EXACTLY one turn, crossing to crossing. No overshoot: stretching the first
+    // and last wrap past the connection plane existed only so a boolean fuse would find
+    // overlapping material at the lead, and the conformal assembler fuses nothing -- it was
+    // leaving copper sticking out into the lead corridor. Geometry is never extended to satisfy
+    // a downstream algorithm; if two pieces must join, they are constructed to meet.
+    appendBumpedSweep(path, s.x, s.y, azS, n.x, n.y, azE + kTwoPi, bumps, wireRadius,
+                      label, ordinal, /*isConnection=*/false);
 }
 
 // ---- Z-return END-RUN planning (round columns) ------------------------------------------
@@ -3821,35 +4012,44 @@ struct PendingZ {
 // first station. The layer wound afterwards then rides over that dragback, which is what
 // appendRoundWrap's bumps model.
 //
-// The dragback sits on the +Z half (opposite the terminal-lead plane at kPlaneAz), and successive
-// transitions are SPREAD across that half rather than stacked on one azimuth: a stacked return
-// makes every layer above bump at the same place, compounding into a bulge of (layers-1) ODs.
+// The dragback sits at its FAN SLOT azimuth (kPlaneAz when it is the only vertical there): the
+// vertical-fan pre-scan spreads the window's verticals a few degrees apart around the station
+// plane so sibling parallels' returns -- which used to share the plane and run through each
+// other -- each get their own angle, exactly as a real winder lays them side by side.
 void appendZDragback(ConductorPath& path, const PlanePt& s, const PlanePt& n, double wireRadius,
                      double azD, const std::string& label, size_t ordinal,
                      const std::vector<WrapBump>& bumpsOut,
                      const std::vector<WrapBump>& bumpsIn) {
-    // The run-out and run-in are themselves wraps lying on a layer, so they ride over any
-    // dragback already laid on that layer exactly as the turns do.
-    // Wrap on the finishing layer, from the station plane round to the dragback azimuth.
-    appendBumpedSweep(path, s.x, s.y, kPlaneAz, s.x, s.y, azD, bumpsOut, wireRadius,
-                      label + " (dragback run-out)", ordinal, /*isConnection=*/true);
-    // Step out onto the finished layer, run axially back, both at the dragback azimuth. Rounded
-    // corners, like every other junction.
-    // The dragback lies on a surface that earlier dragbacks have ALREADY lifted: at the +Z axis
-    // the layer below it is offset by their accumulated bump length, so this return's own Z
-    // coordinate must carry that offset too -- otherwise it is laid straight through the wire
-    // that is bumping over its predecessor.
-    const double czOut = sweepEndRaise(kPlaneAz, azD, bumpsOut);
-    double czIn = 0.0;
-    for (const auto& bmp : bumpsIn) czIn += bmp.distance;
-    std::vector<gp_Pnt> chain{azPointC(0, czOut, s.x, s.y, azD),
-                              azPointC(0, czIn, n.x, s.y, azD),
-                              azPointC(0, czIn, n.x, n.y, azD)};
-    appendFilletedPolyline(path.prims, chain, wireRadius, label + " (dragback)", ordinal,
+    // The return is CENTRED ON ITS SLOT's axial plane: the wrap arrives at its station on that
+    // plane, steps out parallel to the radial direction onto the next layer's radius, drops
+    // parallel to Y, and steps out once more onto the first station of the layer that continues.
+    // No lateral offset and no stub, so every leg is exactly axis-parallel and the two corners
+    // between them are plain 90-degree junctions the assembler mitres at 45 degrees.
+    // The raise comes from tallestBumpColumn on the SAME list the adjoining wrap used, so the
+    // chain and the wrap meet at one identical point.
+    // The raised positions follow appendBumpedSweep's dropped-centre rule (cz = -raise, radius
+    // hypot(r, raise)) on the SAME bump lists, so the chain and the wraps meet at identical
+    // points.
+    const double chainRaise = tallestBumpColumn(bumpsOut).first;
+    const gp_Pnt pS = azPointC(0, -chainRaise, std::hypot(s.x, chainRaise), s.y, azD);
+    // The turn this return FEEDS rides over it, exactly as every turn at or outside the return's
+    // radius does: its first station therefore sits one wire OD further out than the bare layer
+    // radius. bumpsIn comes from the WINDOW-WIDE pre-scan and already CONTAINS this return (it is
+    // taken at the destination radius, which is the return's own radius), so its diameter must not
+    // be added again.
+    const double destRaise = tallestBumpColumn(bumpsIn).first;
+    // Run-out at the top, descent at the next layer's radius, run-in at the bottom -- the bottom
+    // step is the MIRROR of the top one and closes the chain onto the turn it feeds. It must land
+    // on that turn's ACTUAL start: the conformal assembler bridges an endpoint mismatch by GROWING
+    // the piece, so a descent stopping at the bare station (one OD short of the lifted turn) grew
+    // 1.58 mm further down, straight through the entrance lead.
+    std::vector<gp_Pnt> direct{
+        pS,
+        azPointC(0, -chainRaise, std::hypot(n.x, chainRaise), s.y, azD),
+        azPointC(0, -chainRaise, std::hypot(n.x, chainRaise), n.y, azD),
+        azPointC(0, -destRaise,  std::hypot(n.x, destRaise),  n.y, azD)};
+    appendFilletedPolyline(path.prims, direct, wireRadius, label + " (dragback)", ordinal,
                            /*isLead=*/false, /*isConnection=*/true);
-    // Wrap in on the next layer, arriving at its first station.
-    appendBumpedSweep(path, n.x, n.y, azD, n.x, n.y, kPlaneAz + kTwoPi, bumpsIn, wireRadius,
-                      label + " (dragback run-in)", ordinal, /*isConnection=*/true);
 }
 
 std::vector<Primitive> buildZEndRun(const PlanePt& s, const PlanePt& n, double azA, double azOff,
@@ -3935,8 +4135,7 @@ void planZEndRuns(std::vector<ConductorPath>& paths, std::vector<PendingZ>& pend
                     for (size_t q = 0; q < paths.size(); ++q) {
                         const auto& Q = paths[q];
                         const double qrw = Q.condRadius > 0 ? Q.condRadius : Q.wireRadius;
-                        const double sum = crw + qrw;
-                        const double minGap = sum - kMaxSagFraction * sum - kContactTol;
+                        const double minGap = gateMinSeparation(crw, qrw);
                         for (size_t j = 0; j < Q.prims.size(); ++j) {
                             if (q == pz.pathIdx) {
                                 const auto& pj = Q.prims[j];
@@ -4015,9 +4214,12 @@ RectStation rectStation(const PlanePt& p, double halfW, double halfD, double min
             halfD - inset};
 }
 
+// zLane: WINDOW-GLOBAL end-run lane allocator, shared across every conductor of the window --
+// per-path counters gave two parallels the same lane, i.e. the same edge rows and the same
+// outer descent lane, on top of each other.
 void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStation& s1,
                     const std::string& label, size_t ordinal, double wireRadius,
-                    double yClear = 0.0, double zOutClear = 0.0) {
+                    double yClear, double zOutClear, int& zLane) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -4068,7 +4270,19 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         ramp.turnOrdinal = ordinal;
         path.prims.push_back(std::move(ramp));
     };
-    if (std::abs(s1.zPos - s0.zPos) > 1e-12 && std::abs(s1.y - s0.y) > 1e-12) {
+    const bool crossLayer =
+        std::abs(s1.zPos - s0.zPos) > 1e-12 && std::abs(s1.y - s0.y) > 1e-12;
+    // Same-depth MULTI-ROW serpentine jumps take the end-run too: any in-plane S -- blend or
+    // filleted -- of one parallel unavoidably passes a sibling parallel's route at MKF's row
+    // stagger, which is under the bare clearance (measured 0.30 mm on 04_forward's 3.3V
+    // secondary). Jumps of ~a pitch keep the S-blend (their curvature is mild and their
+    // sibling gap is the full row spacing). The size gate is the smallest jump whose
+    // alternative filleted route could carry the house minimum bend -- anything that big is a
+    // row-skipping return, not a wrap transition.
+    const bool bigLateral =
+        std::abs(s1.zPos - s0.zPos) <= 1e-12 &&
+        0.4 * std::min(0.5 * s0.segX, std::abs(s1.y - s0.y)) >= 1.5 * wireRadius;
+    if (crossLayer || bigLateral) {
         // Layer transition that also moves axially (a Z-order return descends the whole
         // window). Every IN-WINDOW route was measured to collide on 02_flyback_efd25: a
         // diagonal cuts between the layers; descending at the target layer's clearance
@@ -4082,7 +4296,7 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         // destination edge, and re-enter at the crossing. Each return gets its own rows
         // (one OD + 15% apart); MKF's own connection model frees exactly these edge slots
         // (turn-blocking, Coil.cpp).
-        const int lane = path.zReturnLanes++;
+        const int lane = zLane++;
         const double row = (lane + 1) * 2.3 * wireRadius;
         const double yEsrc = (y >= 0 ? 1.0 : -1.0) * (yClear + row);
         const double yEdst = (s1.y >= 0 ? 1.0 : -1.0) * (yClear + row);
@@ -4590,10 +4804,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         wwRadialHeight = wws[0].get_radial_height().value();
     }
 
-    auto planePoint = [&](double x2d, double y2d) {
-        return azPointC(0, 0, x2d + zoff, y2d, kPlaneAz);
-    };
-
     auto station = [](const MAS::Turn* t) -> PlanePt {
         const auto& c = t->get_coordinates();
         if (c.size() < 2) {
@@ -4637,6 +4847,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     std::vector<ConductorPath> paths;
     paths.reserve(conductors.size());
     std::vector<PendingZ> pendingZ;   // Z-returns, planned after all conductors are built
+    int zLaneWindow = 0;              // rect-column end-run lane allocator, WINDOW-global
 
     // Per-winding index (stable, MAS order) for the seam-azimuth stagger. MKF draws every winding's
     // seam/leads on the SAME reference plane, so different windings' terminal leads collide there.
@@ -4646,9 +4857,378 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     std::map<std::string,int> windingIdx;
     for (const auto& ct : conductors) windingIdx.emplace(ct.winding, (int)windingIdx.size());
     const int nWindings = (int)windingIdx.size();
-    // Spread the windings over ~2/3 of the circle so even a tight coil clears (tangential gap at the
-    // winding's outer radius is r*azStagger, far above a wire diameter for any real core).
-    const double azStagger = nWindings > 1 ? (2.0 * kPi / 3.0) / nWindings : 0.0;
+    // Parallel strands per winding: the tangential spread has to divide the core's opening
+    // between every strand of every winding, so it needs the counts up front.
+    std::map<std::string,int> nParallels;
+    for (const auto& ct : conductors)
+        nParallels[ct.winding] = std::max(nParallels[ct.winding], (int)ct.parallel + 1);
+    // The spread itself is budgeted per conductor from the core's measured opening (see the
+    // seam-angle block below); ~2/3 of the circle is only its unconstrained upper bound.
+
+    // EVERY dragback in the window, from EVERY conductor, collected BEFORE anything is built.
+    // A return is a physical obstruction in the winding build: whatever is wound at or outside
+    // its radius rides over it, whether or not it belongs to the same winding or the same
+    // parallel. Collecting them per-conductor (the old behaviour) meant a return laid by
+    // Primary parallel 0 was invisible to parallel 2 and to the Secondary, which wound straight
+    // through it (06_llc_xfmr_eq4128: 487 um between parallel 0's descent and parallel 2's
+    // wrap, against 500 um of copper). The radius rule below still keeps ordering physical --
+    // only turns at or outside a return's radius ride over it, and those are exactly the ones
+    // wound after it.
+    // THE VERTICAL FAN (Alf, 2026-08-05). Every vertical run in the window -- terminal
+    // connections and dragback returns -- used to sit exactly on the station plane, where they
+    // collided: both parallels of a winding dragging back through each other (06/14/23), sibling
+    // entrance leads overlapping (11/24), two windings' leads too close (13). They are now
+    // spread in a TIGHT fan around the plane: each vertical takes the smallest azimuth offset
+    // that clears every other vertical it could actually touch. Verticals in the SAME radial
+    // band need distinct angles; verticals of different bands (returns of different layers,
+    // leads at well-separated heights) reuse the same angle -- except a lead RUNS THROUGH every
+    // layer radius on its way out, so leads are also cleared against any return whose axial span
+    // covers the lead's height.
+    struct LaidDragback { double az; double radius; double diam; };
+    std::vector<LaidDragback> laidDragbacks;
+    std::map<std::pair<size_t, size_t>, double> dragAzOf;   // (conductor, transition) -> azimuth
+    std::map<size_t, double> leadAzIn, leadAzOut;           // conductor -> lead azimuth
+    double fanWidth = 0.0;
+    if (effectivelyRound) {
+        struct Vert {          // one azimuth-slot request
+            int kind;          // 0 = terminal lead GROUP, 1 = dragback
+            size_t ci;         // conductor index (dragbacks)
+            size_t trans;      // transition index (dragbacks)
+            bool entrance;     // leads
+            double r;          // innermost radius of the vertical run
+            double y0, y1;     // axial extent of the run (y0 <= y1)
+            double rw;         // COATED wire radius -- slot clearance is physical
+            double rwBare;     // bare-copper radius -- what the collision gate enforces
+            // Leads: ALL PARALLELS of a winding share ONE slot (their strands must keep the
+            // same length -- Alf), so a lead vert carries every member row and the conductors
+            // it binds.
+            std::vector<double> ys;
+            std::vector<size_t> cis;
+        };
+        std::vector<Vert> verts;
+        struct WireRow {       // one station row, with its conductor's signed advance
+            double r, y, adv, rw;   // rw = BARE radius (the gate's criterion)
+            size_t ci;
+        };
+        std::vector<WireRow> rows;   // NB: WireRow.rw carries the BARE radius: rows are MKF's
+                                     // geometry, and lead corridors past them are planned at
+                                     // the full bare separation (see the drift model below)
+        struct LeadAgg {       // per-(winding, side) lead aggregation
+            double r = 0.0, rw = 0.0, rwB = 0.0;
+            std::vector<double> ys;
+            std::vector<size_t> cis;
+        };
+        std::map<std::pair<std::string, bool>, LeadAgg> leadGroups;
+        for (size_t cv = 0; cv < conductors.size(); ++cv) {
+            const auto& ct = conductors[cv];
+            const MAS::Wire& w = wireMap.at(ct.winding);
+            auto [cw, chh] = TurnBuilder::wireDimensions(w, *ct.turns.front(),
+                                                         /*paintCoating=*/true);
+            const double rwCoat = 0.5 * std::min(cw, chh);
+            auto [bw, bh] = TurnBuilder::wireDimensions(w, *ct.turns.front(),
+                                                        /*paintCoating=*/false);
+            const double rwBare = 0.5 * std::min(bw, bh);
+            // Detection mirrors the emission loop EXACTLY (same wire footprint, same median
+            // pitch), so every dragback the loop emits has a fan azimuth waiting for it.
+            auto [ew, eh] = TurnBuilder::wireDimensions(w, *ct.turns.front(), opts.paintCoating);
+            const bool rectW = w.get_type() == MAS::WireType::RECTANGULAR ||
+                               w.get_type() == MAS::WireType::PLANAR;
+            const double rwEmit = rectW ? 0.5 * std::hypot(ew, eh) : 0.5 * std::min(ew, eh);
+            double mp = 0.0, adv = 0.0;
+            {
+                std::vector<double> pitches;
+                int pos = 0, neg = 0;
+                for (size_t i = 0; i + 1 < ct.turns.size(); ++i) {
+                    PlanePt a = station(ct.turns[i]), b = station(ct.turns[i + 1]);
+                    if (std::abs(b.x - a.x) <= rwEmit) {
+                        const double dy = b.y - a.y;
+                        pitches.push_back(std::abs(dy));
+                        (dy >= 0.0 ? pos : neg)++;
+                    }
+                }
+                if (!pitches.empty()) {
+                    std::sort(pitches.begin(), pitches.end());
+                    mp = pitches[pitches.size() / 2];
+                    if (pos == 0 || neg == 0) adv = (pos > 0 ? mp : -mp);
+                }
+            }
+            // Mirror of the emission loop's TRAILING OUTLET PRUNE (see there): trailing
+            // return/link transitions are not emitted, so they claim no fan slot, lay no
+            // return, and their stations are not obstacle rows.
+            size_t nEmitP = ct.turns.size();
+            while (nEmitP > 2) {
+                const PlanePt a = station(ct.turns[nEmitP - 2]);
+                const PlanePt b = station(ct.turns[nEmitP - 1]);
+                const bool link = std::abs(b.x - a.x) > rwEmit &&
+                                  std::abs(b.y - a.y) <= std::abs(b.x - a.x);
+                if (!link && !isZReturn(a, b, rwEmit, mp, adv)) break;
+                --nEmitP;
+            }
+            for (size_t i = 0; i + 1 < nEmitP; ++i) {
+                PlanePt a = station(ct.turns[i]), b = station(ct.turns[i + 1]);
+                if (isZReturn(a, b, rwEmit, mp, adv))
+                    verts.push_back({1, cv, i, false, b.x, std::min(a.y, b.y),
+                                     std::max(a.y, b.y), rwCoat, rwBare, {}, {}});
+            }
+            const PlanePt pf = station(ct.turns.front()), pl = station(ct.turns[nEmitP - 1]);
+            auto& gin = leadGroups[{ct.winding, true}];
+            gin.r = std::min(gin.r > 0.0 ? gin.r : 1e30, pf.x);
+            gin.rw = rwCoat;
+            gin.rwB = rwBare;
+            gin.ys.push_back(pf.y);
+            gin.cis.push_back(cv);
+            auto& gout = leadGroups[{ct.winding, false}];
+            gout.r = std::min(gout.r > 0.0 ? gout.r : 1e30, pl.x);
+            gout.rw = rwCoat;
+            gout.rwB = rwBare;
+            gout.ys.push_back(pl.y);
+            gout.cis.push_back(cv);
+            for (size_t i = 0; i < nEmitP; ++i) {
+                const PlanePt st = station(ct.turns[i]);
+                rows.push_back({st.x, st.y, adv, rwBare, cv});
+            }
+        }
+        // ONE lead slot per (winding, side): all parallels of a winding leave together at the
+        // same azimuth, so every strand keeps the same length (Alf) -- the slot must clear for
+        // EVERY member row at once.
+        for (const auto& [key, g] : leadGroups) {
+            double yLo = 1e30, yHi = -1e30;
+            for (double yv : g.ys) {
+                yLo = std::min(yLo, yv);
+                yHi = std::max(yHi, yv);
+            }
+            verts.push_back({0, g.cis.front(), 0, key.second, g.r, yLo, yHi, g.rw, g.rwB,
+                             g.ys, g.cis});
+        }
+        // Angular clearance two verticals need between them, taken at the innermost radius where
+        // both exist; 0 when they can never touch. The LAYOUT criterion is the COATED radii
+        // sum -- wires may touch their insulation, never overlap it, exactly how MKF packs
+        // adjacent turns. It sits strictly above the collision gate's fault criterion
+        // (gateMinSeparation on bare copper), so fan-placed geometry can never sit AT the
+        // gate's threshold where sampling noise flips the verdict.
+        auto need = [&](const Vert& A, const Vert& B) -> double {
+            const double dSep = A.rw + B.rw;
+            if (A.kind == 0 && B.kind == 0) {
+                // Two lead groups are STRAIGHT radial runs at their member rows (round columns
+                // never use MKF's tilted 2D routes any more): rows a gate-clearance apart
+                // coexist at the SAME azimuth. Only genuinely overlapping rows need distinct
+                // angles (24_margin: rows 0.53 mm apart on 0.5 mm bare wire).
+                double dyMin = 1e30;
+                for (double ya : A.ys)
+                    for (double yb : B.ys) dyMin = std::min(dyMin, std::abs(ya - yb));
+                if (dyMin > dSep) return 0.0;
+            } else if (A.kind != B.kind) {
+                const Vert& L = A.kind == 0 ? A : B;
+                const Vert& D = A.kind == 0 ? B : A;
+                // A lead crosses the return's radius at its member heights on the way out;
+                // only a group passing clear above/below the descent's axial span -- or one
+                // attaching OUTSIDE the descent's radius, never reaching it -- can share the
+                // angle.
+                bool clear = L.r > D.r + dSep;
+                if (!clear) {
+                    clear = true;
+                    for (double ly : L.ys)
+                        if (ly >= D.y0 - dSep && ly <= D.y1 + dSep) clear = false;
+                }
+                if (clear) return 0.0;
+            } else {
+                // Two dragbacks: a conductor's OWN returns deliberately stack in one column
+                // (layer reuse -- the snap below puts them there), so they never need an
+                // angle between them. Returns of DIFFERENT conductors always take distinct
+                // angles: sharing a column stacks their raises into the other winding's
+                // ride-over (23_interleaved: the secondary's exit rode 1.97 mm -- its own
+                // return piled onto the primary's column -- while its entrance rode 1.07).
+                if (A.ci == B.ci) return 0.0;
+            }
+            // Perpendicular clearance, not the chord: a vertical's RUN-OUT is a radial line
+            // through the neighbour's band, so the closest approach between two slots dAz
+            // apart is r*sin(dAz) at the innermost radius both occupy -- the chord formula
+            // left a same-band dragback pair exactly 0.3 um under the gate.
+            const double rr = std::max(std::min(A.r, B.r), dSep);
+            return std::asin(std::min(1.0, dSep / rr));
+        };
+        // CENTRE-OUT symmetric packing (Alf, 2026-08-05): every vertical takes the FEASIBLE
+        // azimuth CLOSEST TO THE STATION PLANE (0 deg), so the fan hugs the plane and only
+        // spreads as far as real conflicts force it -- the bump treatment (one raised region,
+        // steps at the XY-plane crossings) is centred there, and a vertical that drifts far
+        // off-plane would slide out from under it. Dragbacks are placed FIRST (they live
+        // inside the winding, under every bump); the leads pack around them, ordered by height
+        // so close-height pairs meet their real clearance and far pairs share angles freely.
+        std::stable_sort(verts.begin(), verts.end(), [](const Vert& a, const Vert& b) {
+            if (a.kind != b.kind) return a.kind > b.kind;
+            return a.y0 < b.y0;
+        });
+        // Forbidden azimuth intervals per LEAD: a lead runs radially at its own row, crossing
+        // every ring band outside its attachment, and the wire rising from a nearby crossed
+        // row DRIFTS in y with azimuth (its wrap's pitch). Where that drift brings the wire
+        // within clearance of the lead's row, the azimuth is forbidden -- this is what put
+        // 06_llc's P2 entrance 0.402 mm under P0's outer rows at the plane, and squeezed
+        // 23's secondary entrances between their siblings' rising first wraps.
+        struct AzInterval { double lo, hi; };
+        // Validity bound of the fan's linearized models: half-way to the XY-plane crossings,
+        // where the ride-over halves change regime. The fan-vs-core-opening guard and the
+        // bump-boundary guard both throw far earlier for any real design.
+        const double kFanReach = kPi / 4.0;
+        std::vector<std::vector<AzInterval>> forbid(verts.size());
+        for (size_t k = 0; k < verts.size(); ++k) {
+            const Vert& L = verts[k];
+            if (L.kind != 0) continue;
+            for (const auto& R : rows) {
+                // Rows radially inside the attachment are never crossed; the raises preserve
+                // radial order (a taller stack lies under everything further out), so the
+                // bare-radius test stays valid for the lifted lead too.
+                if (R.r + R.rw < L.r - L.rw - 1e-12) continue;
+                if (std::abs(R.adv) < 1e-12) continue;   // no consistent advance: gate arbitrates
+                // Rows are MKF's own geometry: the corridor past them is planned at the FULL
+                // BARE separation -- the gate's sag allowance (kMaxSagFraction) then remains
+                // as the buffer between plan and verdict, with no invented factor. (The
+                // coated criterion here forbade corridors the gate accepts and drove groups
+                // to the reach edge.)
+                const double clr = L.rwBare + R.rw;
+                // ANY member's attachment row rides WITH the group's slot (the wrap it feeds
+                // starts at that azimuth), so it constrains nothing in absolute azimuth --
+                // the drift model only applies to rows whose crossings sit elsewhere. Without
+                // this the group forbade itself and flew to the reach edge.
+                bool attachRow = false;
+                for (size_t m = 0; m < L.ys.size() && !attachRow; ++m)
+                    attachRow = R.ci == L.cis[m] &&
+                                std::abs(R.y - L.ys[m]) < 0.5 * (L.rwBare + R.rw);
+                if (attachRow) continue;
+                for (size_t m = 0; m < L.ys.size(); ++m) {
+                    const double dy = L.ys[m] - R.y;
+                    const double a1 = (dy - clr) * kTwoPi / R.adv;
+                    const double a2 = (dy + clr) * kTwoPi / R.adv;
+                    AzInterval iv{std::min(a1, a2), std::max(a1, a2)};
+                    if (iv.hi < -kFanReach || iv.lo > kFanReach) continue;
+                    // The linear drift model only means anything within the fan's reach: a
+                    // pair whose forbidden band covers the whole reach cannot be fixed by
+                    // azimuth at all -- leave it to the gate rather than launching the lead
+                    // to a nonsense angle. Intervals are kept UNCLAMPED: truncating one at
+                    // the reach edge fabricated a "feasible" boundary slot there while the
+                    // real forbidden band continued past it.
+                    if (iv.lo <= -kFanReach && iv.hi >= kFanReach) continue;
+                    forbid[k].push_back(iv);
+                }
+            }
+        }
+        std::vector<double> az(verts.size(), 0.0);
+        for (size_t k = 0; k < verts.size(); ++k) {
+            // HARD constraints: the vertical-vs-vertical needs -- geometry the fan itself
+            // places, non-negotiable. SOFT: the row-drift windows -- a linearized model of
+            // MKF's wraps on the layout criterion, deliberately stricter than the gate; when
+            // NO azimuth satisfies both, the vertical takes the tightest hard-feasible slot
+            // and the collision gate keeps the final word (binding the model launched groups
+            // to the reach edge for corridors the gate accepts).
+            auto hardOk = [&](double c) {
+                for (size_t j = 0; j < k; ++j)
+                    if (std::abs(c - az[j]) + 1e-12 < need(verts[j], verts[k])) return false;
+                return true;
+            };
+            auto softOk = [&](double c) {
+                for (const auto& iv : forbid[k])
+                    if (c > iv.lo + 1e-12 && c < iv.hi - 1e-12) return false;
+                return true;
+            };
+            bool have = false;
+            double best = 0.0;
+            auto consider = [&](double c, bool withSoft) {
+                if (!hardOk(c) || (withSoft && !softOk(c))) return;
+                // Closest to the plane wins; exact ties go positive (determinism).
+                if (!have || std::abs(c) < std::abs(best) - 1e-12 ||
+                    (std::abs(c) <= std::abs(best) + 1e-12 && c > best)) {
+                    best = c;
+                    have = true;
+                }
+            };
+            // A conductor's returns SNAP onto the azimuth its earlier returns already took
+            // whenever that is feasible: different-layer returns of one conductor stack in ONE
+            // column (the layer-reuse rule, and what tallestBumpColumn's raise accounting
+            // needs). Without the snap they landed fractions of a degree apart -- neither
+            // stacked nor separated, and the ride-over raise under-counted the pile.
+            for (int tier = 0; tier < 2 && !have; ++tier) {
+                if (verts[k].kind != 1) break;
+                for (size_t j = 0; j < k; ++j)
+                    if (verts[j].kind == 1 && verts[j].ci == verts[k].ci)
+                        consider(az[j], tier == 0);
+            }
+            std::vector<double> cand{0.0};
+            for (size_t j = 0; j < k; ++j) {
+                const double nd = need(verts[j], verts[k]);
+                if (nd > 0.0) {
+                    cand.push_back(az[j] + nd);
+                    cand.push_back(az[j] - nd);
+                }
+            }
+            for (const auto& iv : forbid[k]) {
+                // Only TRUE interval endpoints inside the reach are meaningful slots.
+                if (std::abs(iv.lo) <= kFanReach) cand.push_back(iv.lo);
+                if (std::abs(iv.hi) <= kFanReach) cand.push_back(iv.hi);
+            }
+            for (int tier = 0; tier < 2 && !have; ++tier)
+                for (double c : cand) consider(c, tier == 0);
+            // max_j(az_j + need_jk) always satisfies the hard tier, so a slot always exists.
+            az[k] = best;
+        }
+        double lo = 0.0, hi = 0.0;
+        for (double a : az) { lo = std::min(lo, a); hi = std::max(hi, a); }
+        fanWidth = hi - lo;
+        for (size_t k = 0; k < verts.size(); ++k) {
+            const double a = kPlaneAz + az[k];
+            if (verts[k].kind == 1) {
+                dragAzOf[{verts[k].ci, verts[k].trans}] = a;
+            } else {
+                // The group's slot binds EVERY parallel of the winding on this side.
+                for (size_t m : verts[k].cis) {
+                    if (verts[k].entrance) leadAzIn[m] = a;
+                    else                   leadAzOut[m] = a;
+                }
+            }
+        }
+        // CONSECUTIVE dragback transitions of one conductor (a single-turn layer) chain end to
+        // start: force them onto one azimuth so the chain stays connected.
+        for (auto& [key, a] : dragAzOf) {
+            if (key.second == 0) continue;
+            auto prev = dragAzOf.find({key.first, key.second - 1});
+            if (prev != dragAzOf.end()) a = prev->second;
+        }
+        for (const auto& v : verts)
+            if (v.kind == 1)
+                laidDragbacks.push_back({dragAzOf.at({v.ci, v.trans}), v.r, 2.0 * v.rw});
+        if (std::getenv("MVB_DRAG_DIAG")) {
+            std::cerr << "[fan] " << verts.size() << " verticals, width "
+                      << fanWidth * 180.0 / kPi << " deg\n";
+            for (size_t k = 0; k < verts.size(); ++k)
+                for (const auto& iv : forbid[k])
+                    std::cerr << "[fan-forbid] k=" << k << " kind=" << verts[k].kind
+                              << " [" << iv.lo * 180.0 / kPi << "," << iv.hi * 180.0 / kPi
+                              << "] deg\n";
+            for (size_t k = 0; k < verts.size(); ++k)
+                std::cerr << "[fan]   " << (verts[k].kind ? "drag" : (verts[k].entrance
+                          ? "lead-in" : "lead-out")) << " ci=" << verts[k].ci
+                          << " trans=" << verts[k].trans << " r=" << verts[k].r * 1e3
+                          << "mm y=[" << verts[k].y0 * 1e3 << "," << verts[k].y1 * 1e3
+                          << "]mm az=" << az[k] * 180.0 / kPi
+                          << " deg off-plane\n";
+        }
+    }
+    // Tallest vertical-fan column overall: every lead must clear it on its way out, so the
+    // common tip radius sits this much further beyond the winding.
+    double fanMaxRaise = 0.0;
+    {
+        std::vector<std::pair<double, double>> cols;
+        for (const auto& ld : laidDragbacks) {
+            bool found = false;
+            for (auto& c : cols) {
+                if (std::abs(std::remainder(ld.az - c.first, kTwoPi)) < 1e-9) {
+                    c.second += ld.diam;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) cols.push_back({ld.az, ld.diam});
+        }
+        for (const auto& c : cols) fanMaxRaise = std::max(fanMaxRaise, c.second);
+    }
 
     for (size_t ci = 0; ci < conductors.size(); ++ci) {
         const auto& ct = conductors[ci];
@@ -5219,8 +5799,25 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
         }
 
+        // czRaise: how far the turn this lead attaches to has been lifted by the dragbacks it
+        // rides over. The lead must meet the wire WHERE IT ACTUALLY IS, not at the nominal
+        // station, or it is laid straight through the bumped turn.
+        // How far the terminal leads stick OUT past the winding, in the connection
+        // plane's radial (-Z) direction — the winding-window opening side. Like the
+        // toroidal lead ("radially outward, past the outer diameter and beyond"), the
+        // concentric lead runs out past the outermost turn so the flat terminal face sits
+        // clear of the coil for FEM. maxTurnRadius is the outermost crossing.
+        double maxTurnRadius = 0.0;
+        for (const MAS::Turn* t : turns)
+            maxTurnRadius = std::max(maxTurnRadius, station(t).x);
+        // The tip plane sits beyond the winding AND beyond the tallest vertical-fan column, so
+        // a lifted lead still runs OUTWARD all the way. Entrance and exit share the plane, so
+        // a conductor's two terminals finish on the same face.
+        const double leadTipRadius = maxTurnRadius + 4.0 * (2.0 * wireRadius) + fanMaxRaise;
+
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
-                                 size_t ordinal, bool stationAtFront) {
+                                 size_t ordinal, bool stationAtFront, double liftRaise = 0.0,
+                                 double azLead = kPlaneAz) {
             // Absorb intermediate waypoints closer than the wire radius to their
             // neighbour: a jog shorter than the wire's own radius lies entirely inside
             // the pipe body of the adjacent edge (and inside MKF's drawn rectangle,
@@ -5255,8 +5852,33 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // ROUND wire gets rounded corners (the toroidal treatment); RECT wire keeps the
             // mitred butt its own machinery expects.
             std::vector<gp_Pnt> leadPts;
-            leadPts.reserve(kept.size());
-            for (const auto& q : kept) leadPts.push_back(planePoint(q.x, q.y));
+            leadPts.reserve(kept.size() + 1);
+            for (const auto& q : kept) leadPts.push_back(azPointC(0, 0, q.x + zoff, q.y, azLead));
+            // The lead runs STRAIGHT OUT at the level the turn finishes (Alf): every point,
+            // tip included, carries the dropped-centre lift the adjoining wrap ends with
+            // (cz = -raise, radius hypot(r, raise), from tallestBumpColumn on the same bump
+            // list), so the attachment matches the wrap exactly and the run never dips back
+            // to the bare radius -- the un-dip read as a zigzag at the exits. The TIP's
+            // radius is chosen so it lands exactly on the conductor's common tip PLANE
+            // (z = -leadTipRadius), whatever the lift or fan slot: entrance and exit still
+            // finish on the same outermost face.
+            if (!rectWire && leadPts.size() > 1) {
+                const size_t tip = stationAtFront ? leadPts.size() - 1 : 0;
+                const double sinA = std::sin(azLead);
+                for (size_t i = 0; i < leadPts.size(); ++i) {
+                    if (i == tip) {
+                        leadPts[i] = azPointC(0, -liftRaise,
+                                              (leadTipRadius - liftRaise) / sinA, kept[i].y,
+                                              azLead);
+                    } else if (liftRaise > 0.0) {
+                        leadPts[i] = azPointC(0, -liftRaise,
+                                              std::hypot(kept[i].x + zoff, liftRaise),
+                                              kept[i].y, azLead);
+                    }
+                }
+            }
+            // The lead lies in its fan slot's axial plane and runs straight out radially, like
+            // the dragback.
             if (!rectWire) {
                 appendFilletedPolyline(path.prims, leadPts, wireRadius, what, ordinal,
                                        /*isLead=*/true, /*isConnection=*/false);
@@ -5275,15 +5897,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
         };
 
-        // How far the terminal leads stick OUT past the winding, in the connection
-        // plane's radial (-Z) direction — the winding-window opening side. Like the
-        // toroidal lead ("radially outward, past the outer diameter and beyond"), the
-        // concentric lead runs out past the outermost turn so the flat terminal face sits
-        // clear of the coil for FEM. maxTurnRadius is the outermost crossing.
-        double maxTurnRadius = 0.0;
-        for (const MAS::Turn* t : turns)
-            maxTurnRadius = std::max(maxTurnRadius, station(t).x);
-        const double leadTipRadius = maxTurnRadius + 4.0 * (2.0 * wireRadius);
         auto extendBorder = [&](std::vector<PlanePt>& wp) {
             // The border waypoint is the one farthest out radially; push it to leadTipRadius.
             PlanePt* outer = &wp.front();
@@ -5291,64 +5904,147 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             outer->x = std::max(outer->x, leadTipRadius);
         };
 
-        // Entrance: MKF's drawn route, walked from the border TO the first station, then
-        // extended straight out so the terminal sticks clear of the coil.
-        {
-            auto wp = terminalWaypoints(entranceGroup, first, path.name + " entrance");
-            extendBorder(wp);
-            std::reverse(wp.begin(), wp.end());
-            pushPlaneSegs(wp, "entrance lead", 0, /*stationAtFront=*/false);
-        }
-
         // The conductor's typical within-layer axial advance per wrap: median |dy| over its
         // same-radius consecutive crossings. Calibrates the Z-transition detection so sparse
         // windings (pitch of several wire-ODs) keep their ordinary helix wraps.
-        double medianPitch = 0.0;
+        double medianPitch = 0.0, zOrderAdvance = 0.0;
         {
             std::vector<double> pitches;
+            int pos = 0, neg = 0;
             for (size_t i = 0; i + 1 < turns.size(); ++i) {
                 PlanePt a = station(turns[i]), b = station(turns[i + 1]);
-                if (std::abs(b.x - a.x) <= wireRadius) pitches.push_back(std::abs(b.y - a.y));
+                if (std::abs(b.x - a.x) <= wireRadius) {
+                    const double dy = b.y - a.y;
+                    pitches.push_back(std::abs(dy));
+                    (dy >= 0.0 ? pos : neg)++;
+                }
             }
             if (!pitches.empty()) {
                 std::sort(pitches.begin(), pitches.end());
                 medianPitch = pitches[pitches.size() / 2];
+                if (pos == 0 || neg == 0) zOrderAdvance = (pos > 0 ? medianPitch : -medianPitch);
             }
+        }
+        // TRAILING OUTLET PRUNE (Alf, 2026-08-06): transitions at the END of a conductor that
+        // are returns or radial links carry no revolution -- they are connection routing, and
+        // the terminal instead exits STRAIGHT from where the last real wrap finishes
+        // (23_interleaved secondary: the outer transition stations produced stub/chain zigzags
+        // at the top; "SHOULD NOT EXIST"). The pruned stations are not visited by the copper.
+        size_t nEmit = turns.size();
+        if (effectivelyRound) {
+            while (nEmit > 2) {
+                const PlanePt a = station(turns[nEmit - 2]), b = station(turns[nEmit - 1]);
+                const bool link = std::abs(b.x - a.x) > wireRadius &&
+                                  std::abs(b.y - a.y) <= std::abs(b.x - a.x);
+                if (!link && !isZReturn(a, b, wireRadius, medianPitch, zOrderAdvance)) break;
+                --nEmit;
+            }
+            last = station(turns[nEmit - 1]);
         }
         // Wraps between consecutive crossings. Z-returns are only RECORDED here (the connecting
         // end-run is planned after every conductor is built, against the full obstacle field —
         // see planZEndRuns); ordinary wraps and serpentine links are appended directly.
-        // Z DRAGBACKS: one azimuth per transition, SPREAD over the +Z half (opposite the
-        // terminal-lead plane). Stacking every return on one azimuth would make each layer above
-        // bump at the same place, compounding into a bulge of (layers-1) wire ODs; spreading
-        // keeps every bump a single OD. Assigned up front so the wraps -- emitted in the same
-        // pass -- already know which dragbacks they must ride over.
+        // Z DRAGBACKS: one azimuth per transition, from the vertical-fan pre-scan -- assigned
+        // up front so the wraps, emitted in the same pass, already know which dragbacks they
+        // must ride over. The pre-scan mirrors this detection exactly; a transition it did not
+        // see is a code drift, not a layout condition, so it throws.
         std::map<size_t, double> zDragbackAzimuth;
         if (effectivelyRound) {
-            std::vector<size_t> zAt;
-            for (size_t i = 0; i + 1 < turns.size(); ++i)
-                if (isZReturn(station(turns[i]), station(turns[i + 1]), wireRadius, medianPitch))
-                    zAt.push_back(i);
-            // ALWAYS the +Z axis (opposite the terminal-lead plane at kPlaneAz). Spreading the
-            // returns around that half was tried and dropped: a dragback is poor practice to
-            // begin with, so a design carries one or two, and the compounding a shared azimuth
-            // could cause never materialises at that count.
-            for (size_t m : zAt) zDragbackAzimuth[m] = kPlaneAz + kPi;
+            for (size_t i = 0; i + 1 < nEmit; ++i) {
+                if (!isZReturn(station(turns[i]), station(turns[i + 1]), wireRadius, medianPitch,
+                               zOrderAdvance))
+                    continue;
+                auto it = dragAzOf.find({ci, i});
+                if (it == dragAzOf.end()) {
+                    throw std::runtime_error(
+                        "ConductorBuilder: dragback transition " + std::to_string(i) + " of " +
+                        path.name + " has no azimuth in the vertical-fan pre-scan (detection "
+                        "drift between the pre-scan and the emission loop)");
+                }
+                zDragbackAzimuth[i] = it->second;
+            }
         }
-        // Dragbacks already laid down (azimuth + the radius their axial run occupies). A turn
-        // rides over every dragback at or inside its own radius.
-        std::vector<std::pair<double, double>> laidDragbacks;
+        // Dragbacks (azimuth + the radius their axial run occupies) come from the WINDOW-WIDE
+        // pre-scan above, so a turn rides over every return in the window at or inside its own
+        // radius -- not just the ones its own conductor laid.
         auto bumpsForTurn = [&](double turnRadius) {
             std::vector<WrapBump> out;
-            for (const auto& [az, radius] : laidDragbacks) {
-                if (turnRadius < radius - wireRadius) continue;
-                // Raise by the dragback wire's own diameter: that is what has to be cleared.
-                out.push_back({az, 2.0 * wireRadius});
+            for (const auto& ld : laidDragbacks) {
+                // EVERY layer at or outside a return rides over it. Returns SHARING an azimuth
+                // stack (their raises add -- see tallestBumpColumn); returns in different fan
+                // slots sit side by side. A return lies in its destination layer's space, so
+                // that layer steps over it; the step puts the wire where the layer outside would
+                // be, so that one steps over too, and so on outward.
+                if (turnRadius < ld.radius - wireRadius) continue;
+                // Raise by the dragback wire's own COATED diameter: that is what has to be
+                // cleared, and different windings use different wire.
+                out.push_back({ld.az, ld.diam});
             }
             return out;
         };
+        // Crossing azimuths: kPlaneAz normally; the fan slot where the crossing belongs to a
+        // dragback (both its ends) or to a terminal lead (the first/last crossing).
+        std::vector<double> crossAz(nEmit, kPlaneAz);
+        double azEntrance = kPlaneAz, azExit = kPlaneAz;
+        if (effectivelyRound && !turns.empty()) {
+            if (auto it = leadAzIn.find(ci); it != leadAzIn.end()) azEntrance = it->second;
+            if (auto it = leadAzOut.find(ci); it != leadAzOut.end()) azExit = it->second;
+            crossAz.front() = azEntrance;
+            crossAz.back() = azExit;
+            for (const auto& [m, azv] : zDragbackAzimuth) {
+                crossAz[m] = azv;
+                crossAz[m + 1] = azv;
+            }
+            // A LAYER LINK never changes azimuth: it hands its own azimuth FORWARD to the
+            // next crossing, so the radial step and whatever follows (usually the exit lead)
+            // stay collinear -- one straight run out to the tip plane, instead of stepping
+            // out, walking an arc along the ring to a different slot, and going out again
+            // (the zigzag Alf flagged on 23's secondary exits). A link feeding straight into
+            // a dragback keeps that dragback's own slot (the link's azimuthal run covers the
+            // difference there).
+            for (size_t i = 0; i + 1 < nEmit; ++i) {
+                const PlanePt a = station(turns[i]), b = station(turns[i + 1]);
+                const bool isLink = std::abs(b.x - a.x) > wireRadius &&
+                                    std::abs(b.y - a.y) <= std::abs(b.x - a.x);
+                if (isLink && !zDragbackAzimuth.count(i + 1)) crossAz[i + 1] = crossAz[i];
+            }
+            // A dragback or link owns its crossings outright -- the lead then joins AT that
+            // azimuth rather than pulling the shared crossing off it.
+            if (turns.size() > 1) {
+                azEntrance = crossAz.front();
+                azExit = crossAz.back();
+            }
+        }
+
+        // Entrance: MKF's drawn route, walked from the border TO the first station, then
+        // extended straight out so the terminal sticks clear of the coil. Emitted at the
+        // entrance's fan azimuth (the first crossing's), so the first wrap starts exactly
+        // where the lead delivers the wire -- INCLUDING the wrap's raise: an interleaved
+        // winding's first turn sits outside another winding's returns, so its first wrap
+        // starts ridden-up and the lead must attach at that lifted radius (23_interleaved:
+        // the bare secondary entrance ran level with the primary's raised head, 0.31 mm off).
+        {
+            std::vector<PlanePt> wp;
+            if (!effectivelyRound) {
+                wp = terminalWaypoints(entranceGroup, first, path.name + " entrance");
+            } else {
+                // ROUND columns: straight in radially at the first station's own row, exactly
+                // like the exit. MKF's drawn 2D entrance route approaches along the window's
+                // edge corridor, whose y drifts between the parallels' rows -- at the lifted
+                // radius that ran the lead level with a SIBLING's ridden-up first wrap
+                // (23_interleaved: s1's route at y -3.04 against s0's raised row at -3.39).
+                wp.push_back(first);
+                wp.push_back({leadTipRadius, first.y});
+            }
+            extendBorder(wp);
+            std::reverse(wp.begin(), wp.end());
+            const double entrRaise =
+                tallestBumpColumn(bumpsForTurn(station(turns.front()).x)).first;
+            pushPlaneSegs(wp, "entrance lead", 0, /*stationAtFront=*/false, entrRaise,
+                          azEntrance);
+        }
         const bool dragDiag = std::getenv("MVB_DRAG_DIAG") != nullptr;
-        for (size_t i = 0; i + 1 < turns.size(); ++i) {
+        for (size_t i = 0; i + 1 < nEmit; ++i) {
             PlanePt s = station(turns[i]);
             PlanePt nxt = station(turns[i + 1]);
             std::string label = "wrap '" + turns[i]->get_name() + "' -> '" +
@@ -5363,9 +6059,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (effectivelyRound) {
                 auto zit = zDragbackAzimuth.find(i);
                 if (zit != zDragbackAzimuth.end()) {
+                    // NB: no push_back here -- every return in the window, this one included, is
+                    // already in laidDragbacks from the pre-scan.
                     appendZDragback(path, s, nxt, wireRadius, zit->second, label, i,
                                     bumpsForTurn(s.x), bumpsForTurn(nxt.x));
-                    laidDragbacks.push_back({zit->second, nxt.x});
                     continue;
                 }
                 const bool weldable = path.femReady && turns.size() > 1 &&
@@ -5373,21 +6070,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // A wrap overshoots wherever the chain BREAKS at its end: terminal leads
                 // (first/last transition), serpentine U-links, and Z end-runs all butt the
                 // wrap in a flat cap at the station -- every such junction needs the lens.
-                // Between two consecutive WRAPS the chain is continuous (one swept run) and
-                // an overshoot would self-overlap the run's own spine, so none is added.
-                auto isBreakAt = [&](size_t k) -> bool {   // does transition k break the chain?
-                    if (k >= turns.size() - 1) return true;             // beyond: a lead
-                    PlanePt a = station(turns[k]), b = station(turns[k + 1]);
-                    if (std::abs(b.x - a.x) > wireRadius &&
-                        std::abs(b.y - a.y) <= std::abs(b.x - a.x)) return true;   // U-link
-                    return isZReturn(a, b, wireRadius, medianPitch);               // Z end-run
-                };
-                const double azU = (weldable && (i == 0 || isBreakAt(i - 1)) && s.x > 1e-9)
-                                   ? 0.75 * wireRadius / s.x : 0.0;
-                const double azO = (weldable && isBreakAt(i + 1) && nxt.x > 1e-9)
-                                   ? 0.75 * wireRadius / nxt.x : 0.0;
-                appendRoundWrap(path, s, nxt, wireRadius, label, i, azU, azO,
-                                bumpsForTurn(s.x));
+                appendRoundWrap(path, s, nxt, wireRadius, label, i, bumpsForTurn(s.x),
+                                crossAz[i], crossAz[i + 1], bumpsForTurn(nxt.x));
             } else if (columnShape == MAS::ColumnShape::RECTANGULAR) {
                 {
                     // Extents the end-run must clear, over EVERY winding in the window
@@ -5403,7 +6087,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     appendRectWrap(path,
                                    rectStation(s, halfW, halfD, minBend, path.name),
                                    rectStation(nxt, halfW, halfD, minBend, path.name),
-                                   label, i, wireRadius, yClear, zOutClear);
+                                   label, i, wireRadius, yClear, zOutClear, zLaneWindow);
                 }
             } else {   // OBLONG with a real straight section
                 appendOblongWrap(path, s, nxt, oblongHalf, label, i);
@@ -5415,14 +6099,26 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // minimal one: from the last station straight out radially at its own level.
         {
             std::vector<PlanePt> wp;
-            if (!exitGroup.empty()) {
+            if (!exitGroup.empty() && !effectivelyRound) {
                 wp = terminalWaypoints(exitGroup, last, path.name + " exit");
             } else {
+                // ROUND columns: straight out radially at the last station's own row (Alf: the
+                // output connections go straight out from the turn). MKF's drawn 2D exit route
+                // hugs the window's edge row, which in the raised, fanned 3D geometry runs the
+                // lead axially along ANOTHER parallel's ridden-up last wrap at the same radius
+                // (23_interleaved: P0's edge jog crossed P1's raised turn 0.8 um off centre).
                 wp.push_back(last);
                 wp.push_back({leadTipRadius, last.y});
             }
             extendBorder(wp);
-            pushPlaneSegs(wp, "exit lead", turns.size() - 1, /*stationAtFront=*/true);
+            // The exit lead leaves the OUTERMOST turn, which rides over every dragback beneath
+            // it, so it is z-lifted by the fan's tallest column -- computed by the SAME helper
+            // on the SAME bump list as the last wrap's end raise, so the two meet at one
+            // identical point.
+            const double exitRaise =
+                tallestBumpColumn(bumpsForTurn(station(turns[nEmit - 1]).x)).first;
+            pushPlaneSegs(wp, "exit lead", nEmit - 1, /*stationAtFront=*/true, exitRaise,
+                          azExit);
         }
 
         // Stagger this winding's seam azimuth so its leads clear the other windings' leads (all drawn
@@ -5437,7 +6133,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // leads/links/end-runs TANGENTIALLY from its sibling strands (physically: the strands
         // exit side by side) without touching any turn position.
         const int wi = windingIdx.at(ct.winding);
-        double seamAngle = effectivelyRound ? (wi * azStagger) : ((wi % 2) * kPi);
+        // The winding/parallel stagger is applied AFTER the core probe: how far the leads may be
+        // spread depends on how wide the core's opening actually is (see below).
+        double seamAngle = effectivelyRound ? 0.0 : ((wi % 2) * kPi);
         // Aim the whole seam sector at the core's window OPENING (Options::leadExitAzimuth):
         // a rigid rotation about the column axis, exactly like the stagger. ROUND columns
         // rotate freely; RECT/OBLONG columns only map onto themselves under 180 degrees, so
@@ -5448,6 +6146,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         if (std::getenv("MVB_DIAG"))
             std::cerr << "[lead-aim] gate: effRound=" << effectivelyRound
                       << " obstacles=" << opts.coreObstacles.size() << "\n";
+        double freeArc = kTwoPi;   // angular width of the core's opening; kTwoPi = unconstrained
         if (effectivelyRound && (!opts.coreObstacles.empty() || !std::isnan(opts.leadExitAzimuth))) {
             double exitAz = opts.leadExitAzimuth;
             if (!opts.coreObstacles.empty()) {
@@ -5462,7 +6161,20 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // Probe the WHOLE radial run of the lead, not just its tip: on a PQ the tip
                 // radius clears the core entirely (fully free) while the run itself passes
                 // straight through a plate at intermediate radii.
-                const double rTip = maxTurnR + 4.0 * (2.0 * wireRadius);
+                // Take the outer bound from the COPPER THAT WAS ACTUALLY EMITTED, never from
+                // leadTipRadius's formula: extendBorder keeps MKF's own border waypoint whenever
+                // it reaches further out, so the real tip can sit well beyond
+                // maxTurnRadius + 8*wireRadius (measured on 23_interleaved_llc_pq3530: tip at
+                // r = 16.0 mm against a formula value of 14.3 mm). Probing only to the formula
+                // samples the inside of the winding window, reports every azimuth free, aims
+                // nothing -- and the lead runs on into the core plate.
+                double rLead = 0.0;
+                for (const auto& pr : path.prims) {
+                    if (!pr.isLead) continue;
+                    auto [pa, pb] = primEndpoints(pr);
+                    rLead = std::max({rLead, std::hypot(pa.X(), pa.Z()), std::hypot(pb.X(), pb.Z())});
+                }
+                const double rTip = std::max(maxTurnR + 4.0 * (2.0 * wireRadius), rLead);
                 const double r0 = maxTurnR + wireRadius;
                 const double yProbe[3] = {0.0, 0.6 * maxAbsY, -0.6 * maxAbsY};
                 const int N = 360, NR = 6;
@@ -5497,26 +6209,82 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
                 if (bestLen > 0 && bestLen < 2 * N - 1) {
                     exitAz = kTwoPi * (bestStart + 0.5 * bestLen) / N;
+                    freeArc = kTwoPi * bestLen / N;
                     if (std::getenv("MVB_DIAG"))
                         std::cerr << "[lead-aim] " << path.name << ": core-free arc "
                                   << (360.0 * bestLen / N) << " deg, exit az "
                                   << (exitAz * 180.0 / kPi) << " deg (rTip=" << rTip * 1e3
                                   << "mm)\n";
-                }   // fully free or fully blocked: keep the given/default azimuth
+                } else if (bestLen == 0) {
+                    // FULLY BLOCKED: the core occupies every azimuth over the lead's radial run,
+                    // so there is no opening to aim at and any azimuth terminates the lead inside
+                    // the core. Refuse loudly -- silently keeping the default azimuth is what let
+                    // 23_interleaved_llc's secondaries exit at 145-150 deg straight into the PQ
+                    // plate and still export.
+                    throw std::runtime_error(
+                        "ConductorBuilder: no core-free exit azimuth for " + path.name +
+                        "'s terminal leads -- the core occupies every azimuth over the lead's "
+                        "radial run r=[" + std::to_string(r0 * 1e3) + "," +
+                        std::to_string(rTip * 1e3) + "] mm. Set Options::leadExitAzimuth "
+                        "explicitly, or shorten the lead so it stays inside the window.");
+                } else if (std::getenv("MVB_DIAG")) {
+                    // Genuinely free at every azimuth: nothing to aim at, keep the default.
+                    std::cerr << "[lead-aim] " << path.name << ": no aim needed -- core free at "
+                              << "every azimuth over r=[" << r0 * 1e3 << "," << rTip * 1e3
+                              << "]mm\n";
+                }
+            }
+            // The vertical fan swings with the seam as one rigid piece: if it is wider than the
+            // core's free opening, some lead necessarily runs into the core no matter where the
+            // aim points -- refuse loudly rather than export copper through a core plate.
+            if (freeArc < kTwoPi && fanWidth > freeArc) {
+                throw std::runtime_error(
+                    "ConductorBuilder: the vertical-connection fan (" +
+                    std::to_string(fanWidth * 180.0 / kPi) + " deg) is wider than the core's "
+                    "free opening (" + std::to_string(freeArc * 180.0 / kPi) + " deg) for " +
+                    path.name + " -- the window's connections cannot all clear the core");
             }
             if (!std::isnan(exitAz)) seamAngle += exitAz - kPlaneAz;
         }
-        if (effectivelyRound && ct.parallel > 0) {
-            double minR = 1e30;
-            for (const MAS::Turn* t : turns) minR = std::min(minR, station(t).x);
-            // NEGATIVE direction: a helix wrap is monotone in azimuth, so just BEHIND the
-            // connection plane every sibling wrap is near its FAR-end y — the lead verticals
-            // land where the other strands' helices are farthest away.
-            seamAngle -= ct.parallel * std::min(0.35, 2.6 * wireRadius / std::max(minR, 1e-9));
-        }
+        // NO TANGENTIAL SPREAD (Alf, 2026-08-04): every winding's and every parallel's terminals
+        // enter and leave on the SAME station plane, straight out along -Z. The spread existed
+        // only to stop different conductors' leads from sharing that plane, but it moved leads out
+        // of the core's opening (23_interleaved_llc_pq3530: secondaries at 145-150 deg, inside the
+        // PQ plate) and it makes the geometry far harder to read. Lead-lead clearance is the
+        // layout's job; where the leads genuinely collide the gate now says so instead of the
+        // spread hiding it.
         rotatePathAboutY(path, seamAngle);
         path.seamRot = seamAngle;
         paths.push_back(std::move(path));
+    }
+
+    // MVB_LEAD_CORE_CHECK: verify what the aim only PREDICTED -- classify the emitted lead
+    // copper against the core solids and report any sample inside one. The aim probes a coarse
+    // azimuth/radius/height lattice before the leads exist; this checks the actual centreline
+    // after the seam rotation, which is the claim that matters.
+    if (std::getenv("MVB_LEAD_CORE_CHECK") && !opts.coreObstacles.empty()) {
+        int hits = 0;
+        for (const auto& p : paths) {
+            for (const auto& pr : p.prims) {
+                if (!pr.isLead) continue;
+                for (const auto& q : samplePrim(pr, p.wireRadius)) {
+                    for (const auto& obst : opts.coreObstacles) {
+                        for (TopExp_Explorer se(obst, TopAbs_SOLID); se.More(); se.Next()) {
+                            BRepClass3d_SolidClassifier cls(se.Current());
+                            cls.Perform(q, 1e-7);
+                            if (cls.State() == TopAbs_IN) {
+                                std::cerr << "[lead-core] " << p.name << " '" << pr.label
+                                          << "' sample (" << q.X() * 1e3 << "," << q.Y() * 1e3
+                                          << "," << q.Z() * 1e3 << ") mm is INSIDE the core\n";
+                                ++hits;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::cerr << "[lead-core] VERDICT: " << (hits ? "FAIL" : "PASS") << " (" << hits
+                  << " lead samples inside the core)\n";
     }
 
     // Deferred Z-return end-runs: planned against the FULL obstacle field (every conductor's
