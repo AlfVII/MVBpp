@@ -9,6 +9,7 @@
 #include "support/Utils.h"
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
 #include <TopExp.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
@@ -1297,14 +1298,12 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
         auto firstPts = samplePrim(*prims[0], wireRadius);
         gp_Vec t0(firstPts[1].XYZ() - firstPts[0].XYZ());
         if (t0.Magnitude() < 1e-12) return TopoDS_Shape();
-        // Exact circular profile: one swept surface per edge instead of one per polygon
-        // facet (a 16-gon profile makes multi-wrap sweeps take minutes), and the true
-        // wire cross-section is round anyway.
-        // The conductor cross-section stays an EXACT circle regardless of --segments (which
-        // facets only the core/bobbin): a faceted swept conductor multiplies the face count,
-        // which slows the sweep, makes the single-body self-intersection check intractable, and
-        // buys nothing -- the FEM mesher tessellates the analytic wire at its own facet density.
-        TopoDS_Wire prof = wireProfileWire(firstPts.front(), gp_Dir(t0), wireRadius, 0);
+        // The profile ALWAYS follows the requested faceting (Alf: one setting, no exceptions;
+        // segments <= 0 is the explicit exact-round request). The old hardcoded exact circle
+        // sped the sweep up but produced PERIODIC surfaces gmsh refuses to mesh, and mixed
+        // round turns into faceted conductors whenever different paths built them.
+        TopoDS_Wire prof =
+            wireProfileWire(firstPts.front(), gp_Dir(t0), wireRadius, wirePolygonSegments);
 
         BRepOffsetAPI_MakePipeShell ps(spine);
         // TRANSITION MODE. Corner machinery is only correct where there IS a corner, and both of
@@ -2471,8 +2470,9 @@ TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double 
                 auto pts = samplePrim(pr, wireRadius);
                 gp_Vec t0(pts[1].XYZ() - pts[0].XYZ());
                 if (t0.Magnitude() > 1e-12) {
+                    // Follows the requested faceting -- never a hardcoded round profile.
                     TopoDS_Wire prof = wireProfileWire(pts.front(), gp_Dir(t0),
-                                                       wireRadius, 0);
+                                                       wireRadius, wirePolygonSegments);
                     BRepOffsetAPI_MakePipeShell ps(spine);
                     ps.Add(prof);
                     ps.Build();
@@ -2858,19 +2858,39 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
                                            gp_Pnt(ends.second.XYZ() + tB.XYZ() * overB)).Edge());
         if (!mw.IsDone()) return {};
         TopoDS_Wire spine = mw.Wire();
-        // MakePipeShell can refuse a FACETED profile on a spine it sweeps happily with the
-        // round one (the polygon's corners fight the framing on tight blends). Retry exact-round
-        // rather than lose the primitive: a couple of short round-sectioned blends are a far
-        // smaller price than missing copper, and the seam they add is local.
-        for (int prof_segments : {segments, 0}) {
-            TopoDS_Wire prof = wireProfileWire(spineStart, tA, r, prof_segments);
-            BRepOffsetAPI_MakePipeShell ps(spine);
-            ps.Add(prof);
-            ps.Build();
-            if (ps.IsDone() && ps.MakeSolid()) return ps.Shape();
-            if (prof_segments == 0) break;
-        }
-    } catch (const Standard_Failure&) {
+        // ONE attempt, at the REQUESTED faceting -- no round-profile retry (Alf: no
+        // fallbacks). A failed faceted sweep returns null and the caller throws naming the
+        // primitive, so the geometry that produced it gets fixed instead of silently mixing
+        // a round (periodic-surface, gmsh-hostile) piece into a faceted conductor.
+        //
+        // The sweep runs in a MILLIMETRE frame: OCC's MakePipeShell mis-frames
+        // sub-millimetre faceted profiles in METRES (measured standalone: the identical
+        // helix/profile that fails at x1 -- PipeNotDone on a 0.1 mm 12-gon, 10_emi/
+        // 13_current_sense/20_iso/24_margin -- sweeps cleanly at x1000). Pure scaling is an
+        // EXACT affine map both ways, so this is a numerical frame choice, not an
+        // approximation. TODO: migrate the other MakePipeShell sites to the same frame as
+        // they are touched.
+        TopoDS_Wire prof = wireProfileWire(spineStart, tA, r, segments);
+        gp_Trsf up, down;
+        up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+        down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
+        TopoDS_Wire spineMm =
+            TopoDS::Wire(BRepBuilderAPI_Transform(spine, up, Standard_True).Shape());
+        TopoDS_Wire profMm =
+            TopoDS::Wire(BRepBuilderAPI_Transform(prof, up, Standard_True).Shape());
+        BRepOffsetAPI_MakePipeShell ps(spineMm);
+        ps.Add(profMm);
+        ps.Build();
+        if (ps.IsDone() && ps.MakeSolid())
+            return BRepBuilderAPI_Transform(ps.Shape(), down, Standard_True).Shape();
+        if (std::getenv("MVB_DIAG"))
+            std::cerr << "[sweep-fail] MakePipeShell status=" << (int)ps.GetStatus()
+                      << " isDone=" << ps.IsDone() << " segments=" << segments
+                      << " r=" << r << "\n";
+    } catch (const Standard_Failure& f) {
+        if (std::getenv("MVB_DIAG"))
+            std::cerr << "[sweep-fail] OCC exception: "
+                      << (f.GetMessageString() ? f.GetMessageString() : "(null)") << "\n";
     }
     return {};
 }
