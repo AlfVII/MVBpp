@@ -1139,10 +1139,20 @@ TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir&
             ps.SetMode(axialAxis);   // fixed binormal = column axis: section stays axial/radial
             ps.Add(prof);
             ps.Build();
-            if (!ps.IsDone() || !ps.MakeSolid()) return TopoDS_Shape();
+            if (!ps.IsDone() || !ps.MakeSolid()) {
+                if (std::getenv("MVB_DIAG"))
+                    std::cerr << "[sweepWire] rect fixed-binormal status="
+                              << (int)ps.GetStatus() << " isDone=" << ps.IsDone() << "\n";
+                return TopoDS_Shape();
+            }
             TopoDS_Shape s = ps.Shape();
             if (BRepCheck_Analyzer(s).IsValid()) return s;
-        } catch (const Standard_Failure&) {
+            if (std::getenv("MVB_DIAG"))
+                std::cerr << "[sweepWire] rect fixed-binormal: swept but INVALID\n";
+        } catch (const Standard_Failure& f) {
+            if (std::getenv("MVB_DIAG"))
+                std::cerr << "[sweepWire] rect fixed-binormal threw: "
+                          << (f.GetMessageString() ? f.GetMessageString() : "(null)") << "\n";
         }
         return TopoDS_Shape();
     }
@@ -2545,6 +2555,21 @@ TopoDS_Shape weldSolidsPairwise(const TopoDS_Shape& compound, double fuzzy) {
     for (TopExp_Explorer e(compound, TopAbs_SOLID); e.More(); e.Next())
         pieces.push_back(e.Current());
     if (pieces.size() <= 1) return compound;
+    // Weld in the MILLIMETRE frame: OCC booleans, like MakePipeShell (see rawGrownSolid),
+    // are unreliable on sub-millimetre features at metre scale -- measured on 03_buck's
+    // tangential lead-corner lens, where the metre-frame fuse united the bodies but ATE
+    // 37 mm3 of copper (caught by the volume guard below). Pure scaling is an exact
+    // affine map both ways; fuzzy scales with the frame so the physical tolerance is
+    // unchanged.
+    gp_Trsf up, down;
+    up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+    down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
+    for (auto& p : pieces)
+        p = BRepBuilderAPI_Transform(p, up, Standard_True).Shape();
+    fuzzy *= 1000.0;
+    auto backDown = [&](const TopoDS_Shape& s) {
+        return BRepBuilderAPI_Transform(s, down, Standard_True).Shape();
+    };
     auto massOf = [](const TopoDS_Shape& sh) {
         GProp_GProps gp; BRepGProp::VolumeProperties(sh, gp); return gp.Mass();
     };
@@ -2585,11 +2610,11 @@ TopoDS_Shape weldSolidsPairwise(const TopoDS_Shape& compound, double fuzzy) {
     // second pass: a piece can weld once its coincident neighbours are in
     for (auto it = loose.begin(); it != loose.end();)
         if (weldOne(*it)) it = loose.erase(it); else ++it;
-    if (loose.empty()) return acc;
+    if (loose.empty()) return backDown(acc);
     BRep_Builder bb; TopoDS_Compound out; bb.MakeCompound(out);
     bb.Add(out, acc);
     for (const auto& l : loose) bb.Add(out, l);
-    return out;
+    return backDown(out);
 }
 
 TopoDS_Shape fuseAllSolids(const TopoDS_Shape& compound, double wireRadius) {
@@ -3336,12 +3361,97 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         auto vol = [](const TopoDS_Shape& sh) {
             GProp_GProps gp; BRepGProp::VolumeProperties(sh, gp); return gp.Mass();
         };
-        for (auto [b, e] : continuousRuns(path)) {
-            const bool leadRun = ptrs[b]->isLead || ptrs[b]->isConnection;
+        // A lead CORNER (the quarter helix joining the radial run tangentially to the wrap --
+        // Alf's 03 directive) is emitted inside the lead run but chains G1 to the wrap, so it
+        // is swept WITH the wrap in the same pipe shell: the corner<->wrap seam then never
+        // exists as a boolean junction. (Sweeping the corner separately and overshooting it
+        // along the wrap was measured to fail: the extension hugs the wrap with coplanar
+        // top/bottom faces, and OCC's fuse cannot weld that tangential lens.) The only weld
+        // left at the corner is the prism's 0.35 r overshoot poking transversally into it.
+        const auto runsAll = continuousRuns(path);
+        std::vector<char> claimed(ptrs.size(), 0);
+        auto leadRunAt = [&](size_t k) {
+            return ptrs[runsAll[k].first]->isLead || ptrs[runsAll[k].first]->isConnection;
+        };
+        for (size_t k = 0; k < runsAll.size(); ++k) {
+            if (leadRunAt(k)) continue;
+            if (k > 0 && leadRunAt(k - 1))
+                for (size_t i = runsAll[k - 1].second; i-- > runsAll[k - 1].first;) {
+                    if (ptrs[i]->kind == Primitive::SPIRAL) claimed[i] = 1; else break;
+                }
+            if (k + 1 < runsAll.size() && leadRunAt(k + 1))
+                for (size_t i = runsAll[k + 1].first; i < runsAll[k + 1].second; ++i) {
+                    if (ptrs[i]->kind == Primitive::SPIRAL) claimed[i] = 1; else break;
+                }
+        }
+        // Simple run-corner-wraps-corner-run path: with the lead corners the WHOLE path is
+        // G1 (every junction tangent by construction), so sweep it as ONE pipe shell -- no
+        // boolean junction anywhere. This is Alf's 03 directive taken to its conclusion:
+        // the prism overshoot + proud height previously poked flaps out of the corner
+        // ("weird joints"), and the buried end faces sat inside the winding OD. One sweep
+        // has no seams: the corner flows into the connection, whose flat start face is the
+        // corner's end section at the turns' outer diameter (+ the minimum-bend margin).
+        const bool cornersBothEnds = runsAll.size() == 3 &&
+                                     leadRunAt(0) && !leadRunAt(1) && leadRunAt(2) &&
+                                     claimed[runsAll[0].second - 1] &&
+                                     claimed[runsAll[2].first];
+        if (cornersBothEnds) {
+            try {
+                BRepBuilderAPI_MakeWire wm;
+                bool okW = true;
+                for (size_t i = 0; i < ptrs.size(); ++i) {
+                    TopoDS_Edge pe = primEdge(*ptrs[i], path.wireRadius);
+                    if (pe.IsNull()) { okW = false; break; }
+                    wm.Add(pe);
+                    if (!wm.IsDone()) { okW = false; break; }
+                }
+                if (okW) {
+                    auto pts = samplePrim(*ptrs[0], path.wireRadius);
+                    gp_Dir t0(pts[1].XYZ() - pts[0].XYZ());
+                    TopoDS_Shape whole = sweepWire(wm.Wire(), pts.front(), t0,
+                                                   path.wireRadius, 0, /*rectangular=*/true,
+                                                   path.wireWidth, path.wireHeight,
+                                                   gp_Dir(0, 1, 0));
+                    if (!whole.IsNull()) {
+                        double spineLen = 0.0;
+                        for (size_t i = 0; i < ptrs.size(); ++i) {
+                            auto sp = samplePrim(*ptrs[i], path.wireRadius);
+                            for (size_t j = 1; j < sp.size(); ++j)
+                                spineLen += sp[j].Distance(sp[j - 1]);
+                        }
+                        const double expected = path.wireWidth * path.wireHeight * spineLen;
+                        const double v = vol(whole);
+                        int nsol = 0;
+                        for (TopExp_Explorer e2(whole, TopAbs_SOLID); e2.More(); e2.Next())
+                            ++nsol;
+                        if (nsol == 1 && expected > 0.0 && v > 0.9 * expected &&
+                            v < 1.1 * expected && BRepCheck_Analyzer(whole).IsValid()) {
+                            if (diagR) std::cerr << "[rect-wire] G1 whole-path sweep: 1 solid, "
+                                                 << "v=" << v * 1e9 << "mm3 (expected "
+                                                 << expected * 1e9 << ")\n";
+                            return whole;
+                        }
+                        if (diagR) std::cerr << "[rect-wire] G1 whole-path sweep rejected: "
+                                             << "nsol=" << nsol << " v=" << v * 1e9
+                                             << " expected=" << expected * 1e9 << "\n";
+                    } else if (diagR) {
+                        std::cerr << "[rect-wire] G1 whole-path sweep returned null\n";
+                    }
+                }
+            } catch (const Standard_Failure& f) {
+                if (diagR) std::cerr << "[rect-wire] G1 whole-path sweep threw: "
+                                     << (f.GetMessageString() ? f.GetMessageString() : "(null)")
+                                     << "\n";
+            }
+        }
+        for (size_t k = 0; k < runsAll.size(); ++k) {
+            const auto [b, e] = runsAll[k];
+            const bool leadRun = leadRunAt(k);
             if (leadRun) {
                 // straight L-route: one oriented prism per SEG, extended 0.35 r past interior
                 // junction ends so consecutive prisms (and the wrap behind) overlap for the weld
                 for (size_t i = b; i < e; ++i) {
+                    if (claimed[i]) continue;   // corner helix -> swept with the wrap run
                     if (ptrs[i]->kind != Primitive::SEG) { okAll = false; break; }
                     gp_XYZ d = ptrs[i]->seg.b.XYZ() - ptrs[i]->seg.a.XYZ();
                     const double len = d.Modulus();
@@ -3369,14 +3479,27 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                 }
             } else {
                 try {
+                    // wrap wire = [claimed corners of the previous lead run] + wraps +
+                    // [claimed corners of the next lead run], all G1-chained by construction
+                    std::vector<size_t> idxs;
+                    if (k > 0) {   // TRAILING claimed corners of the previous lead run
+                        size_t lo = runsAll[k - 1].second;
+                        while (lo > runsAll[k - 1].first && claimed[lo - 1]) --lo;
+                        for (size_t i = lo; i < runsAll[k - 1].second; ++i) idxs.push_back(i);
+                    }
+                    for (size_t i = b; i < e; ++i) idxs.push_back(i);
+                    if (k + 1 < runsAll.size())   // LEADING claimed corners of the next lead run
+                        for (size_t i = runsAll[k + 1].first;
+                             i < runsAll[k + 1].second && claimed[i]; ++i)
+                            idxs.push_back(i);
                     BRepBuilderAPI_MakeWire wm;
-                    for (size_t i = b; i < e; ++i) {
+                    for (size_t i : idxs) {
                         TopoDS_Edge pe = primEdge(*ptrs[i], path.wireRadius);
                         if (!pe.IsNull()) wm.Add(pe);
                         if (!wm.IsDone()) { okAll = false; break; }
                     }
                     if (!okAll || !wm.IsDone()) { okAll = false; break; }
-                    auto pts = samplePrim(*ptrs[b], path.wireRadius);
+                    auto pts = samplePrim(*ptrs[idxs.front()], path.wireRadius);
                     if (pts.size() < 2) { okAll = false; break; }
                     gp_Dir t0(pts[1].XYZ() - pts[0].XYZ());
                     TopoDS_Shape run = sweepWire(wm.Wire(), pts.front(), t0, path.wireRadius, 0,
@@ -3395,6 +3518,16 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
             if (diagR) std::cerr << "[rect-wire] per-run compound: " << nsol
                                  << " solid(s) after weld, v=" << vol(welded) * 1e9
                                  << "mm3 (runs total " << total * 1e9 << ")\n";
+            if (diagR && nsol > 1) {
+                int si = 0;
+                for (TopExp_Explorer e2(welded, TopAbs_SOLID); e2.More(); e2.Next(), ++si) {
+                    Bnd_Box bx; BRepBndLib::Add(e2.Current(), bx);
+                    double x0,y0,z0,x1,y1,z1; bx.Get(x0,y0,z0,x1,y1,z1);
+                    std::fprintf(stderr, "[rect-wire]   solid %d v=%.3fmm3 "
+                                 "x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n", si,
+                                 vol(e2.Current())*1e9, x0*1e3,x1*1e3, y0*1e3,y1*1e3, z0*1e3,z1*1e3);
+                }
+            }
             return pruneDegenerateSolids(welded);
         }
         if (diagR) std::cerr << "[rect-wire] per-run compound failed -- falling back to the "
@@ -3411,6 +3544,25 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                             << " condRadius=" << path.condRadius
                             << " wireWidth=" << path.wireWidth << " wireHeight=" << path.wireHeight
                             << " isRect=" << path.isRectangular << " prims=" << ptrs.size() << "\n";
+        if (diag) {
+            auto kn = [](int k) {
+                return k == Primitive::SEG ? "SEG" : k == Primitive::ARC3 ? "ARC3"
+                     : k == Primitive::SPIRAL ? "SPIRAL" : "BLEND";
+            };
+            for (size_t i = 0; i < ptrs.size(); ++i) {
+                auto pts = samplePrim(*ptrs[i], path.wireRadius);
+                gp_Pnt a = pts.front(), b = pts.back();
+                double gap = -1.0;
+                if (i + 1 < ptrs.size())
+                    gap = b.Distance(samplePrim(*ptrs[i + 1], path.wireRadius).front());
+                std::fprintf(stderr,
+                             "[prim %2zu] %-6s a=(%9.4f,%9.4f,%9.4f) b=(%9.4f,%9.4f,%9.4f) "
+                             "gap->next=%.6f mm  %s\n",
+                             i, kn(ptrs[i]->kind), a.X() * 1e3, a.Y() * 1e3, a.Z() * 1e3,
+                             b.X() * 1e3, b.Y() * 1e3, b.Z() * 1e3, gap * 1e3,
+                             ptrs[i]->label.c_str());
+            }
+        }
         if (!spine.IsNull()) {
             auto p0pts = samplePrim(*ptrs[0], path.wireRadius);
             gp_Dir t0 = (p0pts.size() >= 2 &&
@@ -6199,9 +6351,68 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // winding's first turn sits outside another winding's returns, so its first wrap
         // starts ridden-up and the lead must attach at that lifted radius (23_interleaved:
         // the bare secondary entrance ran level with the primary's raised head, 0.31 mm off).
+        // RECT wire on a round column: a real CORNER connects the turn to its lead (Alf:
+        // 03's ribbon butted the lead at 90 degrees with a bare notch). Quarter arc about
+        // the vertical axis at the crossing, tangent to the wrap's azimuthal direction AND
+        // to the radial run; the run continues parallel, offset one bend radius
+        // tangentially. The rect single-body sweep rounds the section through it natively.
+        // slope: the adjoining wrap's dy per unit arc length at the crossing. The corner and
+        // the straight run BOTH carry it, so every junction is EXACTLY tangent -- a flat
+        // corner met the rising wrap at a ~2 deg kink, and the spine filleter's 1.25*r trim
+        // then ate the whole quarter arc into a degenerate edge (BRepAdaptor: No geometry).
+        auto rectLeadCorner = [&](const PlanePt& st, double azL, bool isExit, double slope,
+                                  const std::string& what) {
+            const gp_XYZ Rhat(std::cos(azL), 0.0, -std::sin(azL));
+            const gp_XYZ That(-std::sin(azL), 0.0, -std::cos(azL));
+            const double Rc = std::max(minBend, 1.02 * 0.5 * path.wireWidth);
+            const double q = 0.5 * kPi * Rc;
+            const gp_XYZ C2 = azPointC(0, 0, st.x, st.y, azL).XYZ() + Rhat * Rc;
+            const double runLen = leadTipRadius - st.x;
+            // y along the wire: the crossing keeps the station row; corner and run continue
+            // at the wrap's slope (entrance: the wire RISES into the wrap; exit: it keeps
+            // climbing away).
+            const double yP = st.y;
+            const double yQ = isExit ? yP + slope * q : yP - slope * q;
+            const double yTip = isExit ? yQ + slope * runLen : yQ - slope * runLen;
+            Primitive arc;
+            arc.kind = Primitive::SPIRAL;
+            if (isExit) {
+                // P (az azL+pi about C) -> Q (az azL+pi/2), azimuth decreasing.
+                arc.spiral = {C2.X(), C2.Z(), Rc, yP, azL + kPi, Rc, yQ, azL + kPi / 2.0};
+            } else {
+                // Q (az azL-pi/2) -> P (az azL-pi), azimuth decreasing.
+                arc.spiral = {C2.X(), C2.Z(), Rc, yQ, azL - kPi / 2.0, Rc, yP, azL - kPi};
+            }
+            arc.label = path.name + " " + what + " corner";
+            arc.turnOrdinal = isExit ? turns.size() - 1 : 0;
+            arc.isLead = true;
+            const gp_Pnt Q(isExit ? C2 + That * Rc + gp_XYZ(0, yQ - st.y, 0)
+                                  : C2 - That * Rc + gp_XYZ(0, yQ - st.y, 0));
+            const gp_Pnt tipPt(Q.XYZ() + Rhat * runLen + gp_XYZ(0, yTip - yQ, 0));
+            Primitive run;
+            run.kind = Primitive::SEG;
+            run.seg = isExit ? Seg{Q, tipPt} : Seg{tipPt, Q};
+            run.label = path.name + " " + what + " run";
+            run.turnOrdinal = arc.turnOrdinal;
+            run.isLead = true;
+            if (isExit) {
+                path.prims.push_back(std::move(arc));
+                path.prims.push_back(std::move(run));
+            } else {
+                path.prims.push_back(std::move(run));
+                path.prims.push_back(std::move(arc));
+            }
+        };
         {
             std::vector<PlanePt> wp;
-            if (!effectivelyRound) {
+            if (effectivelyRound && rectWire) {
+                const double sIn =
+                    turns.size() > 1
+                        ? (station(turns[1]).y - station(turns[0]).y) /
+                              (kTwoPi * std::max(station(turns[0]).x, 1e-9))
+                        : 0.0;
+                rectLeadCorner(first, azEntrance, /*isExit=*/false, sIn, "entrance lead");
+            } else if (!effectivelyRound) {
                 PlanePt fLead = first;
                 // Rect columns: the crossing sits on the DISPLACED -Z face (dragback
                 // reservation), so the lead attaches there too.
@@ -6226,12 +6437,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     wp.push_back({leadTipRadius, first.y});
                 }
             }
-            extendBorder(wp);
-            std::reverse(wp.begin(), wp.end());
-            const double entrRaise =
-                tallestBumpColumn(bumpsForTurn(station(turns.front()).x)).first;
-            pushPlaneSegs(wp, "entrance lead", 0, /*stationAtFront=*/false, entrRaise,
-                          azEntrance);
+            if (!wp.empty()) {
+                extendBorder(wp);
+                std::reverse(wp.begin(), wp.end());
+                const double entrRaise =
+                    tallestBumpColumn(bumpsForTurn(station(turns.front()).x)).first;
+                pushPlaneSegs(wp, "entrance lead", 0, /*stationAtFront=*/false, entrRaise,
+                              azEntrance);
+            }
         }
         const bool dragDiag = std::getenv("MVB_DRAG_DIAG") != nullptr;
         for (size_t i = 0; i + 1 < nEmit; ++i) {
@@ -6299,7 +6512,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // minimal one: from the last station straight out radially at its own level.
         {
             std::vector<PlanePt> wp;
-            if (!exitGroup.empty() && !effectivelyRound) {
+            if (effectivelyRound && rectWire) {
+                const double sOut =
+                    nEmit > 1
+                        ? (station(turns[nEmit - 1]).y - station(turns[nEmit - 2]).y) /
+                              (kTwoPi * std::max(station(turns[nEmit - 1]).x, 1e-9))
+                        : 0.0;
+                rectLeadCorner(last, azExit, /*isExit=*/true, sOut, "exit lead");
+            } else if (!exitGroup.empty() && !effectivelyRound) {
                 PlanePt lLead = last;
                 // Displaced -Z crossing, exactly like the entrance.
                 if (columnShape == MAS::ColumnShape::RECTANGULAR)
@@ -6323,15 +6543,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     wp.push_back({leadTipRadius, last.y});
                 }
             }
-            extendBorder(wp);
-            // The exit lead leaves the OUTERMOST turn, which rides over every dragback beneath
-            // it, so it is z-lifted by the fan's tallest column -- computed by the SAME helper
-            // on the SAME bump list as the last wrap's end raise, so the two meet at one
-            // identical point.
-            const double exitRaise =
-                tallestBumpColumn(bumpsForTurn(station(turns[nEmit - 1]).x)).first;
-            pushPlaneSegs(wp, "exit lead", nEmit - 1, /*stationAtFront=*/true, exitRaise,
-                          azExit);
+            if (!wp.empty()) {
+                extendBorder(wp);
+                // The exit lead leaves the OUTERMOST turn, which rides over every dragback
+                // beneath it, so it is z-lifted by the fan's tallest column -- computed by
+                // the SAME helper on the SAME bump list as the last wrap's end raise, so the
+                // two meet at one identical point.
+                const double exitRaise =
+                    tallestBumpColumn(bumpsForTurn(station(turns[nEmit - 1]).x)).first;
+                pushPlaneSegs(wp, "exit lead", nEmit - 1, /*stationAtFront=*/true, exitRaise,
+                              azExit);
+            }
         }
 
         // Stagger this winding's seam azimuth so its leads clear the other windings' leads (all drawn
