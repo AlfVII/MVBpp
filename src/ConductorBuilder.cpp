@@ -4214,12 +4214,13 @@ RectStation rectStation(const PlanePt& p, double halfW, double halfD, double min
             halfD - inset};
 }
 
-// zLane: WINDOW-GLOBAL end-run lane allocator, shared across every conductor of the window --
-// per-path counters gave two parallels the same lane, i.e. the same edge rows and the same
-// outer descent lane, on top of each other.
+// routeKind/routeLane: this transition's WINDOW-GLOBAL routing decision from the
+// rectRouteOf pre-scan (-1 = ordinary S-blend transition; 0 = out-of-window end-run;
+// 1 = on-face ride-over). The decision lives upstream so lanes are consistent across every
+// conductor of the window.
 void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStation& s1,
                     const std::string& label, size_t ordinal, double wireRadius,
-                    double yClear, double zOutClear, int& zLane) {
+                    double yClear, double zOutClear, int routeKind, int routeLane) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -4270,19 +4271,34 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         ramp.turnOrdinal = ordinal;
         path.prims.push_back(std::move(ramp));
     };
-    const bool crossLayer =
-        std::abs(s1.zPos - s0.zPos) > 1e-12 && std::abs(s1.y - s0.y) > 1e-12;
-    // Same-depth MULTI-ROW serpentine jumps take the end-run too: any in-plane S -- blend or
-    // filleted -- of one parallel unavoidably passes a sibling parallel's route at MKF's row
-    // stagger, which is under the bare clearance (measured 0.30 mm on 04_forward's 3.3V
-    // secondary). Jumps of ~a pitch keep the S-blend (their curvature is mild and their
-    // sibling gap is the full row spacing). The size gate is the smallest jump whose
-    // alternative filleted route could carry the house minimum bend -- anything that big is a
-    // row-skipping return, not a wrap transition.
-    const bool bigLateral =
-        std::abs(s1.zPos - s0.zPos) <= 1e-12 &&
-        0.4 * std::min(0.5 * s0.segX, std::abs(s1.y - s0.y)) >= 1.5 * wireRadius;
-    if (crossLayer || bigLateral) {
+    if (routeKind == 1) {
+        // RIDE-OVER (Alf, 2026-08-06): the jump travels ON its own -Z face, lifted ONE wire
+        // OD outward in its own x lane -- run along the face to the lane, lift, carry the
+        // axial travel over the crossed rows, drop back, run to the crossing. All right-angle
+        // legs: fillets where they fit, mitred sharp corners where they don't (the dragback
+        // chain's proven machinery). Lanes stagger inward from the face's transition corner;
+        // the leads run at x = 0, one full lane clear of the innermost ride lane.
+        const double lift = 2.0 * wireRadius;
+        const double xm = std::min(s0.segX, s1.segX);
+        const double xv = xm - (routeLane + 1) * 2.3 * wireRadius;
+        if (xv < 2.3 * wireRadius) {
+            throw std::runtime_error(
+                "ConductorBuilder: ride-over lane " + std::to_string(routeLane) + " of " +
+                label + " does not fit on the -Z face (lane x = " + std::to_string(xv * 1e3) +
+                " mm) -- too many same-depth multi-row jumps for this face");
+        }
+        const double z0 = -s0.zPos;
+        std::vector<gp_Pnt> pts{gp_Pnt(+s0.segX, y, z0),
+                                gp_Pnt(xv, y, z0),
+                                gp_Pnt(xv, y, z0 - lift),
+                                gp_Pnt(xv, s1.y, z0 - lift),
+                                gp_Pnt(xv, s1.y, z0),
+                                gp_Pnt(0, s1.y, z0)};
+        appendFilletedPolyline(path.prims, pts, wireRadius, label + " ramp -Z (ride-over)",
+                               ordinal, /*isLead=*/false, /*isConnection=*/false);
+        return;
+    }
+    if (routeKind == 0) {
         // Layer transition that also moves axially (a Z-order return descends the whole
         // window). Every IN-WINDOW route was measured to collide on 02_flyback_efd25: a
         // diagonal cuts between the layers; descending at the target layer's clearance
@@ -4296,7 +4312,13 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         // destination edge, and re-enter at the crossing. Each return gets its own rows
         // (one OD + 15% apart); MKF's own connection model frees exactly these edge slots
         // (turn-blocking, Coil.cpp).
-        const int lane = zLane++;
+        if (routeLane < 0) {
+            throw std::runtime_error(
+                "ConductorBuilder: end-run transition of " + label +
+                " has no pre-assigned lane (detection drift between the rectRouteOf pre-scan "
+                "and appendRectWrap)");
+        }
+        const int lane = routeLane;
         const double row = (lane + 1) * 2.3 * wireRadius;
         const double yEsrc = (y >= 0 ? 1.0 : -1.0) * (yClear + row);
         const double yEdst = (s1.y >= 0 ? 1.0 : -1.0) * (yClear + row);
@@ -4314,17 +4336,22 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             // its way in; starting it at 0.2 segX crossed the entrance lead's level 0.31 mm
             // away (measured on 02_flyback_efd25, gate minimum 0.40 mm). Starting at 0.4 segX
             // moves that crossing point proportionally farther from the plane the leads run in.
-            const gp_Pnt wp[6] = {gp_Pnt(+s0.segX, y, -s0.zPos),
+            // The way back is an L, never a diagonal: the axial leg climbs from the edge row
+            // to the CROSSING ROW at a safe x, and the final approach runs ALONG that row to
+            // the crossing. A diagonal re-entry cut across the terminal leads' rows near
+            // x = 0 (17_cllc: 1.38 mm from the entrance lead against 1.93 mm of litz).
+            const gp_Pnt wp[7] = {gp_Pnt(+s0.segX, y, -s0.zPos),
                                   gp_Pnt(+s0.segX * 0.8, yEsrc, -s0.zPos),
                                   gp_Pnt(+s0.segX * 0.6, yEsrc, -zOut),
                                   gp_Pnt(xm * 0.62, yEdst, -zOut),
                                   gp_Pnt(xm * 0.52, yEdst, -s1.zPos),
+                                  gp_Pnt(xm * 0.52, s1.y, -s1.zPos),
                                   gp_Pnt(0, s1.y, -s1.zPos)};
-            static const char* kLeg[5] = {"ramp -Z (edge pop-out)", "ramp -Z (edge travel out)",
+            static const char* kLeg[6] = {"ramp -Z (edge pop-out)", "ramp -Z (edge travel out)",
                                           "ramp -Z (outer descent)", "ramp -Z (edge travel in)",
-                                          "ramp -Z (re-entry)"};
+                                          "ramp -Z (re-entry)",     "ramp -Z (row approach)"};
             const double ov = 0.35 * wireRadius;
-            for (int k = 0; k < 5; ++k) {
+            for (int k = 0; k < 6; ++k) {
                 gp_XYZ d = wp[k + 1].XYZ() - wp[k].XYZ();
                 const double len = d.Modulus();
                 if (len < 1e-12) continue;
@@ -4336,7 +4363,24 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         }
 
     } else {
-        pushBlend(gp_Pnt(+s0.segX, y, -s0.zPos), gp_Pnt(0, s1.y, -s1.zPos), "ramp -Z");
+        const gp_Pnt a(+s0.segX, y, -s0.zPos), b(0, s1.y, -s1.zPos);
+        // A steep same-depth S (a multi-row jump on a face with NO intervening rows -- the
+        // pre-scan would have routed it as a ride-over otherwise) cannot be swept as a
+        // faceted pipe (02_flyback turn 39->40: invalid solid; the round pipe closes, but a
+        // periodic surface is what gmsh refuses). Where right-angle fillets at the house
+        // minimum bend fit, build the same S from SEG legs + exact fillets. The gentle case
+        // (~one pitch) keeps the S-blend, whose curvature is mild exactly there.
+        const double legX = 0.5 * std::abs(a.X() - b.X());
+        const double legY = std::abs(b.Y() - a.Y());
+        if (std::abs(a.Z() - b.Z()) < 1e-12 &&
+            0.4 * std::min(legX, legY) >= 1.5 * wireRadius) {
+            const double xm = 0.5 * (a.X() + b.X());
+            std::vector<gp_Pnt> pts{a, gp_Pnt(xm, a.Y(), a.Z()), gp_Pnt(xm, b.Y(), b.Z()), b};
+            appendFilletedPolyline(path.prims, pts, wireRadius, label + " ramp -Z", ordinal,
+                                   /*isLead=*/false, /*isConnection=*/false);
+        } else {
+            pushBlend(a, b, "ramp -Z");
+        }
     }
 }
 
@@ -4847,7 +4891,105 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     std::vector<ConductorPath> paths;
     paths.reserve(conductors.size());
     std::vector<PendingZ> pendingZ;   // Z-returns, planned after all conductors are built
-    int zLaneWindow = 0;              // rect-column end-run lane allocator, WINDOW-global
+
+    // RECT-column transition routing, decided WINDOW-globally up front. Two routed kinds:
+    //  - END-RUN (kind 0): CROSS-LAYER returns leave the window entirely; their lanes deepen
+    //    MONOTONICALLY with how close to the window edge the pop-out starts, so the pop-out
+    //    diagonals nest instead of crossing (04_forward: arrival-order lanes crossed at 0 mm).
+    //  - RIDE-OVER (kind 1, Alf 2026-08-06): a SAME-DEPTH jump that crosses other rows on its
+    //    own -Z face travels ON that face lifted one wire OD outward, in its own x lane --
+    //    the wire lies over the rows it crosses, like the round column's bumps, so any number
+    //    of jumps coexist in-window (private out-of-window lanes stacked absurdly deep, y=-31
+    //    on a +-12 window). Same-depth single-pitch transitions keep the S-blend.
+    std::map<std::pair<size_t, size_t>, std::pair<int, int>> rectRouteOf;  // -> {kind, lane}
+    if (!isToroidal && columnShape == MAS::ColumnShape::RECTANGULAR) {
+        struct FaceRow { double zPos, y, rw; };
+        std::vector<FaceRow> faceRows;
+        struct RectRet {
+            double absYsrc;
+            size_t ci, trans;
+            int kind;
+            double zPos = 0, lo = 0, hi = 0, rw = 0;   // ride-over span on its face
+        };
+        std::vector<RectRet> rets;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (size_t cv = 0; cv < conductors.size(); ++cv) {
+                const auto& ct = conductors[cv];
+                const MAS::Wire& w = wireMap.at(ct.winding);
+                auto [ew, eh] =
+                    TurnBuilder::wireDimensions(w, *ct.turns.front(), opts.paintCoating);
+                const bool rectW = w.get_type() == MAS::WireType::RECTANGULAR ||
+                                   w.get_type() == MAS::WireType::PLANAR;
+                const double rw = rectW ? 0.5 * std::hypot(ew, eh) : 0.5 * std::min(ew, eh);
+                const double mb = rw * 1.02;
+                if (pass == 0) {
+                    for (const MAS::Turn* t : ct.turns) {
+                        const RectStation st = rectStation(station(t), halfW, halfD, mb,
+                                                           ct.winding);
+                        faceRows.push_back({st.zPos, st.y, rw});
+                    }
+                    continue;
+                }
+                for (size_t i = 0; i + 1 < ct.turns.size(); ++i) {
+                    const RectStation a =
+                        rectStation(station(ct.turns[i]), halfW, halfD, mb, ct.winding);
+                    const RectStation b =
+                        rectStation(station(ct.turns[i + 1]), halfW, halfD, mb, ct.winding);
+                    if (std::abs(b.zPos - a.zPos) > 1e-12) {
+                        if (std::abs(b.y - a.y) > 1e-12)
+                            rets.push_back({std::abs(a.y), cv, i, 0, 0, 0, 0, 0});
+                        continue;
+                    }
+                    // Same depth: routed only when the in-plane S would cross ANOTHER row of
+                    // the same face (that is what collided at the parallels' row stagger).
+                    const double lo = std::min(a.y, b.y), hi = std::max(a.y, b.y);
+                    bool crossesRow = false;
+                    for (const FaceRow& fr : faceRows) {
+                        if (std::abs(fr.zPos - a.zPos) > rw) continue;
+                        if (fr.y > lo + 0.5 * (rw + fr.rw) && fr.y < hi - 0.5 * (rw + fr.rw)) {
+                            crossesRow = true;
+                            break;
+                        }
+                    }
+                    if (crossesRow) rets.push_back({std::abs(a.y), cv, i, 1, a.zPos, lo, hi, rw});
+                }
+            }
+        }
+        // End-run lanes: monotone in |ySrc| so the pop-out diagonals nest.
+        std::stable_sort(rets.begin(), rets.end(), [](const RectRet& x, const RectRet& y) {
+            return x.absYsrc < y.absYsrc;
+        });
+        int laneEnd = 0;
+        for (const RectRet& r : rets)
+            if (r.kind == 0) rectRouteOf[{r.ci, r.trans}] = {0, laneEnd++};
+        // Ride-over lanes: INTERVAL-COLOURED -- two jumps share an x lane whenever they live
+        // on different faces or their axial spans (plus one wire clearance each) never
+        // overlap. A private lane per jump did not fit 02_flyback's face (21 lanes); its true
+        // overlap depth is a handful.
+        std::vector<RectRet*> rides;
+        for (RectRet& r : rets)
+            if (r.kind == 1) rides.push_back(&r);
+        std::stable_sort(rides.begin(), rides.end(),
+                         [](const RectRet* x, const RectRet* y) { return x->lo < y->lo; });
+        struct LaneUse { double zPos, hi, rw; };
+        std::vector<std::vector<LaneUse>> laneUses;
+        for (RectRet* r : rides) {
+            size_t k = 0;
+            for (; k < laneUses.size(); ++k) {
+                bool free = true;
+                for (const LaneUse& u : laneUses[k]) {
+                    if (std::abs(u.zPos - r->zPos) > u.rw + r->rw) continue;  // other face
+                    if (u.hi + u.rw + r->rw < r->lo) continue;                // spans clear
+                    free = false;
+                    break;
+                }
+                if (free) break;
+            }
+            if (k == laneUses.size()) laneUses.emplace_back();
+            laneUses[k].push_back({r->zPos, r->hi, r->rw});
+            rectRouteOf[{r->ci, r->trans}] = {1, (int)k};
+        }
+    }
 
     // Per-winding index (stable, MAS order) for the seam-azimuth stagger. MKF draws every winding's
     // seam/leads on the SAME reference plane, so different windings' terminal leads collide there.
@@ -4888,6 +5030,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     std::vector<LaidDragback> laidDragbacks;
     std::map<std::pair<size_t, size_t>, double> dragAzOf;   // (conductor, transition) -> azimuth
     std::map<size_t, double> leadAzIn, leadAzOut;           // conductor -> lead azimuth
+    std::map<std::pair<size_t, bool>, double> leadTiltY;    // (conductor, entrance) -> tilted row
     double fanWidth = 0.0;
     if (effectivelyRound) {
         struct Vert {          // one azimuth-slot request
@@ -5182,6 +5325,50 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     if (verts[k].entrance) leadAzIn[m] = a;
                     else                   leadAzOut[m] = a;
                 }
+            }
+        }
+        // AWAY-TILT: a lead whose row sits closer than the bare clearance to a crossed row,
+        // with a drift too slow for ANY azimuth in reach to open the corridor, is statically
+        // pinned (13_current_sense: 0.161 mm from the secondary band on a 0.118 mm/turn
+        // drift). Its RUN then tilts to the nearest clear row right at the attachment and
+        // travels straight from there -- the attachment point itself never moves.
+        for (size_t k = 0; k < verts.size(); ++k) {
+            const Vert& L = verts[k];
+            if (L.kind != 0) continue;
+            for (size_t m = 0; m < L.ys.size(); ++m) {
+                std::vector<const WireRow*> crossed;
+                bool pinned = false;
+                for (const auto& R : rows) {
+                    if (R.r + R.rw < L.r - L.rw - 1e-12) continue;
+                    if (R.ci == L.cis[m] && std::abs(R.y - L.ys[m]) < 0.5 * (L.rwBare + R.rw))
+                        continue;   // the member's own attachment row
+                    crossed.push_back(&R);
+                    const double clr = L.rwBare + R.rw;
+                    const double dy = std::abs(L.ys[m] - R.y);
+                    if (dy < clr &&
+                        (std::abs(R.adv) < 1e-12 ||
+                         (clr - dy) * kTwoPi / std::abs(R.adv) > kFanReach))
+                        pinned = true;
+                }
+                if (!pinned) continue;
+                // Candidate rows: just past each crossed row on either side; nearest clear
+                // one to the member's own row wins.
+                double best = 0.0;
+                bool have = false;
+                for (const WireRow* R : crossed) {
+                    for (double sgn : {1.0, -1.0}) {
+                        const double cand = R->y + sgn * (L.rwBare + R->rw);
+                        bool ok = true;
+                        for (const WireRow* Q : crossed)
+                            if (std::abs(cand - Q->y) + 1e-12 < L.rwBare + Q->rw) ok = false;
+                        if (!ok) continue;
+                        if (!have || std::abs(cand - L.ys[m]) < std::abs(best - L.ys[m])) {
+                            best = cand;
+                            have = true;
+                        }
+                    }
+                }
+                if (have) leadTiltY[{L.cis[m], L.entrance}] = best;
             }
         }
         // CONSECUTIVE dragback transitions of one conductor (a single-turn layer) chain end to
@@ -5756,12 +5943,34 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // grouping is ambiguous when a crossing sits within a wire of the window edge.
         std::vector<const RSpace*> entranceGroup, exitGroup;
         {
-            std::vector<std::vector<const RSpace*>> groups(1);
-            for (const RSpace* s : terminalRects) {
-                groups.back().push_back(s);
-                if (!rectIsVertical(*s)) groups.emplace_back();   // run closes the group
+            std::vector<std::vector<const RSpace*>> groups;
+            std::vector<const RSpace*> hs;
+            for (const RSpace* s : terminalRects)
+                if (!rectIsVertical(*s)) hs.push_back(s);
+            if (hs.size() == 2) {
+                // Exactly one horizontal RUN per lead: pair every vertical stub with the run
+                // whose centre is nearest. Pure emission order misgroups whenever MKF draws a
+                // route run-first instead of stub-first (09_planar's CONTIGUOUS secondary:
+                // [H V H V] split into three sequential groups).
+                groups.assign(2, {});
+                groups[0].push_back(hs[0]);
+                groups[1].push_back(hs[1]);
+                for (const RSpace* s : terminalRects) {
+                    if (!rectIsVertical(*s)) continue;
+                    double d[2];
+                    for (int g = 0; g < 2; ++g)
+                        d[g] = std::hypot(s->coordinates.at(0) - hs[g]->coordinates.at(0),
+                                          s->coordinates.at(1) - hs[g]->coordinates.at(1));
+                    groups[d[0] <= d[1] ? 0 : 1].push_back(s);
+                }
+            } else {
+                groups.emplace_back();
+                for (const RSpace* s : terminalRects) {
+                    groups.back().push_back(s);
+                    if (!rectIsVertical(*s)) groups.emplace_back();   // run closes the group
+                }
+                if (!groups.empty() && groups.back().empty()) groups.pop_back();
             }
-            if (!groups.empty() && groups.back().empty()) groups.pop_back();
             if (groups.size() == 1) {
                 // MKF drew only ONE lead (seen on 13_current_sense_er95: a 100-turn 0.1 mm
                 // secondary whose connection reserved-spaces carry a single horizontal run --
@@ -6033,8 +6242,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // edge corridor, whose y drifts between the parallels' rows -- at the lifted
                 // radius that ran the lead level with a SIBLING's ridden-up first wrap
                 // (23_interleaved: s1's route at y -3.04 against s0's raised row at -3.39).
+                // A statically pinned lead (see the AWAY-TILT pre-scan) drops to its clear
+                // row right at the attachment and runs straight from there.
                 wp.push_back(first);
-                wp.push_back({leadTipRadius, first.y});
+                if (auto tk = leadTiltY.find({ci, true}); tk != leadTiltY.end()) {
+                    wp.push_back({first.x + 2.0 * wireRadius, tk->second});
+                    wp.push_back({leadTipRadius, tk->second});
+                } else {
+                    wp.push_back({leadTipRadius, first.y});
+                }
             }
             extendBorder(wp);
             std::reverse(wp.begin(), wp.end());
@@ -6084,10 +6300,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     }
                     const double zOutClear =
                         rectStation({xMax, 0.0}, halfW, halfD, minBend, path.name).zPos;
+                    auto routeIt = rectRouteOf.find({ci, i});
+                    const int rk = routeIt != rectRouteOf.end() ? routeIt->second.first : -1;
+                    const int rl = routeIt != rectRouteOf.end() ? routeIt->second.second : -1;
                     appendRectWrap(path,
                                    rectStation(s, halfW, halfD, minBend, path.name),
                                    rectStation(nxt, halfW, halfD, minBend, path.name),
-                                   label, i, wireRadius, yClear, zOutClear, zLaneWindow);
+                                   label, i, wireRadius, yClear, zOutClear, rk, rl);
                 }
             } else {   // OBLONG with a real straight section
                 appendOblongWrap(path, s, nxt, oblongHalf, label, i);
@@ -6107,8 +6326,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // hugs the window's edge row, which in the raised, fanned 3D geometry runs the
                 // lead axially along ANOTHER parallel's ridden-up last wrap at the same radius
                 // (23_interleaved: P0's edge jog crossed P1's raised turn 0.8 um off centre).
+                // A statically pinned lead (AWAY-TILT pre-scan) drops to its clear row at the
+                // attachment, exactly like the entrance.
                 wp.push_back(last);
-                wp.push_back({leadTipRadius, last.y});
+                if (auto tk = leadTiltY.find({ci, false}); tk != leadTiltY.end()) {
+                    wp.push_back({last.x + 2.0 * wireRadius, tk->second});
+                    wp.push_back({leadTipRadius, tk->second});
+                } else {
+                    wp.push_back({leadTipRadius, last.y});
+                }
             }
             extendBorder(wp);
             // The exit lead leaves the OUTERMOST turn, which rides over every dragback beneath
