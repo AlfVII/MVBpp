@@ -520,6 +520,21 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                     }
                     if (ci == cj && shareEndpoint(pa, pb)) continue;
                     double d = polyPolyDistance(polys[ci][i], polys[cj][j]);
+                    if (std::getenv("MVB_GATE_DIAG") && d < minGap) {
+                        // Closest sampled pair, so a reported overlap can be located in space.
+                        double best = 1e30; gp_Pnt ba, bb;
+                        for (const auto& pa2 : polys[ci][i])
+                            for (const auto& pb2 : polys[cj][j]) {
+                                const double dd = pa2.SquareDistance(pb2);
+                                if (dd < best) { best = dd; ba = pa2; bb = pb2; }
+                            }
+                        std::fprintf(stderr,
+                            "[gate] '%s' vs '%s' d=%.4fmm need=%.4fmm closest A=(%.3f,%.3f,%.3f) "
+                            "rA=%.3f  B=(%.3f,%.3f,%.3f) rB=%.3f\n",
+                            pa.label.c_str(), pb.label.c_str(), d*1e3, minGap*1e3,
+                            ba.X()*1e3, ba.Y()*1e3, ba.Z()*1e3, std::hypot(ba.X(), ba.Z())*1e3,
+                            bb.X()*1e3, bb.Y()*1e3, bb.Z()*1e3, std::hypot(bb.X(), bb.Z())*1e3);
+                    }
                     // Rectangular wire: the round capsule is wrong -- the section is width(radial) x
                     // height(axial). Decompose the closest-approach vector into its AXIAL and in-
                     // plane (radial/tangential) parts and require the section boxes to overlap in
@@ -4162,6 +4177,18 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
     // tallest stack.
     const double raise = tallestBumpColumn(bumps).first;
     if (raise <= 0.0) {
+        // A full revolution at CONSTANT radius and height (the first turn of a U layer -- see
+        // appendRoundWrap) is a CLOSED circle: swept whole it makes a periodic surface with a
+        // seam, which the conformal assembler cannot build ("could not sweep primitive"). Two
+        // half-arcs sweep as ordinary patches and meet tangentially. Bumped rings are already
+        // split into head/level/tail below, so only the unbumped case needs this.
+        if (azEnd - azStart > kPi + 1e-9 && std::abs(r1 - r0) < 1e-12 &&
+            std::abs(y1 - y0) < 1e-12) {
+            const double azMid = 0.5 * (azStart + azEnd);
+            pushPiece(azStart, azMid, r0, r0, y0, y0, false, "");
+            pushPiece(azMid, azEnd, r0, r0, y0, y0, false, "");
+            return;
+        }
         pushPiece(azStart, azEnd, r0, r1, y0, y1, false, "");
         return;
     }
@@ -4229,43 +4256,40 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
                      double wireRadius, const std::string& label, size_t ordinal,
                      const std::vector<WrapBump>& bumps = {}, double azS = kPlaneAz,
                      double azE = kPlaneAz, const std::vector<WrapBump>& bumpsEnd = {}) {
+    // U (SERPENTINE) LAYER LINK -- Alf, 2026-08-07, 14_dab. Layers wound in U (this one bottom
+    // to top, the next top to bottom) connect DIFFERENTLY from a dragback, and differently from
+    // a cone: the wire leaves the last turn's crossing on a straight HORIZONTAL segment, radial
+    // and at CONSTANT HEIGHT, until it reaches the next layer's radius; from there it continues
+    // as a NORMAL round turn -- that first turn of the new layer also at constant height. The
+    // height only begins to change at the layer's SECOND turn.
+    //
+    // So the transition carries the segment AND one full revolution: it is a turn, exactly as
+    // MKF counts it. Emitting only the segment dropped a whole turn of copper (and of
+    // inductance) per layer change; emitting a cone over the revolution instead ("what the fuck
+    // is this monstrosity") gave the right turn count with the wrong shape.
     if (std::abs(n.x - s.x) > wireRadius && std::abs(n.y - s.y) <= std::abs(n.x - s.x)) {
-        // The link lives at the fan azimuths, INSIDE the raised region: both its stations are
-        // ridden up over the returns beneath them, so it connects the RAISED endpoints
-        // (dropped-centre rule, matching the wraps) -- a bare link ran level with a
-        // neighbour's raised run (23_interleaved: the secondary's radial climb 0.45 mm off
-        // the primary's ridden-up tail). The radial step happens AT ONE azimuth (the incoming
-        // crossing's); when the outgoing crossing sits in a different fan slot, a short
-        // azimuthal run along the NEW ring covers the difference -- a single chord swung
-        // across the fan and clipped a sibling's descent (0.45 mm off on 23).
         const double rsRaise = tallestBumpColumn(bumps).first;
         const double reRaise = tallestBumpColumn(bumpsEnd).first;
+        // The segment is TANGENTIAL to the arc it leaves -- at the crossing the turn's own
+        // tangent is the -X direction -- and runs just far enough for the tangent to reach the
+        // next layer's radius. A tangent from radius r0 meets radius r1 after L = sqrt(r1^2 -
+        // r0^2), having advanced dAz = atan2(L, r0) in azimuth; the wire leaves its arc
+        // smoothly (the junction is exactly tangent) instead of stepping sideways out of it,
+        // which a radial segment does.
+        const double L = std::sqrt(std::max(0.0, n.x * n.x - s.x * s.x));
+        const double dAz = std::atan2(L, s.x);
         Primitive step;
         step.kind = Primitive::SEG;
-        // Raised endpoints follow the wrap's own rule: the SAME radius, translated by -raise
-        // in z (Alf's straight-riser bump model) -- not a grown radius.
         step.seg = {azPointC(0, -rsRaise, s.x, s.y, azS),
-                    azPointC(0, -reRaise, n.x, n.y, azS)};
+                    azPointC(0, -reRaise, n.x, s.y, azS + dAz)};
         step.label = label + " (layer link)";
         step.turnOrdinal = ordinal;
         step.isConnection = true;
         path.prims.push_back(std::move(step));
-        const double dAz = azE - azS;
-        if (std::abs(dAz) > 1e-9) {
-            const double R = n.x;
-            Primitive arc;
-            arc.kind = Primitive::ARC3;
-            arc.arc.c = gp_Pnt(0, n.y, -reRaise);
-            // +Y advances azimuth in the azPointC frame; a backward run flips the axis so the
-            // sweep stays positive (OCC refuses negative revolve sweeps).
-            arc.arc.axis = dAz > 0.0 ? gp_XYZ(0, 1, 0) : gp_XYZ(0, -1, 0);
-            arc.arc.v0 = azPointC(0, -reRaise, R, n.y, azS).XYZ() - arc.arc.c.XYZ();
-            arc.arc.sweep = std::abs(dAz);
-            arc.label = label + " (layer link run)";
-            arc.turnOrdinal = ordinal;
-            arc.isConnection = true;
-            path.prims.push_back(std::move(arc));
-        }
+        // The new layer's FIRST turn: a normal round turn, from where the tangent landed, at
+        // the height the segment arrived at (the height only changes from the SECOND turn).
+        appendBumpedSweep(path, n.x, s.y, azS + dAz, n.x, n.y, azE + kTwoPi, bumpsEnd,
+                          wireRadius, label, ordinal, false);
         return;
     }
     // The wrap spans EXACTLY one turn, crossing to crossing. No overshoot: stretching the first
@@ -5485,6 +5509,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             std::vector<double> ys;
             std::vector<size_t> cis;
             std::vector<std::array<double, 4>> segs;   // (r0, y0, r1, y1)
+            double destAdvance = 0.0;  // dragbacks: the climb of the layer they land on
             double attachY = 0.0;
             std::string wname;
         };
@@ -5584,9 +5609,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (size_t i = 0; i + 1 < nEmitP; ++i) {
                 PlanePt a = station(ct.turns[i]), b = station(ct.turns[i + 1]);
                 const PitchBand bandP = bandAt(bandsP, a.x, rwEmit, mp, adv);
-                if (isZReturn(a, b, rwEmit, bandP.medianPitch, bandP.advance))
-                    verts.push_back({1, cv, i, false, b.x, std::min(a.y, b.y),
-                                     std::max(a.y, b.y), rwCoat, rwBare, {}, {}});
+                if (isZReturn(a, b, rwEmit, bandP.medianPitch, bandP.advance)) {
+                    Vert dv;
+                    dv.kind = 1; dv.ci = cv; dv.trans = i; dv.entrance = false;
+                    dv.r = b.x; dv.y0 = std::min(a.y, b.y); dv.y1 = std::max(a.y, b.y);
+                    dv.rw = rwCoat; dv.rwBare = rwBare;
+                    // the climb of the layer this return LANDS on (its own band, not the
+                    // conductor's net direction -- a serpentine conductor has none)
+                    dv.destAdvance = bandAt(bandsP, b.x, rwEmit, 0.0, 0.0).advance;
+                    verts.push_back(std::move(dv));
+                }
             }
             const PlanePt pf = station(ct.turns.front()), pl = station(ct.turns[nEmitP - 1]);
             // MKF-DRAWN LEAD ROUTES (Alf, 2026-08-07): the fan models EXACTLY the
@@ -5815,6 +5847,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         anchor = az[j];
                         anchored = true;
                     }
+            // Alf, 2026-08-07 (14_dab): "they must have the same x coord" -- every parallel of
+            // a winding leaves on the SAME azimuth, so the connections are aligned and every
+            // strand keeps the same length. The anchor is therefore BINDING, not a preference:
+            // once one member of a (winding, side) group is placed the rest take that exact
+            // slot. If that is infeasible the collision gate says so -- the leads are never
+            // silently fanned apart (Primary parallel 2 sat 2.6 deg off its siblings' plane).
+            if (anchored) {
+                az[k] = anchor;
+                continue;
+            }
             auto consider = [&](double c, bool withSoft) {
                 if (!hardOk(c) || (withSoft && !softOk(c))) return;
                 // Closest to the anchor (plane when unanchored) wins; ties go positive.
@@ -5854,6 +5896,56 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 for (double c : cand) consider(c, tier == 0);
             // max_j(az_j + need_jk) always satisfies the hard tier, so a slot always exists.
             az[k] = best;
+        }
+        // CLIMB-AWARE SLOT ORDER for sibling dragbacks (Alf's 14_dab). The slots are correct in
+        // SEPARATION but their ORDER matters once the layer they land on climbs steeply. Two
+        // parallels whose crossings sit dAz apart have their helices phase-shifted, so their
+        // constant separation becomes  -(dY) + pitch*dAz/2pi : the climb either adds to the
+        // station spacing or eats it. Assign the SAME set of slots so azimuth runs OPPOSITE to
+        // the destination-station height -- then the shift always ADDS. (14_dab's secondary
+        // returns onto a 15 mm-pitch layer: 2.29 deg of slot spacing ate 0.095 mm of an 0.855 mm
+        // budget, leaving 0.755 against a 0.784 requirement.)
+        // Permuting an already-validated set of slots cannot change any pairwise separation --
+        // need() between two dragbacks depends only on their radii and wire, not on which
+        // conductor holds which slot. Restricted to bands where each conductor has exactly ONE
+        // return, so the consecutive-return snap below still holds.
+        {
+            std::vector<size_t> dragIdx;
+            for (size_t k = 0; k < verts.size(); ++k)
+                if (verts[k].kind == 1) dragIdx.push_back(k);
+            std::vector<char> done(dragIdx.size(), 0);
+            for (size_t a0 = 0; a0 < dragIdx.size(); ++a0) {
+                if (done[a0]) continue;
+                std::vector<size_t> group{dragIdx[a0]};
+                done[a0] = 1;
+                for (size_t b0 = a0 + 1; b0 < dragIdx.size(); ++b0) {
+                    if (done[b0] ||
+                        std::abs(verts[dragIdx[b0]].r - verts[dragIdx[a0]].r) >
+                            verts[dragIdx[a0]].rw)
+                        continue;
+                    group.push_back(dragIdx[b0]);
+                    done[b0] = 1;
+                }
+                if (group.size() < 2) continue;
+                std::set<size_t> cis;
+                for (size_t g : group) cis.insert(verts[g].ci);
+                if (cis.size() != group.size()) continue;
+                // the climb of the layer these returns land on, from their own band
+                double advance = 0.0;
+                for (size_t g : group)
+                    if (std::abs(verts[g].destAdvance) > std::abs(advance))
+                        advance = verts[g].destAdvance;
+                if (std::abs(advance) < 1e-12) continue;
+                std::vector<double> slots;
+                for (size_t g : group) slots.push_back(az[g]);
+                std::sort(slots.begin(), slots.end());
+                // destination station height (a return lands at its low end when it descends)
+                std::sort(group.begin(), group.end(), [&](size_t x, size_t y) {
+                    return advance > 0.0 ? verts[x].y0 > verts[y].y0
+                                         : verts[x].y0 < verts[y].y0;
+                });
+                for (size_t g = 0; g < group.size(); ++g) az[group[g]] = slots[g];
+            }
         }
         double lo = 0.0, hi = 0.0;
         for (double a : az) { lo = std::min(lo, a); hi = std::max(hi, a); }
