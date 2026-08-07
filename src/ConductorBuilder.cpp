@@ -5052,7 +5052,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
         }
         const double zStart = halfD + maxOD;      // just outside the winding's outer face
-        const double zEnd = maxR + 4.0 * maxOD;   // the leadTipRadius reach, rect analog
+        // Probe out to the CORE's own z extent (its C dimension), never just the lead-tip
+        // reach (Alf, 2026-08-07): a one-sided plate sits BEYOND the copper tip, and the
+        // connection must exit the core envelope to be usable.
+        double zCore = 0.0;
+        for (const auto& obst : opts.coreObstacles) {
+            Bnd_Box bx; BRepBndLib::Add(obst, bx);
+            double x0, y0, z0, x1, y1, z1; bx.Get(x0, y0, z0, x1, y1, z1);
+            zCore = std::max({zCore, std::abs(z0), std::abs(z1)});
+        }
+        const double zEnd = std::max(maxR + 4.0 * maxOD, zCore);
         const double xs = static_cast<double>(conductors.size()) * maxOD;
         auto corridorBlocked = [&](double sgn) {
             for (const auto& obst : opts.coreObstacles)
@@ -6680,10 +6689,24 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     auto [pa, pb] = primEndpoints(pr);
                     rLead = std::max({rLead, std::hypot(pa.X(), pa.Z()), std::hypot(pb.X(), pb.Z())});
                 }
-                const double rTip = std::max(maxTurnR + 4.0 * (2.0 * wireRadius), rLead);
+                // Probe out to the CORE's own outer envelope, never just the emitted
+                // copper's tip (Alf, 2026-08-07, 10_emi/EP13): the connection must EXIT
+                // the core, so an azimuth is free only if the whole ray out PAST the core
+                // clears it. An EP-style wrapping plate sits BEYOND the lead-tip radius --
+                // stopping the probe at the copper reported every azimuth free and left
+                // the fan on EP13's CLOSED -Z face.
+                double rCore = 0.0;
+                for (const auto& obst : opts.coreObstacles) {
+                    Bnd_Box bx; BRepBndLib::Add(obst, bx);
+                    double x0, y0, z0, x1, y1, z1; bx.Get(x0, y0, z0, x1, y1, z1);
+                    rCore = std::max({rCore, std::hypot(x0, z0), std::hypot(x0, z1),
+                                      std::hypot(x1, z0), std::hypot(x1, z1)});
+                }
+                const double rTip =
+                    std::max({maxTurnR + 4.0 * (2.0 * wireRadius), rLead, rCore});
                 const double r0 = maxTurnR + wireRadius;
                 const double yProbe[3] = {0.0, 0.6 * maxAbsY, -0.6 * maxAbsY};
-                const int N = 360, NR = 6;
+                const int N = 360, NR = 16;   // fine enough radially to never step over a core plate
                 std::vector<char> free_(N, 1);
                 for (const auto& obst : opts.coreObstacles) {
                     for (TopExp_Explorer se(obst, TopAbs_SOLID); se.More(); se.Next()) {
