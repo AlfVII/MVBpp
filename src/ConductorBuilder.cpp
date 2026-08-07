@@ -3989,6 +3989,62 @@ struct RingInv {
 // median pitch — sparse windings legitimately advance several wire-ODs per ordinary wrap.
 // zOrderAdvance: the conductor's SIGNED within-layer advance when every same-radius step moves
 // the same way (a z-order winding); 0.0 when the direction alternates (classic serpentine).
+// Within-layer pitch statistics PER RADIUS BAND. A conductor's layers do not share a pitch:
+// a dense inner layer packs at one wire OD while a sparse outer layer legitimately advances
+// several ODs per turn (fence-post SPREAD over a half-full layer). Judging every transition
+// against the CONDUCTOR's median pitch therefore misreads the sparse layer's ordinary wraps as
+// Z-returns and emits vertical descents where the wire should wrap (measured on the litz
+// fixture: layer 1's 4 turns, pitch 2.55 mm against layer 0's 0.69 mm median, came out as three
+// straight drops instead of three rings). Each band is judged against its OWN pitch.
+struct PitchBand {
+    double radius = 0.0;
+    double medianPitch = 0.0;
+    double advance = 0.0;   // signed, 0 when the layer's direction alternates
+};
+std::vector<PitchBand> computePitchBands(const std::vector<PlanePt>& stations, double wireRadius) {
+    std::vector<std::pair<double, std::vector<double>>> raw;   // (band radius, |dy| samples)
+    std::vector<std::pair<int, int>> signs;                    // (pos, neg) per band
+    for (size_t i = 0; i + 1 < stations.size(); ++i) {
+        const PlanePt& a = stations[i];
+        const PlanePt& b = stations[i + 1];
+        if (std::abs(b.x - a.x) > wireRadius) continue;   // layer change, not a within-layer step
+        size_t band = raw.size();
+        for (size_t k = 0; k < raw.size(); ++k) {
+            if (std::abs(raw[k].first - a.x) <= wireRadius) { band = k; break; }
+        }
+        if (band == raw.size()) { raw.push_back({a.x, {}}); signs.push_back({0, 0}); }
+        const double dy = b.y - a.y;
+        raw[band].second.push_back(std::abs(dy));
+        (dy >= 0.0 ? signs[band].first : signs[band].second)++;
+    }
+    std::vector<PitchBand> bands;
+    for (size_t k = 0; k < raw.size(); ++k) {
+        auto samples = raw[k].second;
+        // A band needs at least TWO within-layer steps before its median means anything: with
+        // a single sample the band adopts that very step as its own "normal pitch", so any
+        // jump -- including a genuine dragback -- looks ordinary (measured on 14_dab, whose
+        // outer secondary layer holds two turns 15 mm apart: the return came out as a 15 mm
+        // rise helix). One-sample bands fall back to the conductor-wide median.
+        if (samples.size() < 2) continue;
+        std::sort(samples.begin(), samples.end());
+        PitchBand band;
+        band.radius = raw[k].first;
+        band.medianPitch = samples[samples.size() / 2];
+        if (signs[k].first == 0 || signs[k].second == 0)
+            band.advance = (signs[k].first > 0 ? band.medianPitch : -band.medianPitch);
+        bands.push_back(band);
+    }
+    return bands;
+}
+// The band a station belongs to; falls back to the whole-conductor values when a radius has no
+// within-layer step of its own (a single-turn layer).
+PitchBand bandAt(const std::vector<PitchBand>& bands, double radius, double wireRadius,
+                 double fallbackPitch, double fallbackAdvance) {
+    for (const auto& band : bands)
+        if (std::abs(band.radius - radius) <= wireRadius) return band;
+    return {radius, fallbackPitch, fallbackAdvance};
+}
+
 bool isZReturn(const PlanePt& s, const PlanePt& n, double wireRadius, double medianPitch,
                double zOrderAdvance = 0.0) {
     if (std::abs(n.x - s.x) > wireRadius && std::abs(n.y - s.y) <= std::abs(n.x - s.x))
@@ -5519,21 +5575,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     if (pos == 0 || neg == 0) adv = (pos > 0 ? mp : -mp);
                 }
             }
-            // Mirror of the emission loop's TRAILING OUTLET PRUNE (see there): trailing
-            // return/link transitions are not emitted, so they claim no fan slot, lay no
-            // return, and their stations are not obstacle rows.
-            size_t nEmitP = ct.turns.size();
-            while (nEmitP > 2) {
-                const PlanePt a = station(ct.turns[nEmitP - 2]);
-                const PlanePt b = station(ct.turns[nEmitP - 1]);
-                const bool link = std::abs(b.x - a.x) > rwEmit &&
-                                  std::abs(b.y - a.y) <= std::abs(b.x - a.x);
-                if (!link && !isZReturn(a, b, rwEmit, mp, adv)) break;
-                --nEmitP;
-            }
+            // Mirrors the emission loop: every station is emitted (no trailing prune), so
+            // every transition claims its fan slot and every station is an obstacle row.
+            const size_t nEmitP = ct.turns.size();
+            std::vector<PlanePt> stationsP;
+            for (const MAS::Turn* t : ct.turns) stationsP.push_back(station(t));
+            const auto bandsP = computePitchBands(stationsP, rwEmit);
             for (size_t i = 0; i + 1 < nEmitP; ++i) {
                 PlanePt a = station(ct.turns[i]), b = station(ct.turns[i + 1]);
-                if (isZReturn(a, b, rwEmit, mp, adv))
+                const PitchBand bandP = bandAt(bandsP, a.x, rwEmit, mp, adv);
+                if (isZReturn(a, b, rwEmit, bandP.medianPitch, bandP.advance))
                     verts.push_back({1, cv, i, false, b.x, std::min(a.y, b.y),
                                      std::max(a.y, b.y), rwCoat, rwBare, {}, {}});
             }
@@ -6532,22 +6583,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (pos == 0 || neg == 0) zOrderAdvance = (pos > 0 ? medianPitch : -medianPitch);
             }
         }
-        // TRAILING OUTLET PRUNE (Alf, 2026-08-06): transitions at the END of a conductor that
-        // are returns or radial links carry no revolution -- they are connection routing, and
-        // the terminal instead exits STRAIGHT from where the last real wrap finishes
-        // (23_interleaved secondary: the outer transition stations produced stub/chain zigzags
-        // at the top; "SHOULD NOT EXIST"). The pruned stations are not visited by the copper.
-        size_t nEmit = turns.size();
-        if (effectivelyRound) {
-            while (nEmit > 2) {
-                const PlanePt a = station(turns[nEmit - 2]), b = station(turns[nEmit - 1]);
-                const bool link = std::abs(b.x - a.x) > wireRadius &&
-                                  std::abs(b.y - a.y) <= std::abs(b.x - a.x);
-                if (!link && !isZReturn(a, b, wireRadius, medianPitch, zOrderAdvance)) break;
-                --nEmit;
-            }
-            last = station(turns[nEmit - 1]);
-        }
+        // NO TRAILING PRUNE. Every station MKF describes is visited by the copper. A prune of
+        // trailing return/link transitions used to live here (my over-application of Alf's
+        // 23_interleaved note about zigzagging LEAD pieces, which the lead work itself fixed:
+        // whole-lead lift, straight parallel-Z runs, MKF-drawn routes). It silently dropped
+        // REAL TURNS -- the litz fixture lost a whole 4-turn outer layer, 23's secondary lost
+        // turns 2-3 -- so the emitted body was a DIFFERENT MAGNETIC from the one MKF drew
+        // (Alf, 2026-08-07: "litz_fixture.svg and COLLIDING_litz_fixture.step are not the same
+        // design"). Worse, the terminal then attached to the pruned-back turn while still
+        // consuming the run row MKF computed for the true last turn, which drove the exit lead
+        // straight down through a dozen of its own turns.
+        const size_t nEmit = turns.size();
         // Wraps between consecutive crossings. Z-returns are only RECORDED here (the connecting
         // end-run is planned after every conductor is built, against the full obstacle field —
         // see planZEndRuns); ordinary wraps and serpentine links are appended directly.
@@ -6556,11 +6602,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // must ride over. The pre-scan mirrors this detection exactly; a transition it did not
         // see is a code drift, not a layout condition, so it throws.
         std::map<size_t, double> zDragbackAzimuth;
+        std::vector<PlanePt> stationsE;
+        for (const MAS::Turn* t : turns) stationsE.push_back(station(t));
+        const auto bandsE = computePitchBands(stationsE, wireRadius);
+        auto zReturnAt = [&](size_t i) {
+            const PlanePt a = station(turns[i]), b = station(turns[i + 1]);
+            const PitchBand band = bandAt(bandsE, a.x, wireRadius, medianPitch, zOrderAdvance);
+            return isZReturn(a, b, wireRadius, band.medianPitch, band.advance);
+        };
         if (effectivelyRound) {
             for (size_t i = 0; i + 1 < nEmit; ++i) {
-                if (!isZReturn(station(turns[i]), station(turns[i + 1]), wireRadius, medianPitch,
-                               zOrderAdvance))
-                    continue;
+                if (!zReturnAt(i)) continue;
                 auto it = dragAzOf.find({ci, i});
                 if (it == dragAzOf.end()) {
                     throw std::runtime_error(
