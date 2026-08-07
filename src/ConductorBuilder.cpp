@@ -4109,19 +4109,26 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
         pushPiece(azStart, azEnd, r0, r1, y0, y1, false, "");
         return;
     }
-    // ALF'S RULE (2026-08-05): the bump affects the -Z HALF ONLY. The +Z half is always the
-    // plain 180-degree arc of the wrap's own circle, from XY plane to XY plane. The raised -Z
-    // half is the circle with its centre DROPPED by the raise (cz = -raise) and its radius
-    // grown to hypot(r, raise), which re-enters the XY plane at exactly (+-r, 0) -- so every
-    // raised arc starts and ends ON the XY plane, whatever its radius, and no step segments
-    // exist at all. At the station side the wire dips to ~(r + raise), clearing the stack; at
-    // the plane crossings it meets the level half at a shallow ~raise/r kink the assembler
-    // mitres.
+    // ALF'S RULE: the bump affects the -Z HALF ONLY. The +Z half is always the plain
+    // 180-degree arc of the wrap's own circle, from XY plane to XY plane. The raised -Z half
+    // is THE SAME CIRCLE, at the wrap's own radius, translated bodily by -raise in z (centre
+    // cz = -raise) -- and the two halves are bridged at the XY-plane crossings by a STRAIGHT
+    // SEGMENT whose length IS the bump dimension at that turn (Alf, 2026-08-07).
+    //
+    // Why the straight riser and not a radius-grown circle (the dropped-centre rule this
+    // replaces, radius hypot(r, raise), which met the plane at (+-r, 0) with no bridge):
+    //   * the wire keeps its EXACT radius all the way round, so it stays concentric with the
+    //     column instead of bulging outward by hypot(r,raise) - r over the whole raised half;
+    //   * the dip at the station side is EXACTLY the raise, not raise + (hypot(r,raise) - r);
+    //   * the junctions are exactly TANGENT: at x = -+r the arc's tangent is purely axial
+    //     (d/daz of (r cos az, y, -r sin az) is (0, 0, -+r) there), which is the riser's own
+    //     direction -- so this model is G1 where the grown-radius one left a raise/r kink for
+    //     the assembler to mitre.
     const double c = raise;
-    auto rShift = [&](double az) { return std::hypot(radiusAt(az), c); };
-    // A sweep short enough to live entirely inside the -Z half is emitted raised end to end.
+    // A sweep short enough to live entirely inside the -Z half is emitted raised end to end:
+    // both its ends are station-side, already inside the raised region, so no riser is due.
     if (azEnd - azStart <= kPi + 1e-9) {
-        pushPiece(azStart, azEnd, rShift(azStart), rShift(azEnd), y0, y1, false,
+        pushPiece(azStart, azEnd, radiusAt(azStart), radiusAt(azEnd), y0, y1, false,
                   " (over dragback)", -c);
         return;
     }
@@ -4137,16 +4144,26 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
         throw std::runtime_error("ConductorBuilder: bump region boundaries inverted for '" +
                                  label + "' (vertical fan too wide for the ride-over model)");
     }
-    // On the dropped-centre circle the XY plane is reached phi = asin(c/R) PAST the nominal
-    // crossing, exactly where x = -+r again -- the head/tail spans extend by phi so their
-    // endpoints land on the level half's endpoints to machine precision.
-    const double phiH = std::asin(c / rShift(aHead));
-    const double phiT = std::asin(c / rShift(aTail));
-    pushPiece(azStart, aHead + phiH, rShift(azStart), rShift(aHead), heightAt(azStart),
+    // The riser at a plane crossing: straight along z, from the raised half's endpoint to the
+    // level half's endpoint (or back), length exactly `raise`.
+    auto pushRiser = [&](double az, double rAt, double yAt, bool up) {
+        const gp_Pnt raised = azPointC(0, -c, rAt, yAt, az);
+        const gp_Pnt level = azPointC(0, 0.0, rAt, yAt, az);
+        Primitive pr;
+        pr.kind = Primitive::SEG;
+        pr.seg = up ? Seg{raised, level} : Seg{level, raised};
+        pr.label = label + " (bump riser)";
+        pr.turnOrdinal = ordinal;
+        pr.isConnection = isConnection;
+        path.prims.push_back(std::move(pr));
+    };
+    pushPiece(azStart, aHead, radiusAt(azStart), radiusAt(aHead), heightAt(azStart),
               heightAt(aHead), false, " (over dragback)", -c);
+    pushRiser(aHead, radiusAt(aHead), heightAt(aHead), /*up=*/true);
     pushPiece(aHead, aTail, radiusAt(aHead), radiusAt(aTail), heightAt(aHead), heightAt(aTail),
               false, "");
-    pushPiece(aTail - phiT, azEnd, rShift(aTail), rShift(azEnd), heightAt(aTail), y1, false,
+    pushRiser(aTail, radiusAt(aTail), heightAt(aTail), /*up=*/false);
+    pushPiece(aTail, azEnd, radiusAt(aTail), radiusAt(azEnd), heightAt(aTail), y1, false,
               " (over dragback)", -c);
 }
 
@@ -4169,15 +4186,17 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         const double reRaise = tallestBumpColumn(bumpsEnd).first;
         Primitive step;
         step.kind = Primitive::SEG;
-        step.seg = {azPointC(0, -rsRaise, std::hypot(s.x, rsRaise), s.y, azS),
-                    azPointC(0, -reRaise, std::hypot(n.x, reRaise), n.y, azS)};
+        // Raised endpoints follow the wrap's own rule: the SAME radius, translated by -raise
+        // in z (Alf's straight-riser bump model) -- not a grown radius.
+        step.seg = {azPointC(0, -rsRaise, s.x, s.y, azS),
+                    azPointC(0, -reRaise, n.x, n.y, azS)};
         step.label = label + " (layer link)";
         step.turnOrdinal = ordinal;
         step.isConnection = true;
         path.prims.push_back(std::move(step));
         const double dAz = azE - azS;
         if (std::abs(dAz) > 1e-9) {
-            const double R = std::hypot(n.x, reRaise);
+            const double R = n.x;
             Primitive arc;
             arc.kind = Primitive::ARC3;
             arc.arc.c = gp_Pnt(0, n.y, -reRaise);
@@ -4335,10 +4354,10 @@ void appendZDragback(ConductorPath& path, const PlanePt& s, const PlanePt& n, do
     // The raise comes from tallestBumpColumn on the SAME list the adjoining wrap used, so the
     // chain and the wrap meet at one identical point.
     // The raised positions follow appendBumpedSweep's dropped-centre rule (cz = -raise, radius
-    // hypot(r, raise)) on the SAME bump lists, so the chain and the wraps meet at identical
+    // same radius, z dropped by raise) on the SAME bump lists, so chain and wraps meet at identical
     // points.
     const double chainRaise = tallestBumpColumn(bumpsOut).first;
-    const gp_Pnt pS = azPointC(0, -chainRaise, std::hypot(s.x, chainRaise), s.y, azD);
+    const gp_Pnt pS = azPointC(0, -chainRaise, s.x, s.y, azD);
     // The turn this return FEEDS rides over it, exactly as every turn at or outside the return's
     // radius does: its first station therefore sits one wire OD further out than the bare layer
     // radius. bumpsIn comes from the WINDOW-WIDE pre-scan and already CONTAINS this return (it is
@@ -4352,9 +4371,9 @@ void appendZDragback(ConductorPath& path, const PlanePt& s, const PlanePt& n, do
     // 1.58 mm further down, straight through the entrance lead.
     std::vector<gp_Pnt> direct{
         pS,
-        azPointC(0, -chainRaise, std::hypot(n.x, chainRaise), s.y, azD),
-        azPointC(0, -chainRaise, std::hypot(n.x, chainRaise), n.y, azD),
-        azPointC(0, -destRaise,  std::hypot(n.x, destRaise),  n.y, azD)};
+        azPointC(0, -chainRaise, n.x, s.y, azD),
+        azPointC(0, -chainRaise, n.x, n.y, azD),
+        azPointC(0, -destRaise,  n.x, n.y, azD)};
     appendFilletedPolyline(path.prims, direct, wireRadius, label + " (dragback)", ordinal,
                            /*isLead=*/false, /*isConnection=*/true);
 }
@@ -6439,7 +6458,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (const auto& q : kept) leadPts.push_back(azPointC(0, 0, q.x + zoff, q.y, azLead));
             // The lead runs STRAIGHT OUT at the level the turn finishes (Alf): every point,
             // tip included, carries the dropped-centre lift the adjoining wrap ends with
-            // (cz = -raise, radius hypot(r, raise), from tallestBumpColumn on the same bump
+            // (cz = -raise at the SAME radius, from tallestBumpColumn on the same bump
             // list), so the attachment matches the wrap exactly and the run never dips back
             // to the bare radius -- the un-dip read as a zigzag at the exits. The TIP's
             // radius is chosen so it lands exactly on the conductor's common tip PLANE
@@ -6451,8 +6470,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 for (size_t i = 0; i < leadPts.size(); ++i) {
                     if (i == tip) continue;
                     if (liftRaise > 0.0)
-                        leadPts[i] = azPointC(0, -liftRaise,
-                                              std::hypot(kept[i].x + zoff, liftRaise),
+                        leadPts[i] = azPointC(0, -liftRaise, kept[i].x + zoff,
                                               kept[i].y, azLead);
                 }
                 // The terminal RUN is a totally straight wire PARALLEL TO THE Z AXIS
