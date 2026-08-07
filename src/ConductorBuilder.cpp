@@ -5018,6 +5018,78 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     std::map<std::string,int> windingIdx;
     for (const auto& ct : conductors) windingIdx.emplace(ct.winding, (int)windingIdx.size());
     const int nWindings = (int)windingIdx.size();
+    // Connection FACE per winding (Alf, 2026-08-07: "use isolation side"): windings on the
+    // PRIMARY isolation side connect on the reference face (-Z, face 0); every other
+    // isolation side (secondary, tertiary, ...) connects on the opposite face (+Z, face 1).
+    // The split is the SAFETY-ISOLATION barrier -- mains-side terminals leave one side of
+    // the component, output-side terminals the other -- not an arbitrary alternation by
+    // winding order. A rect/oblong column maps onto itself only under 180 deg, so exactly
+    // these two faces exist; round columns keep the single fan plane (aimed at the core
+    // opening) and ignore this.
+    std::map<std::string, int> windingFace;
+    for (const auto& w : coil.get_functional_description())
+        windingFace[w.get_name()] =
+            (w.get_isolation_side() == MAS::IsolationSide::PRIMARY) ? 0 : 1;
+    // Some cores open on ONE side only (Alf, 2026-08-07: EP/EPX-style plates wrap one Z
+    // face). Before honouring the isolation-side faces, probe the core solids over both
+    // +-Z connection corridors (the slot span x the winding's height band x the lead's
+    // z reach). A blocked face takes no connections: every winding is forced to the open
+    // face -- the collision gate arbitrates the crowding loudly, never the core. Both
+    // corridors blocked -> refuse. This must run BEFORE emission: the dragback space
+    // reservation and the lead attachment key on the face during prim construction.
+    if (!isToroidal && !opts.coreObstacles.empty() &&
+        (columnShape == MAS::ColumnShape::RECTANGULAR ||
+         columnShape == MAS::ColumnShape::OBLONG)) {
+        double maxR = 0.0, maxY = 0.0, maxOD = 0.0;
+        for (const auto& ct : conductors) {
+            if (ct.turns.empty()) continue;
+            const MAS::Wire& w = wireMap.at(ct.winding);
+            auto [ww, wh] = TurnBuilder::wireDimensions(w, *ct.turns.front(), true);
+            maxOD = std::max(maxOD, std::max(ww, wh));
+            for (const MAS::Turn* t : ct.turns) {
+                maxR = std::max(maxR, station(t).x);
+                maxY = std::max(maxY, std::abs(station(t).y));
+            }
+        }
+        const double zStart = halfD + maxOD;      // just outside the winding's outer face
+        const double zEnd = maxR + 4.0 * maxOD;   // the leadTipRadius reach, rect analog
+        const double xs = static_cast<double>(conductors.size()) * maxOD;
+        auto corridorBlocked = [&](double sgn) {
+            for (const auto& obst : opts.coreObstacles)
+                for (TopExp_Explorer se(obst, TopAbs_SOLID); se.More(); se.Next()) {
+                    BRepClass3d_SolidClassifier cls(se.Current());
+                    for (int zi = 0; zi <= 8; ++zi)
+                        for (int xi = -2; xi <= 2; ++xi)
+                            for (int yi = -2; yi <= 2; ++yi) {
+                                cls.Perform(gp_Pnt(xs * xi / 2.0, maxY * yi / 2.0,
+                                                   sgn * (zStart + (zEnd - zStart) * zi / 8.0)),
+                                            1e-7);
+                                if (cls.State() == TopAbs_IN || cls.State() == TopAbs_ON)
+                                    return true;
+                            }
+                }
+            return false;
+        };
+        const bool blockNeg = corridorBlocked(-1.0);   // face 0: -Z, the reference face
+        const bool blockPos = corridorBlocked(+1.0);   // face 1: +Z (seam rotated 180 deg)
+        if (blockNeg && blockPos)
+            throw std::runtime_error(
+                "ConductorBuilder: the core blocks BOTH +-Z connection corridors "
+                "(probed z=[" + std::to_string(zStart * 1e3) + "," +
+                std::to_string(zEnd * 1e3) + "] mm) -- no rect-column terminal exit "
+                "is possible");
+        if (blockNeg || blockPos) {
+            const int open = blockNeg ? 1 : 0;
+            for (auto& [wname, f] : windingFace)
+                if (f != open) {
+                    std::cerr << "[ConductorBuilder] core blocks the "
+                              << (blockNeg ? "-Z" : "+Z") << " connection corridor: winding '"
+                              << wname << "' forced from its isolation-side face to the open "
+                              << (open == 1 ? "+Z" : "-Z") << " face\n";
+                    f = open;
+                }
+        }
+    }
 
     // RECT-column DRAGBACKS (Alf, 2026-08-06), the round-column model transliterated:
     // a cross-layer return runs on the CONNECTION (-Z) face -- step out to the destination
@@ -5077,7 +5149,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (std::abs(b.zPos - a.zPos) > 1e-12) {
                     if (!slotOf.count(cv)) slotOf[cv] = 0.0;   // slot assigned below
                     rectReturns.push_back({cv, i, a.zPos, b.zPos, diam, 0.0,
-                                           windingIdx.at(ct.winding) % 2});
+                                           windingFace.at(ct.winding)});
                     maxDiam = std::max(maxDiam, diam);
                 }
             }
@@ -6419,7 +6491,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (columnShape == MAS::ColumnShape::RECTANGULAR)
                     fLead.x += rectRideFor(
                         rectStation(first, halfW, halfD, minBend, path.name).zPos,
-                        windingIdx.at(ct.winding) % 2);
+                        windingFace.at(ct.winding));
                 wp = terminalWaypoints(entranceGroup, fLead, path.name + " entrance");
             } else {
                 // ROUND columns: straight in radially at the first station's own row, exactly
@@ -6479,7 +6551,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 {
                     const RectStation rs0 = rectStation(s, halfW, halfD, minBend, path.name);
                     const RectStation rs1 = rectStation(nxt, halfW, halfD, minBend, path.name);
-                    const int side = windingIdx.at(ct.winding) % 2;
+                    const int side = windingFace.at(ct.winding);
                     const RectReturn* ret = nullptr;
                     for (const auto& r : rectReturns)
                         if (r.ci == ci && r.trans == i) { ret = &r; break; }
@@ -6525,7 +6597,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (columnShape == MAS::ColumnShape::RECTANGULAR)
                     lLead.x += rectRideFor(
                         rectStation(last, halfW, halfD, minBend, path.name).zPos,
-                        windingIdx.at(ct.winding) % 2);
+                        windingFace.at(ct.winding));
                 wp = terminalWaypoints(exitGroup, lLead, path.name + " exit");
             } else {
                 // ROUND columns: straight out radially at the last station's own row (Alf: the
@@ -6567,10 +6639,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // are circles (rotation-invariant), so rotating a strand's whole path separates its
         // leads/links/end-runs TANGENTIALLY from its sibling strands (physically: the strands
         // exit side by side) without touching any turn position.
-        const int wi = windingIdx.at(ct.winding);
         // The winding/parallel stagger is applied AFTER the core probe: how far the leads may be
         // spread depends on how wide the core's opening actually is (see below).
-        double seamAngle = effectivelyRound ? 0.0 : ((wi % 2) * kPi);
+        double seamAngle = effectivelyRound ? 0.0 : (windingFace.at(ct.winding) * kPi);
         // Aim the whole seam sector at the core's window OPENING (Options::leadExitAzimuth):
         // a rigid rotation about the column axis, exactly like the stagger. ROUND columns
         // rotate freely; RECT/OBLONG columns only map onto themselves under 180 degrees, so
