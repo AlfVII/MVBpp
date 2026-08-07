@@ -3301,8 +3301,39 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         std::vector<const Primitive*> cptrs;
         cptrs.reserve(path.prims.size());
         for (const auto& pr : path.prims) cptrs.push_back(&pr);
-        return pruneDegenerateSolids(
+        TopoDS_Shape conf = pruneDegenerateSolids(
             emitToroidConformal(cptrs, path.wireRadius, wirePolygonSegments));
+        // EXPERIMENT (Alf, 2026-08-07): MVB_FUSE_ROUND. With EXACT round profiles
+        // (segments=0) every junction is a planar disk / mitre ellipse, so a guarded
+        // fuse of the conformal compound can produce ONE solid the way the rect path
+        // does. MEASURED RESULT (01_etd34, exact profiles): the union DOES unite
+        // (25 -> 1, volume exact at 560.93 mm3) but the body is BRepCheck-INVALID --
+        // identically in the metre AND the mm frame, so it is not the boolean scale
+        // bug but OCC's face stitching where the trimmed cylinder/torus laterals meet
+        // at the junction rings. An invalid body is unusable regardless of whether
+        // gmsh would mesh it, so the conformal compound + gmsh fragment REMAINS the
+        // round-wire architecture. Hook kept env-gated for re-testing after OCCT
+        // upgrades; fuseAllSolids' guards mean it can never ship corruption silently
+        // (and verify-cad flags the invalid result loudly, as measured).
+        if (std::getenv("MVB_FUSE_ROUND")) {
+            // mm frame, like weldSolidsPairwise: metre-scale booleans corrupt sub-mm
+            // features (measured on 03's corner lens).
+            gp_Trsf up, down;
+            up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+            down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
+            const TopoDS_Shape confMm =
+                BRepBuilderAPI_Transform(conf, up, Standard_True).Shape();
+            const TopoDS_Shape fusedMm = fuseAllSolids(confMm, path.wireRadius * 1000.0);
+            const TopoDS_Shape fused =
+                BRepBuilderAPI_Transform(fusedMm, down, Standard_True).Shape();
+            int nIn = 0, nOut = 0;
+            for (TopExp_Explorer e(conf, TopAbs_SOLID); e.More(); e.Next()) ++nIn;
+            for (TopExp_Explorer e(fused, TopAbs_SOLID); e.More(); e.Next()) ++nOut;
+            std::cerr << "[fuse-round] '" << path.name << "': " << nIn << " solids -> "
+                      << nOut << (nOut < nIn ? " (fused)" : " (kept compound)") << "\n";
+            return fused;
+        }
+        return conf;
     }
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
