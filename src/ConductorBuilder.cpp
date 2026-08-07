@@ -1478,6 +1478,32 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
             return BRepPrimAPI_MakeRevol(face, gp_Ax1(pr.arc.c, revDir), std::abs(pr.arc.sweep))
                 .Shape();
         }
+        if (!round && pr.kind == Primitive::SPIRAL && !pr.spiral.blend) {
+            // RISING RECT CORNER (Alf, 18_stacked): the pipe-shell swept the section from a
+            // SAMPLED chord tangent, so the solid began its rotation before the straight's
+            // real end and its lateral surfaces matched neither neighbour. Loft EXACT
+            // analytic sections instead: profiles on the helical corner at the TRUE tangent,
+            // the first/last EXACTLY on the neighbouring prisms' end planes.
+            const Spiral& sp = pr.spiral;
+            const double azSpan = sp.az1 - sp.az0;
+            const int K = std::max(5, (int)std::ceil(std::abs(azSpan) / (kPi / 12.0)) + 1);
+            BRepOffsetAPI_ThruSections loft(Standard_True, Standard_False);
+            for (int k2 = 0; k2 < K; ++k2) {
+                const double t = (double)k2 / (K - 1);
+                const double az = sp.az0 + azSpan * t;
+                const double rr = sp.r0 + (sp.r1 - sp.r0) * t;
+                const double yy = sp.y0 + (sp.y1 - sp.y0) * t;
+                const gp_Pnt c(sp.cx + rr * std::cos(az), yy, sp.cz - rr * std::sin(az));
+                gp_XYZ tv(-rr * std::sin(az) * azSpan + (sp.r1 - sp.r0) * std::cos(az),
+                          sp.y1 - sp.y0,
+                          -rr * std::cos(az) * azSpan - (sp.r1 - sp.r0) * std::sin(az));
+                if (tv.Modulus() < 1e-15) return TopoDS_Shape();
+                loft.AddWire(rectProfileWire(c, gp_Dir(tv), axial, w, h));
+            }
+            loft.Build();
+            if (loft.IsDone() && !loft.Shape().IsNull()) return loft.Shape();
+            return TopoDS_Shape();
+        }
         // BLEND / SPIRAL (the gentle axial transition that carries the wire from one turn to the
         // next): pipe the section over the analytic edge. This is the ONLY swept primitive in an
         // otherwise analytic rect-column turn (every straight is a prism, every corner a revolve),
@@ -1547,6 +1573,9 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
 bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius);   // defined below
 
 TopoDS_Shape emitRectColumn(const ConductorPath& path) {
+    if (std::getenv("MVB_DIAG"))
+        std::cerr << "[emitRectColumn] ENTER '" << path.name << "' prims=" << path.prims.size()
+                  << " femReady=" << path.femReady << " roundProfile=" << path.roundProfile << "\n";
     // The straight/blend section's "axial" axis: the column axis Y for concentric columns, or the
     // toroid's AZIMUTHAL tangent (perpendicular to the poloidal plane) at the primitive's position.
     // (Corners take their axis from the arc itself, inside rectPrimSolid.)
@@ -1662,7 +1691,16 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         double extA = -trimStart[i], extB = -trimEnd[i];
         TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB, extA,
                                        extB, round, radius, /*splitOverride=*/-1);
-        if (s.IsNull()) continue;
+        if (s.IsNull()) {
+            // NO silent drops (Alf): a failed primitive solid means the emitted copper is
+            // missing from the conductor -- 17_cllc shipped its secondary WITHOUT the exit
+            // lead through this very 'continue' and the watertight battery could not see it
+            // (every present solid was valid; the absent one had no witness).
+            throw std::runtime_error(
+                "ConductorBuilder: rectPrimSolid failed for '" + pr.label + "' of '" +
+                path.name + "' (trims " + std::to_string(extA) + "/" + std::to_string(extB) +
+                " m). Refusing to emit a conductor with missing copper.");
+        }
         if (std::getenv("MVB_DIAG") && !BRepCheck_Analyzer(s).IsValid())
             std::cerr << "[rect-column] INVALID prim solid [" << pr.label << "]\n";
         splitArgs.push_back({&pr, axialA, axialB, extA, extB});
@@ -3249,6 +3287,12 @@ TopoDS_Shape emitToroidConformal(const std::vector<const Primitive*>& ptrs, doub
 }
 
 TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
+    if (std::getenv("MVB_DIAG"))
+        std::cerr << "[emitConductor] '" << path.name << "' prims=" << path.prims.size()
+                  << " useRectSolids=" << path.useRectSolids << " roundProfile="
+                  << path.roundProfile << " femReady=" << path.femReady << " toroidal="
+                  << path.toroidal << " singleBodyCapable=" << path.singleBodyCapable
+                  << " isRect=" << path.isRectangular << "\n";
     // FEM ROUND-WIRE windings (EVERY column type: round/oblong/rect columns AND toroids):
     // the CONFORMAL MITRE ASSEMBLY, checked FIRST so no legacy strategy runs. See the block
     // comment further down (kept with the legacy paths) and docs/: research-converged
@@ -3836,7 +3880,22 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
     // borderX = 2*centre.x - turnX; the run's level is the rect's own y (with no stub
     // MKF still routes at the blocked edge slot, within half a wire of the station) —
     // all MKF data, nothing invented.
-    double borderX = 2.0 * run->coordinates.at(0) - station.x;
+    // Border = the drawn run box's own FAR EDGE minus half a wire (box height = one wire
+    // OD). Station-independent -- the old mirror (2*centre - station) assumed the station
+    // at the box's near edge and INVERTED the lead when a dragback-displaced attach sat
+    // past the centre (17_cllc secondary exit: attach ridden +5.3 mm -> "border" landed
+    // inside the winding and the exit lead was mangled into the ring band). For an
+    // undisplaced station the two derivations are algebraically identical. A lead never
+    // runs inward: the border is clamped outward of the attach.
+    double borderX = run->coordinates.at(0) + 0.5 * run->dimensions.at(0) -
+                     0.5 * run->dimensions.at(1);
+    borderX = std::max(borderX, station.x);
+    if (std::getenv("MVB_DIAG"))
+        std::cerr << "[terminalWaypoints] " << who << ": station=(" << station.x * 1e3 << ","
+                  << station.y * 1e3 << ") run rect c=(" << run->coordinates.at(0) * 1e3 << ","
+                  << run->coordinates.at(1) * 1e3 << ") dims=(" << run->dimensions.at(0) * 1e3
+                  << "x" << run->dimensions.at(1) * 1e3 << ") -> borderX=" << borderX * 1e3
+                  << "\n";
     double edgeY = run->coordinates.at(1);
     // SVG semantics (Alf, 2026-08-07): a pink box that COVERS the wire surface at the
     // turn is NOT a segment -- it only marks the connection of the turn to another
@@ -4470,7 +4529,14 @@ RectStation rectStation(const PlanePt& p, double halfW, double halfD, double min
 void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStation& s1,
                     const std::string& label, size_t ordinal, double wireRadius,
                     double ride0, double rideBack0, bool isReturn, double chainRide,
-                    double destRide, double xSlot) {
+                    double destRide, double xSlot,
+                    // When the NEXT transition is a dragback, its descent x-slot: the rising
+                    // turn ENDS there and corners straight into the step-out (Alf, 17_cllc:
+                    // no run past the crossing and back -- the U-fold pieces must not exist).
+                    double stopAtX = std::numeric_limits<double>::quiet_NaN(),
+                    // First transition feeding an entrance lead corner: the first straight
+                    // BEGINS this far along its own direction (the corner occupies [0, startAtX]).
+                    double startAtX = std::numeric_limits<double>::quiet_NaN()) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -4516,8 +4582,20 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         // full row apart and can never cross. The EXTENDED lateral length from any dragback
         // reservation joins this same distribution (Alf).
         const double q = 0.5 * kPi * s0.cornerR;
-        const double L =
-            4.0 * s0.segX + 4.0 * s0.segZ + 2.0 * ride0 + 2.0 * rideBack0 + 4.0 * q;
+        // A rising turn that feeds a dragback ends AT the descent slot, so the pitch is
+        // distributed over the path it actually travels (crossing-to-slot shortening).
+        const double endX = std::isnan(stopAtX) ? 0.0 : stopAtX;
+        const double begX = std::isnan(startAtX) ? 0.0 : startAtX;
+        if (!std::isnan(stopAtX) && std::abs(stopAtX) > s0.segX)
+            throw std::runtime_error(
+                "ConductorBuilder: dragback x-slot " + std::to_string(stopAtX) +
+                " m lies outside the -Z face straight of " + label);
+        if (begX < 0.0 || begX > s0.segX)
+            throw std::runtime_error(
+                "ConductorBuilder: entrance corner offset " + std::to_string(begX) +
+                " m lies outside the -Z face straight of " + label);
+        const double L = 4.0 * s0.segX + 4.0 * s0.segZ + 2.0 * ride0 + 2.0 * rideBack0 +
+                         4.0 * q - endX - begX;
         if (L < 1e-12) {
             throw std::runtime_error(
                 "ConductorBuilder: rect turn of " + label +
@@ -4541,7 +4619,7 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             path.prims.push_back(std::move(pr));
             arc += q;
         };
-        riseSeg(0, -zN0, -s0.segX, -zN0, s0.segX, "face -Z out");
+        riseSeg(-begX, -zN0, -s0.segX, -zN0, s0.segX - begX, "face -Z out");
         riseCorner(-s0.segX, -cZ0, kPi / 2.0, "corner -X-Z");
         riseSeg(-s0.xPos, -cZ0, -s0.xPos, +cP0, 2.0 * s0.segZ + ride0 + rideBack0,
                 "face -X");
@@ -4551,7 +4629,7 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         riseSeg(+s0.xPos, +cP0, +s0.xPos, -cZ0, 2.0 * s0.segZ + ride0 + rideBack0,
                 "face +X");
         riseCorner(+s0.segX, -cZ0, 0.0, "corner +X-Z");
-        riseSeg(+s0.segX, -zN0, 0, -zN0, s0.segX, "face -Z in");
+        riseSeg(+s0.segX, -zN0, endX, -zN0, s0.segX - endX, "face -Z in");
         return;
     }
     // CROSS-LAYER DRAGBACK (Alf, 2026-08-06): the CHAIN ONLY, no revolution -- exactly like
@@ -4567,12 +4645,18 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
     {
         const double zDesc = s1.zPos + chainRide;   // the descent's face depth
         const double zDest = s1.zPos + destRide;    // the destination crossing's depth
-        std::vector<gp_Pnt> pts{gp_Pnt(0, y, -zN0),
-                                gp_Pnt(xSlot, y, -zN0),
+        // The chain STARTS at the slot: the preceding rising turn already ends there
+        // (stopAtX) and corners into the step-out -- the old run from the face crossing
+        // to the slot doubled back over the just-arrived straight (Alf, 17_cllc:
+        // "Secondary parallel 110 should not exist"). Only a chain with NO preceding
+        // wrap (a return as the conductor's first transition) keeps the crossing run.
+        std::vector<gp_Pnt> pts;
+        if (ordinal == 0) pts.push_back(gp_Pnt(0, y, -zN0));
+        pts.insert(pts.end(), {gp_Pnt(xSlot, y, -zN0),
                                 gp_Pnt(xSlot, y, -zDesc),
                                 gp_Pnt(xSlot, s1.y, -zDesc),
                                 gp_Pnt(xSlot, s1.y, -zDest),
-                                gp_Pnt(0, s1.y, -zDest)};
+                                gp_Pnt(0, s1.y, -zDest)});
         appendFilletedPolyline(path.prims, pts, wireRadius, label + " (dragback)", ordinal,
                                /*isLead=*/false, /*isConnection=*/true);
     }
@@ -6303,7 +6387,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // The tip plane sits beyond the winding AND beyond the tallest vertical-fan column, so
         // a lifted lead still runs OUTWARD all the way. Entrance and exit share the plane, so
         // a conductor's two terminals finish on the same face.
-        const double leadTipRadius = maxTurnRadius + 4.0 * (2.0 * wireRadius) + fanMaxRaise;
+        // RECT columns: the terminal attach can sit on a dragback-DISPLACED face (rectRideFor),
+        // so the common tip plane must clear the displaced attach too, or the tip lands INSIDE
+        // the attach (17_cllc: exit attach ridden to 24.9 mm vs a 24.2 mm tip plane).
+        double maxRide = 0.0;
+        if (columnShape == MAS::ColumnShape::RECTANGULAR)
+            for (int side2 = 0; side2 < 2; ++side2)
+                for (const auto& [lvlZ, diam] : rectRideLevels[side2])
+                    maxRide += diam;   // conservative: all reservation levels stacked
+        const double leadTipRadius =
+            maxTurnRadius + 4.0 * (2.0 * wireRadius) + fanMaxRaise + maxRide;
 
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
                                  size_t ordinal, bool stationAtFront, double liftRaise = 0.0,
@@ -6391,10 +6484,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         };
 
         auto extendBorder = [&](std::vector<PlanePt>& wp) {
-            // The border waypoint is the one farthest out radially; push it to leadTipRadius.
-            PlanePt* outer = &wp.front();
-            for (auto& p : wp) if (p.x > outer->x) outer = &p;
-            outer->x = std::max(outer->x, leadTipRadius);
+            // The BORDER is always the route's LAST waypoint (terminalWaypoints order:
+            // station first; called before the entrance reversal). Push IT to the common
+            // tip plane. Picking "the farthest-out waypoint" instead extended the STATION
+            // itself whenever a dragback-displaced attach sat beyond the drawn border
+            // (17_cllc secondary exit: attach 19.17 vs border 19.05), detaching the lead
+            // from its turn -- both ends landed at the border.
+            wp.back().x = std::max(wp.back().x, leadTipRadius);
         };
 
         // The conductor's typical within-layer axial advance per wrap: median |dy| over its
@@ -6593,10 +6689,46 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 PlanePt fLead = first;
                 // Rect columns: the crossing sits on the DISPLACED -Z face (dragback
                 // reservation), so the lead attaches there too.
-                if (columnShape == MAS::ColumnShape::RECTANGULAR)
-                    fLead.x += rectRideFor(
-                        rectStation(first, halfW, halfD, minBend, path.name).zPos,
-                        windingFace.at(ct.winding));
+                if (columnShape == MAS::ColumnShape::RECTANGULAR) {
+                    const RectStation rsF =
+                        rectStation(first, halfW, halfD, minBend, path.name);
+                    const double rideF = rectRideFor(rsF.zPos, windingFace.at(ct.winding));
+                    fLead.x += rideF;
+                // RECT-WIRE LEAD CORNER (Alf, 18_stacked: "the connections are not
+                // properly connected to the end of turn"): the ribbon cannot butt the
+                // terminal run at 90 degrees -- the face straight ends a corner radius
+                // short (see the appendRectWrap call) and this in-plane quarter wedge
+                // turns it into the lead, conformal to both end planes.
+                auto rectLeadCornerPrim = [&](const RectStation& rsA, double rideA,
+                                              double rowY, bool isExit, size_t ord) {
+                    const double cR = rsA.cornerR;
+                    const double zA = rsA.zPos + rideA;
+                    Primitive cnr;
+                    cnr.kind = Primitive::ARC3;
+                    cnr.arc.axis = gp_XYZ(0, -1, 0);
+                    cnr.arc.sweep = kPi / 2.0;
+                    if (isExit) {
+                        cnr.arc.c = gp_Pnt(cR, rowY, -(zA + cR));
+                        cnr.arc.v0 = gp_XYZ(0, 0, cR);
+                    } else {
+                        cnr.arc.c = gp_Pnt(-cR, rowY, -(zA + cR));
+                        cnr.arc.v0 = gp_XYZ(cR, 0, 0);
+                    }
+                    cnr.label = path.name + (isExit ? " exit" : " entrance") + " lead corner";
+                    cnr.turnOrdinal = ord;
+                    cnr.isLead = true;
+                    path.prims.push_back(std::move(cnr));
+                };
+                    // Corner only when the first transition is a rising turn that was
+                    // actually shortened for it (mirrors the appendRectWrap call).
+                    bool ret0 = false;
+                    for (const auto& r : rectReturns)
+                        if (r.ci == ci && r.trans == 0) ret0 = true;
+                    if (rectWire && turns.size() > 1 && !ret0) {
+                        rectLeadCornerPrim(rsF, rideF, first.y, /*isExit=*/false, 0);
+                        fLead.x += rsF.cornerR;
+                    }
+                }
                 wp = terminalWaypoints(entranceGroup, fLead, path.name + " entrance");
             }
             if (!wp.empty()) {
@@ -6643,8 +6775,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     const RectStation rs1 = rectStation(nxt, halfW, halfD, minBend, path.name);
                     const int side = windingFace.at(ct.winding);
                     const RectReturn* ret = nullptr;
-                    for (const auto& r : rectReturns)
-                        if (r.ci == ci && r.trans == i) { ret = &r; break; }
+                    const RectReturn* nextRet = nullptr;
+                    for (const auto& r : rectReturns) {
+                        if (r.ci == ci && r.trans == i) ret = &r;
+                        if (r.ci == ci && r.trans == i + 1) nextRet = &r;
+                    }
                     double chainRide = 0.0, destRide = 0.0, xSlot = 0.0;
                     if (ret) {
                         destRide = rectRideFor(rs1.zPos, side);
@@ -6659,10 +6794,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                 label);
                         }
                     }
+                    // RECT-WIRE LEAD CORNERS (Alf, 18_stacked): the first/last face
+                    // straight ends a corner radius short of the crossing; the in-plane
+                    // quarter wedge (emitted with the lead) turns into the terminal run.
+                    const double kNaN = std::numeric_limits<double>::quiet_NaN();
+                    const bool rw = path.isRectangular;
+                    const double stopX = nextRet ? nextRet->xSlot
+                                       : (rw && i + 2 == nEmit && !ret ? rs1.cornerR : kNaN);
+                    const double startX = (rw && i == 0 && !ret) ? rs0.cornerR : kNaN;
                     appendRectWrap(path, rs0, rs1, label, i, wireRadius,
                                    rectRideFor(rs0.zPos, side),
                                    rectRideFor(rs0.zPos, 1 - side), ret != nullptr,
-                                   chainRide, destRide, xSlot);
+                                   chainRide, destRide, xSlot, stopX, startX);
                 }
             } else {   // OBLONG with a real straight section
                 appendOblongWrap(path, s, nxt, oblongHalf, label, i);
@@ -6692,10 +6835,44 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // the entrance).
                 PlanePt lLead = last;
                 // Displaced -Z crossing, exactly like the entrance.
-                if (columnShape == MAS::ColumnShape::RECTANGULAR)
-                    lLead.x += rectRideFor(
-                        rectStation(last, halfW, halfD, minBend, path.name).zPos,
-                        windingFace.at(ct.winding));
+                if (columnShape == MAS::ColumnShape::RECTANGULAR) {
+                    const RectStation rsL =
+                        rectStation(last, halfW, halfD, minBend, path.name);
+                    const double rideL = rectRideFor(rsL.zPos, windingFace.at(ct.winding));
+                    lLead.x += rideL;
+                // RECT-WIRE LEAD CORNER (Alf, 18_stacked: "the connections are not
+                // properly connected to the end of turn"): the ribbon cannot butt the
+                // terminal run at 90 degrees -- the face straight ends a corner radius
+                // short (see the appendRectWrap call) and this in-plane quarter wedge
+                // turns it into the lead, conformal to both end planes.
+                auto rectLeadCornerPrim = [&](const RectStation& rsA, double rideA,
+                                              double rowY, bool isExit, size_t ord) {
+                    const double cR = rsA.cornerR;
+                    const double zA = rsA.zPos + rideA;
+                    Primitive cnr;
+                    cnr.kind = Primitive::ARC3;
+                    cnr.arc.axis = gp_XYZ(0, -1, 0);
+                    cnr.arc.sweep = kPi / 2.0;
+                    if (isExit) {
+                        cnr.arc.c = gp_Pnt(cR, rowY, -(zA + cR));
+                        cnr.arc.v0 = gp_XYZ(0, 0, cR);
+                    } else {
+                        cnr.arc.c = gp_Pnt(-cR, rowY, -(zA + cR));
+                        cnr.arc.v0 = gp_XYZ(cR, 0, 0);
+                    }
+                    cnr.label = path.name + (isExit ? " exit" : " entrance") + " lead corner";
+                    cnr.turnOrdinal = ord;
+                    cnr.isLead = true;
+                    path.prims.push_back(std::move(cnr));
+                };
+                    bool retLast = false;
+                    for (const auto& r : rectReturns)
+                        if (r.ci == ci && r.trans + 2 == nEmit) retLast = true;
+                    if (rectWire && nEmit > 1 && !retLast) {
+                        rectLeadCornerPrim(rsL, rideL, last.y, /*isExit=*/true, nEmit - 1);
+                        lLead.x += rsL.cornerR;
+                    }
+                }
                 wp = terminalWaypoints(exitGroup, lLead, path.name + " exit");
             } else {
                 // MKF drew only one lead (see splitTerminalGroups): synthesized minimal
