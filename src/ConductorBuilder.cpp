@@ -4294,18 +4294,28 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
                      double wireRadius, const std::string& label, size_t ordinal,
                      const std::vector<WrapBump>& bumps = {}, double azS = kPlaneAz,
                      double azE = kPlaneAz, const std::vector<WrapBump>& bumpsEnd = {}) {
-    // U (SERPENTINE) LAYER LINK -- Alf, 2026-08-07, 14_dab. Layers wound in U (this one bottom
-    // to top, the next top to bottom) connect DIFFERENTLY from a dragback, and differently from
-    // a cone: the wire leaves the last turn's crossing on a straight HORIZONTAL segment, radial
-    // and at CONSTANT HEIGHT, until it reaches the next layer's radius; from there it continues
-    // as a NORMAL round turn -- that first turn of the new layer also at constant height. The
-    // height only begins to change at the layer's SECOND turn.
+    // U (SERPENTINE) LAYER LINK -- Alf, 2026-08-07, 14_dab; descent form Alf, 2026-08-08 (ABT
+    // #608 final form). Layers wound in U (this one bottom to top, the next top to bottom)
+    // connect DIFFERENTLY from a dragback, and differently from a cone: the wire leaves the
+    // last turn's crossing on a straight TANGENTIAL segment until it reaches the next layer's
+    // radius; from there it continues as a NORMAL round turn ending at the new layer's first
+    // station. That landing turn "must already include the decrease of the pitch, including the
+    // straight tangential chunk": MKF places the landing station BELOW the arrival (one wire OD
+    // into the layer), and the descent is distributed over the WHOLE transition by azimuth --
+    // the chunk slopes over its dAz share and the revolution continues the same gradient into
+    // the station. When MKF keeps the station level (the landing turn is the section's LAST,
+    // where nothing follows it), the same interpolation degenerates to the flat link -- one
+    // rule, no special case.
     //
     // So the transition carries the segment AND one full revolution: it is a turn, exactly as
     // MKF counts it. Emitting only the segment dropped a whole turn of copper (and of
     // inductance) per layer change; emitting a cone over the revolution instead ("what the fuck
     // is this monstrosity") gave the right turn count with the wrong shape.
-    if (std::abs(n.x - s.x) > wireRadius && std::abs(n.y - s.y) <= std::abs(n.x - s.x)) {
+    //
+    // The height window admits the descending landing (up to ~a wire OD past the radial step);
+    // a dragback returns across the whole layer height and stays excluded.
+    if (std::abs(n.x - s.x) > wireRadius
+        && std::abs(n.y - s.y) <= std::abs(n.x - s.x) + 2.0 * wireRadius) {
         const double rsRaise = tallestBumpColumn(bumps).first;
         const double reRaise = tallestBumpColumn(bumpsEnd).first;
         // The segment is TANGENTIAL to the arc it leaves -- at the crossing the turn's own
@@ -4316,17 +4326,22 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         // which a radial segment does.
         const double L = std::sqrt(std::max(0.0, n.x * n.x - s.x * s.x));
         const double dAz = std::atan2(L, s.x);
+        // Distribute the landing descent by azimuth over chunk + revolution (total advance is
+        // exactly 2*pi): the chunk's far end sits dAz/2pi of the way down, and the revolution
+        // carries the rest into the station. s.y == n.y (section-final landing) degenerates to
+        // the flat link.
+        const double chunkEndY = s.y + (n.y - s.y) * (dAz / kTwoPi);
         Primitive step;
         step.kind = Primitive::SEG;
         step.seg = {azPointC(0, -rsRaise, s.x, s.y, azS),
-                    azPointC(0, -reRaise, n.x, s.y, azS + dAz)};
+                    azPointC(0, -reRaise, n.x, chunkEndY, azS + dAz)};
         step.label = label + " (layer link)";
         step.turnOrdinal = ordinal;
         step.isConnection = true;
         path.prims.push_back(std::move(step));
-        // The new layer's FIRST turn: a normal round turn, from where the tangent landed, at
-        // the height the segment arrived at (the height only changes from the SECOND turn).
-        appendBumpedSweep(path, n.x, s.y, azS + dAz, n.x, n.y, azE + kTwoPi, bumpsEnd,
+        // The new layer's FIRST turn: a normal round turn from where the tangent landed,
+        // continuing the same descent gradient into the layer's first station.
+        appendBumpedSweep(path, n.x, chunkEndY, azS + dAz, n.x, n.y, azE + kTwoPi, bumpsEnd,
                           wireRadius, label, ordinal, false);
         return;
     }

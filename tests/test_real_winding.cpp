@@ -432,23 +432,39 @@ TEST_CASE("Real winding: two parallels become two independent conductors", "[rea
     }
 }
 
-TEST_CASE("Real winding: multi-parallel throws on MKF's overlapping lead rows",
+TEST_CASE("Real winding: multi-layer multi-parallel builds collision-free",
           "[realwinding]") {
-    // MKF draws every parallel's terminal lead at the SAME edge row (identical rectangles), so a
-    // multi-parallel winding's parallel strands have COINCIDENT lead copper. That is overlapping
-    // copper — an un-meshable solid — even though the parallels are the same net, so the collision gate
-    // (which forbids ANY copper interpenetration, parallels included) correctly refuses to emit it. The
-    // per-winding seam stagger cannot separate them: parallels share a winding, hence the same angle.
-    // MKF must allocate one lead row per parallel (ABT #229/#240) before this can build.
-    auto magneticJson = loadFixture("realwinding_round_2p.json");   // 8t x 2p -> multi-layer
+    // HISTORY — this fixture characterized two generations of a collision, both fixed. First MKF
+    // drew every parallel's terminal lead at the SAME edge row (coincident copper) until ABT
+    // #229/#240 gave each parallel its own row. The build then still collided: the U layer links
+    // landed LEVEL with the previous layer's last turn, so the parallels' landing revolutions
+    // overlapped. The ABT #608 final form fixed that too — MKF places each non-first U layer's
+    // first station below the tangential arrival (as far as the window allows) and the landing
+    // wrap descends, chunk included — so the 8t x 2p multi-layer U fixture now builds valid,
+    // meshable copper (verified ALL WATERTIGHT in the full battery). The gate throwing here again
+    // means a REGRESSION in one of those two fixes.
+    auto magneticJson = loadFixture("realwinding_round_2p.json");   // 8t x 2p -> multi-layer U
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
 
     mvb::MagneticBuilder builder;
-    REQUIRE_THROWS_WITH(
-        builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
-                              mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
-                              /*useRealWindingGeometry=*/true),
-        Catch::Matchers::ContainsSubstring("collision"));
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+
+    const mvb::NamedShape* p0 = nullptr;
+    const mvb::NamedShape* p1 = nullptr;
+    for (const auto& ns : named) {
+        if (ns.name == "Primary parallel 0") p0 = &ns;
+        if (ns.name == "Primary parallel 1") p1 = &ns;
+    }
+    REQUIRE(p0 != nullptr);
+    REQUIRE(p1 != nullptr);
+    REQUIRE(shapeVolume(p0->shape) > 0.0);
+    REQUIRE(shapeVolume(p1->shape) > 0.0);
+    // Same guarantee the single-layer 2p case asserts: the parallels are independent copper.
+    double v = commonVolume(p0->shape, p1->shape);
+    INFO("parallel-parallel common volume = " << v);
+    REQUIRE(v <= 1e-12);
 }
 
 namespace {
