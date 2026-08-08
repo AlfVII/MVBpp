@@ -2752,16 +2752,33 @@ TopoDS_Shape fuseAllSolids(const TopoDS_Shape& compound, double wireRadius) {
 // thin sheet/shell solids behind when it welds a dense multilayer winding: they carry no
 // copper, render as stray sheets, and break tetrahedral meshing. Any real conductor piece --
 // even a lead-junction sphere -- is orders of magnitude above the 1e-12 m^3 (1e-3 mm^3) floor.
-TopoDS_Shape pruneDegenerateSolids(const TopoDS_Shape& shape) {
-    constexpr double kMinSolidVolume = 1e-12;   // m^3
+TopoDS_Shape pruneDegenerateSolids(const TopoDS_Shape& shape, double wireRadius) {
+    // The threshold is RELATIVE TO THE WIRE, never an absolute volume. This exists to drop
+    // boolean SLIVERS -- sheets with no thickness -- so the scale that matters is the wire's
+    // own: a piece thinner than a hundredth of a wire radius along the wire is a sliver, any
+    // longer piece is real copper. An absolute 1e-12 m^3 cutoff silently deleted every bump
+    // riser of 13_current_sense's 0.049 mm-radius secondary (riser volume 8.4e-13 m^3, a
+    // legitimate 0.112 mm step), leaving the bump arcs disconnected -- Alf, 2026-08-08:
+    // "Secondary parallel 0 16 and 17 are not connected, they are missing the straight
+    // segment of the bump".
+    const double kMinSolidVolume =
+        kPi * wireRadius * wireRadius * (wireRadius / 100.0);
     std::vector<TopoDS_Shape> kept;
     int total = 0;
+    double droppedVolume = 0.0;
     for (TopExp_Explorer exp(shape, TopAbs_SOLID); exp.More(); exp.Next()) {
         ++total;
         GProp_GProps props;
         BRepGProp::VolumeProperties(exp.Current(), props);
         if (std::abs(props.Mass()) >= kMinSolidVolume) kept.push_back(exp.Current());
+        else droppedVolume += std::abs(props.Mass());
     }
+    // Dropping copper is never routine: say so.
+    if (static_cast<int>(kept.size()) != total)
+        std::cerr << "[ConductorBuilder] pruneDegenerateSolids dropped "
+                  << (total - static_cast<int>(kept.size())) << " of " << total
+                  << " solids as slivers (" << droppedVolume * 1e9 << " mm3, threshold "
+                  << kMinSolidVolume * 1e9 << " mm3)\n";
     if (kept.empty() || static_cast<int>(kept.size()) == total) return shape;
     if (kept.size() == 1) return kept.front();
     TopoDS_Compound out;
@@ -3322,12 +3339,23 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // the CONFORMAL MITRE ASSEMBLY, checked FIRST so no legacy strategy runs. See the block
     // comment further down (kept with the legacy paths) and docs/: research-converged
     // construction, no booleans on the winding.
+    if (std::getenv("MVB_SOLID_DUMP")) {
+        for (size_t i = 0; i < path.prims.size(); ++i) {
+            auto [pa, pb] = primEndpoints(path.prims[i]);
+            static const char* kn[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
+            std::fprintf(stderr, "[prim] %s %3zu %-6s a=(%8.3f,%8.3f,%8.3f) b=(%8.3f,%8.3f,%8.3f) '%s'\n",
+                         path.name.c_str(), i, kn[path.prims[i].kind],
+                         pa.X()*1e3, pa.Y()*1e3, pa.Z()*1e3, pb.X()*1e3, pb.Y()*1e3, pb.Z()*1e3,
+                         path.prims[i].label.c_str());
+        }
+    }
     if (path.femReady && !path.isRectangular) {
         std::vector<const Primitive*> cptrs;
         cptrs.reserve(path.prims.size());
         for (const auto& pr : path.prims) cptrs.push_back(&pr);
-        return pruneDegenerateSolids(
-            emitToroidConformal(cptrs, path.wireRadius, wirePolygonSegments));
+        // NO prune: the conformal assembler runs no booleans, so it cannot make slivers --
+        // every solid is a swept primitive, and it throws rather than dropping any.
+        return emitToroidConformal(cptrs, path.wireRadius, wirePolygonSegments);
     }
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
@@ -3607,7 +3635,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                                  vol(e2.Current())*1e9, x0*1e3,x1*1e3, y0*1e3,y1*1e3, z0*1e3,z1*1e3);
                 }
             }
-            return pruneDegenerateSolids(welded);
+            return pruneDegenerateSolids(welded, path.wireRadius);
         }
         if (diagR) std::cerr << "[rect-wire] per-run compound failed -- falling back to the "
                                 "whole-spine single body\n";
@@ -3723,7 +3751,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // assembly for the dense toroids where the single-solid sweep can't close. Drawing (femReady
     // false) skips it and keeps the fast overlapping per-run compound below.
     if (path.toroidal && path.femReady) {
-        return pruneDegenerateSolids(emitToroidConformal(ptrs, path.wireRadius, wirePolygonSegments));
+        return emitToroidConformal(ptrs, path.wireRadius, wirePolygonSegments);
     }
 
     BRep_Builder builder;
@@ -3837,7 +3865,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         result = multiTurn ? weldSolidsPairwise(compound, 1e-7)
                            : fuseAllSolids(compound, path.wireRadius);
     }
-    result = pruneDegenerateSolids(result);
+    result = pruneDegenerateSolids(result, path.wireRadius);
 
     // MVB_COVERAGE_CHECK: is the conductor FULLY CONDUCTING? Walk every primitive's centreline
     // and classify each sample against the emitted solids. A sample that lies in no solid is a
@@ -5295,6 +5323,26 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // winding order. A rect/oblong column maps onto itself only under 180 deg, so exactly
     // these two faces exist; round columns keep the single fan plane (aimed at the core
     // opening) and ignore this.
+    // ONE TIP PLANE FOR THE WHOLE WINDOW (Alf, 2026-08-08: "can we also make that all the
+    // connections reach the same -z or +z? ... until the max(pri, sec)"). Each conductor used
+    // to derive its own tip from its own outermost turn and its own wire, so a winding wound
+    // further in stopped short of one wound further out and the terminals ended on different
+    // planes. The reach is now the MAXIMUM over every conductor of the same expression, so all
+    // terminals finish flush -- which is also what a port-face BC wants.
+    double commonTipBase = 0.0;      // max over conductors of (outermost turn + 4 wire ODs)
+    double commonTipWireRadius = 0.0;  // the thickest wire, for the bobbin clearance term
+    for (const auto& ct : conductors) {
+        if (ct.turns.empty()) continue;
+        const MAS::Wire& w = wireMap.at(ct.winding);
+        auto [ew, eh] = TurnBuilder::wireDimensions(w, *ct.turns.front(), opts.paintCoating);
+        const bool rectW = w.get_type() == MAS::WireType::RECTANGULAR ||
+                           w.get_type() == MAS::WireType::PLANAR;
+        const double rw = rectW ? 0.5 * std::hypot(ew, eh) : 0.5 * std::min(ew, eh);
+        double maxR = 0.0;
+        for (const MAS::Turn* t : ct.turns) maxR = std::max(maxR, station(t).x);
+        commonTipBase = std::max(commonTipBase, maxR + 4.0 * (2.0 * rw));
+        commonTipWireRadius = std::max(commonTipWireRadius, rw);
+    }
     std::map<std::string, int> windingFace;
     for (const auto& w : coil.get_functional_description())
         windingFace[w.get_name()] =
@@ -6578,9 +6626,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (ww.get_coordinates() && ww.get_width())
                 bobbinOuterX = std::max(bobbinOuterX,
                                         (*ww.get_coordinates())[0] + *ww.get_width() / 2.0);
+        // commonTipBase / commonTipWireRadius are window-global (see above), and fanMaxRaise
+        // and maxRide are too, so every conductor lands on the SAME plane.
         const double leadTipRadius =
-            std::max(maxTurnRadius + 4.0 * (2.0 * wireRadius) + fanMaxRaise + maxRide,
-                     bobbinOuterX + 2.0 * wireRadius);
+            std::max(commonTipBase + fanMaxRaise + maxRide,
+                     bobbinOuterX + 2.0 * commonTipWireRadius);
 
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
                                  size_t ordinal, bool stationAtFront, double liftRaise = 0.0,
