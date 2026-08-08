@@ -1588,6 +1588,16 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
 bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius);   // defined below
 
 TopoDS_Shape emitRectColumn(const ConductorPath& path) {
+    if (std::getenv("MVB_SOLID_DUMP")) {
+        for (size_t i = 0; i < path.prims.size(); ++i) {
+            auto [pa, pb] = primEndpoints(path.prims[i]);
+            static const char* kn[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
+            std::fprintf(stderr, "[prim] %s %2zu %-6s a=(%8.3f,%8.3f,%8.3f) b=(%8.3f,%8.3f,%8.3f) '%s'\n",
+                         path.name.c_str(), i, kn[path.prims[i].kind],
+                         pa.X()*1e3, pa.Y()*1e3, pa.Z()*1e3, pb.X()*1e3, pb.Y()*1e3, pb.Z()*1e3,
+                         path.prims[i].label.c_str());
+        }
+    }
     if (std::getenv("MVB_DIAG"))
         std::cerr << "[emitRectColumn] ENTER '" << path.name << "' prims=" << path.prims.size()
                   << " femReady=" << path.femReady << " roundProfile=" << path.roundProfile << "\n";
@@ -6557,8 +6567,20 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (int side2 = 0; side2 < 2; ++side2)
                 for (const auto& [lvlZ, diam] : rectRideLevels[side2])
                     maxRide += diam;   // conservative: all reservation levels stacked
+        // The terminals must EMERGE FROM THE COMPONENT: the tip plane always clears the
+        // BOBBIN's own extent (Alf, 2026-08-08), never just the winding's. The bobbin's
+        // flange reaches columnWidth + windowWidth radially (BobbinBuilder), and the 2D
+        // radial coordinate maps to 3D depth with the same zoff the leads use, so the
+        // comparison is exact in this frame. Clearing it by one wire OD puts the tip face
+        // outside the flange rather than flush with it.
+        double bobbinOuterX = 0.0;
+        for (const auto& ww : bobbinPd.get_winding_windows())
+            if (ww.get_coordinates() && ww.get_width())
+                bobbinOuterX = std::max(bobbinOuterX,
+                                        (*ww.get_coordinates())[0] + *ww.get_width() / 2.0);
         const double leadTipRadius =
-            maxTurnRadius + 4.0 * (2.0 * wireRadius) + fanMaxRaise + maxRide;
+            std::max(maxTurnRadius + 4.0 * (2.0 * wireRadius) + fanMaxRaise + maxRide,
+                     bobbinOuterX + 2.0 * wireRadius);
 
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
                                  size_t ordinal, bool stationAtFront, double liftRaise = 0.0,
@@ -6631,6 +6653,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                        /*isLead=*/true, /*isConnection=*/false);
             }
             else {
+                if (std::getenv("MVB_DIAG"))
+                    std::cerr << "[lead-wp]   " << what << " rect branch: leadPts="
+                              << leadPts.size() << " prims before=" << path.prims.size() << "\n";
                 for (size_t i = 0; i + 1 < leadPts.size(); ++i) {
                     if (leadPts[i].Distance(leadPts[i + 1]) < 1e-12) continue;
                     Primitive pr;
@@ -6826,8 +6851,35 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 path.prims.push_back(std::move(arc));
             }
         };
+            // RECT-WIRE LEAD CORNER (Alf, 18_stacked: "the connections are not
+            // properly connected to the end of turn"): the ribbon cannot butt the
+            // terminal run at 90 degrees -- the face straight ends a corner radius
+            // short (see the appendRectWrap call) and this in-plane quarter wedge
+            // turns it into the lead, conformal to both end planes.
+            auto rectLeadCornerPrim = [&](const RectStation& rsA, double rideA,
+                                          double rowY, bool isExit, size_t ord) {
+                const double cR = rsA.cornerR;
+                const double zA = rsA.zPos + rideA;
+                Primitive cnr;
+                cnr.kind = Primitive::ARC3;
+                cnr.arc.axis = gp_XYZ(0, -1, 0);
+                cnr.arc.sweep = kPi / 2.0;
+                if (isExit) {
+                    cnr.arc.c = gp_Pnt(cR, rowY, -(zA + cR));
+                    cnr.arc.v0 = gp_XYZ(0, 0, cR);
+                } else {
+                    cnr.arc.c = gp_Pnt(-cR, rowY, -(zA + cR));
+                    cnr.arc.v0 = gp_XYZ(cR, 0, 0);
+                }
+                cnr.label = path.name + (isExit ? " exit" : " entrance") + " lead corner";
+                cnr.turnOrdinal = ord;
+                cnr.isLead = true;
+                path.prims.push_back(std::move(cnr));
+            };
         {
             std::vector<PlanePt> wp;
+            std::optional<RectStation> entranceCorner;
+            double entranceCornerRide = 0.0;
             if (effectivelyRound && rectWire) {
                 // The tangent corner replaces the straight radial attach; it is only
                 // defined for MKF routes WITHOUT a vertical connection. If MKF draws an
@@ -6856,38 +6908,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         rectStation(first, halfW, halfD, minBend, path.name);
                     const double rideF = rectRideFor(rsF.zPos, windingFace.at(ct.winding));
                     fLead.x += rideF;
-                // RECT-WIRE LEAD CORNER (Alf, 18_stacked: "the connections are not
-                // properly connected to the end of turn"): the ribbon cannot butt the
-                // terminal run at 90 degrees -- the face straight ends a corner radius
-                // short (see the appendRectWrap call) and this in-plane quarter wedge
-                // turns it into the lead, conformal to both end planes.
-                auto rectLeadCornerPrim = [&](const RectStation& rsA, double rideA,
-                                              double rowY, bool isExit, size_t ord) {
-                    const double cR = rsA.cornerR;
-                    const double zA = rsA.zPos + rideA;
-                    Primitive cnr;
-                    cnr.kind = Primitive::ARC3;
-                    cnr.arc.axis = gp_XYZ(0, -1, 0);
-                    cnr.arc.sweep = kPi / 2.0;
-                    if (isExit) {
-                        cnr.arc.c = gp_Pnt(cR, rowY, -(zA + cR));
-                        cnr.arc.v0 = gp_XYZ(0, 0, cR);
-                    } else {
-                        cnr.arc.c = gp_Pnt(-cR, rowY, -(zA + cR));
-                        cnr.arc.v0 = gp_XYZ(cR, 0, 0);
-                    }
-                    cnr.label = path.name + (isExit ? " exit" : " entrance") + " lead corner";
-                    cnr.turnOrdinal = ord;
-                    cnr.isLead = true;
-                    path.prims.push_back(std::move(cnr));
-                };
                     // Corner only when the first transition is a rising turn that was
                     // actually shortened for it (mirrors the appendRectWrap call).
                     bool ret0 = false;
                     for (const auto& r : rectReturns)
                         if (r.ci == ci && r.trans == 0) ret0 = true;
                     if (rectWire && turns.size() > 1 && !ret0) {
-                        rectLeadCornerPrim(rsF, rideF, first.y, /*isExit=*/false, 0);
+                        // DEFERRED, not emitted here: the entrance runs border -> corner ->
+                        // wrap, so the corner must FOLLOW the lead segment in path order.
+                        // Pushed first, the pair [corner, seg] reads as a closed excursion --
+                        // the segment ends exactly where the corner starts -- and
+                        // dropRedundantExcursions deleted BOTH, taking the whole input
+                        // connection with it (Alf, 2026-08-08: "18 is missing the input
+                        // connection"). The exit is naturally ordered wrap -> corner -> seg,
+                        // which is why it was never affected.
+                        entranceCorner = rsF;
+                        entranceCornerRide = rideF;
                         fLead.x += rsF.cornerR;
                     }
                 }
@@ -6901,6 +6937,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 pushPlaneSegs(wp, "entrance lead", 0, /*stationAtFront=*/false, entrRaise,
                               azEntrance);
             }
+            if (entranceCorner)
+                rectLeadCornerPrim(*entranceCorner, entranceCornerRide, first.y,
+                                   /*isExit=*/false, 0);
         }
         const bool dragDiag = std::getenv("MVB_DRAG_DIAG") != nullptr;
         for (size_t i = 0; i + 1 < nEmit; ++i) {
@@ -7002,31 +7041,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         rectStation(last, halfW, halfD, minBend, path.name);
                     const double rideL = rectRideFor(rsL.zPos, windingFace.at(ct.winding));
                     lLead.x += rideL;
-                // RECT-WIRE LEAD CORNER (Alf, 18_stacked: "the connections are not
-                // properly connected to the end of turn"): the ribbon cannot butt the
-                // terminal run at 90 degrees -- the face straight ends a corner radius
-                // short (see the appendRectWrap call) and this in-plane quarter wedge
-                // turns it into the lead, conformal to both end planes.
-                auto rectLeadCornerPrim = [&](const RectStation& rsA, double rideA,
-                                              double rowY, bool isExit, size_t ord) {
-                    const double cR = rsA.cornerR;
-                    const double zA = rsA.zPos + rideA;
-                    Primitive cnr;
-                    cnr.kind = Primitive::ARC3;
-                    cnr.arc.axis = gp_XYZ(0, -1, 0);
-                    cnr.arc.sweep = kPi / 2.0;
-                    if (isExit) {
-                        cnr.arc.c = gp_Pnt(cR, rowY, -(zA + cR));
-                        cnr.arc.v0 = gp_XYZ(0, 0, cR);
-                    } else {
-                        cnr.arc.c = gp_Pnt(-cR, rowY, -(zA + cR));
-                        cnr.arc.v0 = gp_XYZ(cR, 0, 0);
-                    }
-                    cnr.label = path.name + (isExit ? " exit" : " entrance") + " lead corner";
-                    cnr.turnOrdinal = ord;
-                    cnr.isLead = true;
-                    path.prims.push_back(std::move(cnr));
-                };
                     bool retLast = false;
                     for (const auto& r : rectReturns)
                         if (r.ci == ci && r.trans + 2 == nEmit) retLast = true;
