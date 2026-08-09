@@ -4688,7 +4688,12 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                     double stopAtX = std::numeric_limits<double>::quiet_NaN(),
                     // First transition feeding an entrance lead corner: the first straight
                     // BEGINS this far along its own direction (the corner occupies [0, startAtX]).
-                    double startAtX = std::numeric_limits<double>::quiet_NaN()) {
+                    double startAtX = std::numeric_limits<double>::quiet_NaN(),
+                    // ABT #615 stage 3: an INTER-SECTION return routes at MKF's drawn band row
+                    // (stub up beside the source's extreme turn, run outward at the band over the
+                    // band-blocked intervening sections, drop onto the receiving section's first
+                    // turn). NaN = adjacent-layer chain (the classic face-level dragback).
+                    double bandY = std::numeric_limits<double>::quiet_NaN()) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -4734,20 +4739,48 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         // full row apart and can never cross. The EXTENDED lateral length from any dragback
         // reservation joins this same distribution (Alf).
         const double q = 0.5 * kPi * s0.cornerR;
+        // STADIUM (ABT #614 unification): segX == 0 — the -Z end has no flat straight, so a
+        // descent slot cannot shorten one. Instead the FINAL cap quarter ends early, at the
+        // azimuth whose sine is the slot: the endpoint is exactly (xSlot, cap point), and the
+        // pitch distribution loses the corresponding ARC length. Stadium slots are laid on the
+        // +X side of the apex only (one-sided assignment at the pre-scan).
+        const bool stadium = s0.segX < 1e-12;
         // A rising turn that feeds a dragback ends AT the descent slot, so the pitch is
         // distributed over the path it actually travels (crossing-to-slot shortening).
-        const double endX = std::isnan(stopAtX) ? 0.0 : stopAtX;
+        const double endX = (std::isnan(stopAtX) || stadium) ? 0.0 : stopAtX;
         const double begX = std::isnan(startAtX) ? 0.0 : startAtX;
-        if (!std::isnan(stopAtX) && std::abs(stopAtX) > s0.segX)
+        double stadiumTheta = 0.0;
+        if (!std::isnan(stopAtX)) {
+            if (stadium) {
+                if (stopAtX < -1e-12)
+                    throw std::runtime_error(
+                        "ConductorBuilder: stadium descent slot " + std::to_string(stopAtX) +
+                        " m is negative — stadium slots are one-sided (+X of the cap apex) for " +
+                        label);
+                if (stopAtX > 0.7 * s0.cornerR)
+                    throw std::runtime_error(
+                        "ConductorBuilder: stadium descent slot " + std::to_string(stopAtX) +
+                        " m lies too far around the cap (radius " +
+                        std::to_string(s0.cornerR) + " m) for " + label);
+                stadiumTheta = std::asin(std::min(1.0, stopAtX / s0.cornerR));
+            }
+            else if (std::abs(stopAtX) > s0.segX) {
+                throw std::runtime_error(
+                    "ConductorBuilder: dragback x-slot " + std::to_string(stopAtX) +
+                    " m lies outside the -Z face straight of " + label);
+            }
+        }
+        if (stadium && begX > 1e-12)
             throw std::runtime_error(
-                "ConductorBuilder: dragback x-slot " + std::to_string(stopAtX) +
-                " m lies outside the -Z face straight of " + label);
-        if (begX < 0.0 || begX > s0.segX)
+                "ConductorBuilder: entrance corner offsets are not supported on stadium "
+                "columns for " + label);
+        if (begX < 0.0 || (!stadium && begX > s0.segX))
             throw std::runtime_error(
                 "ConductorBuilder: entrance corner offset " + std::to_string(begX) +
                 " m lies outside the -Z face straight of " + label);
+        const double endCut = stadium ? s0.cornerR * stadiumTheta : endX;
         const double L = 4.0 * s0.segX + 4.0 * s0.segZ + 2.0 * ride0 + 2.0 * rideBack0 +
-                         4.0 * q - endX - begX;
+                         4.0 * q - endCut - begX;
         if (L < 1e-12) {
             throw std::runtime_error(
                 "ConductorBuilder: rect turn of " + label +
@@ -4780,6 +4813,19 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         riseCorner(+s0.segX, +cP0, 3.0 * kPi / 2.0, "corner +X+Z");
         riseSeg(+s0.xPos, +cP0, +s0.xPos, -cZ0, 2.0 * s0.segZ + ride0 + rideBack0,
                 "face +X");
+        if (stadium && stadiumTheta > 0.0) {
+            // Shortened final quarter: end theta short of the apex, exactly at the slot.
+            Primitive pr;
+            pr.kind = Primitive::SPIRAL;
+            const double sweep = kPi / 2.0 - stadiumTheta;
+            pr.spiral = {+s0.segX, -cZ0, s0.cornerR, yAt(arc), 0.0,
+                         s0.cornerR, yAt(arc + s0.cornerR * sweep), sweep};
+            pr.label = label + std::string(" corner +X-Z (to slot)");
+            pr.turnOrdinal = ordinal;
+            path.prims.push_back(std::move(pr));
+            arc += s0.cornerR * sweep;
+            return;
+        }
         riseCorner(+s0.segX, -cZ0, 0.0, "corner +X-Z");
         riseSeg(+s0.segX, -zN0, endX, -zN0, s0.segX - endX, "face -Z in");
         return;
@@ -4800,28 +4846,67 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         // The chain STARTS at the slot: the preceding rising turn already ends there
         // (stopAtX) and corners into the step-out -- the old run from the face crossing
         // to the slot doubled back over the just-arrived straight (Alf, 17_cllc:
-        // "Secondary parallel 110 should not exist"). Only a chain with NO preceding
-        // wrap (a return as the conductor's first transition) keeps the crossing run.
+        // "Secondary parallel 110 should not exist"). A return with no preceding rising
+        // wrap gets a lone-turn RING first (caller), so every chain starts at its slot.
+        // STADIUM: the slot point sits ON the cap arc, a sagitta closer than the apex depth.
+        const bool stadiumChain = s0.segX < 1e-12;
+        const double slotSag = stadiumChain
+            ? (s0.cornerR - std::sqrt(std::max(0.0, s0.cornerR * s0.cornerR - xSlot * xSlot)))
+            : 0.0;
         std::vector<gp_Pnt> pts;
-        if (ordinal == 0) pts.push_back(gp_Pnt(0, y, -zN0));
-        pts.insert(pts.end(), {gp_Pnt(xSlot, y, -zN0),
-                                gp_Pnt(xSlot, y, -zDesc),
-                                gp_Pnt(xSlot, s1.y, -zDesc),
-                                gp_Pnt(xSlot, s1.y, -zDest),
-                                gp_Pnt(0, s1.y, -zDest)});
+        if (!std::isnan(bandY)) {
+            // BAND ROUTE (ABT #615 stage 3): MKF's stage-2 alternation puts the exit turn
+            // adjacent to the band and the receiving section's first turn just under it, so
+            // the stubs are stumps; the run crosses the intervening sections at the band row,
+            // where MKF blocked their turns one OD below — clearance is the model's own.
+            pts.insert(pts.end(), {gp_Pnt(xSlot, y, -(zN0 - slotSag)),
+                                    gp_Pnt(xSlot, bandY, -(zN0 - slotSag)),
+                                    gp_Pnt(xSlot, bandY, -zDest),
+                                    gp_Pnt(xSlot, s1.y, -zDest),
+                                    gp_Pnt(0, s1.y, -zDest)});
+        }
+        else {
+            pts.insert(pts.end(), {gp_Pnt(xSlot, y, -(zN0 - slotSag)),
+                                    gp_Pnt(xSlot, y, -zDesc),
+                                    gp_Pnt(xSlot, s1.y, -zDesc),
+                                    gp_Pnt(xSlot, s1.y, -zDest),
+                                    gp_Pnt(0, s1.y, -zDest)});
+        }
         appendFilletedPolyline(path.prims, pts, wireRadius, label + " (dragback)", ordinal,
                                /*isLead=*/false, /*isConnection=*/true);
     }
 }
 
-// OBLONG column (stadium): straights on the two flat +-X faces at x = +-radial, half caps
-// of radius = radial about the end centres (0, +-straightHalf) — the same decomposition
-// as build_concentric_oblong_turn. The -Z cap's second quarter is the transition: a
-// spiral about the cap centre from az 0 to the crossing apex at az pi/2 (the flat faces
-// stay on-station; the round end carries the move).
-void appendOblongWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
-                      double straightHalf, const std::string& label, size_t ordinal) {
-    auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
+// SINGLE-TURN-LAYER TANGENTIAL WRAP (Alf, 2026-08-09): a turn alone in its layer connects
+// to the next layer "as U turns, with a tangential connection, even if they are Z winding".
+// One full revolution whose radius AND pitch are distributed over the whole path: straights
+// become chords between the interpolated stations, cap/corner quarters become spirals with
+// r0 -> r1 (the Spiral primitive interpolates radius natively). Starts at s0's crossing
+// apex, ends exactly at s1's — continuous with the neighbouring wraps. No descent lane, no
+// ride level: the transition reserves nothing.
+void appendRectTangentialWrap(ConductorPath& path, const RectStation& s0,
+                              const RectStation& s1, const std::string& label,
+                              size_t ordinal, double ride0, double rideBack0) {
+    if (std::abs(s1.segX - s0.segX) > 1e-9 || std::abs(s1.segZ - s0.segZ) > 1e-9)
+        throw std::runtime_error(
+            "ConductorBuilder: tangential wrap of " + label +
+            " spans stations with differing corner insets (unsupported)");
+    const double segX = s0.segX, segZ = s0.segZ;
+    const double cZ0 = segZ + ride0;         // -Z corner centres' z (both stations)
+    const double cP0 = segZ + rideBack0;     // +Z corner centres' z
+    const double r0 = s0.cornerR, r1 = s1.cornerR;
+    const double dy = s1.y - s0.y;
+    // Nominal perimeter with AVERAGE-radius quarters: every arc mark below is a fraction of
+    // this, so the wrap ends exactly at (r1, y1) and junctions share their marks (continuous).
+    const double qAvg = 0.25 * kPi * (r0 + r1);
+    const double L = 4.0 * segX + 4.0 * segZ + 2.0 * ride0 + 2.0 * rideBack0 + 4.0 * qAvg;
+    if (L < 1e-12)
+        throw std::runtime_error("ConductorBuilder: tangential wrap of " + label +
+                                 " has no path length");
+    double arc = 0.0;
+    auto rAt = [&](double at) { return r0 + (r1 - r0) * at / L; };
+    auto yAt = [&](double at) { return s0.y + dy * at / L; };
+    auto pushSegT = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
         pr.kind = Primitive::SEG;
@@ -4830,40 +4915,45 @@ void appendOblongWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         pr.turnOrdinal = ordinal;
         path.prims.push_back(std::move(pr));
     };
-    auto pushCap = [&](double cz, double azStart, double sweep, const char* what) {
+    auto tanCorner = [&](double cxx, double czz, double azStart, const char* what) {
         Primitive pr;
-        pr.kind = Primitive::ARC3;
-        pr.arc.c = gp_Pnt(0, s.y, cz);
-        pr.arc.axis = gp_XYZ(0, 1, 0);
-        pr.arc.v0 = gp_XYZ(s.x * std::cos(azStart), 0, -s.x * std::sin(azStart));
-        pr.arc.sweep = sweep;
+        pr.kind = Primitive::SPIRAL;
+        pr.spiral = {cxx, czz, rAt(arc), yAt(arc), azStart,
+                     rAt(arc + qAvg), yAt(arc + qAvg), azStart + kPi / 2.0};
         pr.label = label + std::string(" ") + what;
         pr.turnOrdinal = ordinal;
         path.prims.push_back(std::move(pr));
+        arc += qAvg;
     };
-    const double sh = straightHalf;
-    pushCap(-sh, kPi / 2.0, kPi / 2.0, "cap -Z out");
-    pushSeg(gp_Pnt(-s.x, s.y, -sh), gp_Pnt(-s.x, s.y, +sh), "face -X");
-    pushCap(+sh, kPi, kPi, "cap +Z");
-    pushSeg(gp_Pnt(+s.x, s.y, +sh), gp_Pnt(+s.x, s.y, -sh), "face +X");
-    auto pushRamp = [&](double r0, double y0, double az0, double r1, double y1,
-                        double az1, const char* what) {
-        Primitive ramp;
-        ramp.kind = Primitive::SPIRAL;
-        ramp.spiral = {0, -sh, r0, y0, az0, r1, y1, az1, /*blend=*/true};
-        ramp.label = label + std::string(" ") + what;
-        ramp.turnOrdinal = ordinal;
-        path.prims.push_back(std::move(ramp));
-    };
-    if (std::abs(n.x - s.x) > 1e-12 && std::abs(n.y - s.y) > 1e-12) {
-        // Same two-phase rule as the rectangular ramp: radial move first (clearing the
-        // crossed layer), axial move at the new clearance second.
-        pushRamp(s.x, s.y, 0.0, n.x, s.y, kPi / 4.0, "cap -Z ramp (radial)");
-        pushRamp(n.x, s.y, kPi / 4.0, n.x, n.y, kPi / 2.0, "cap -Z ramp (axial)");
-    } else {
-        pushRamp(s.x, s.y, 0.0, n.x, n.y, kPi / 2.0, "cap -Z ramp");
+    // Face depths at an arc mark: zN = cZ0 + r (the -Z face), zP = cP0 + r, xPos = segX + r.
+    pushSegT(gp_Pnt(0, yAt(arc), -(cZ0 + rAt(arc))),
+             gp_Pnt(-segX, yAt(arc + segX), -(cZ0 + rAt(arc + segX))), "face -Z out (tan)");
+    arc += segX;
+    tanCorner(-segX, -cZ0, kPi / 2.0, "corner -X-Z (tan)");
+    {
+        const double len = 2.0 * segZ + ride0 + rideBack0;
+        pushSegT(gp_Pnt(-(segX + rAt(arc)), yAt(arc), -cZ0),
+                 gp_Pnt(-(segX + rAt(arc + len)), yAt(arc + len), +cP0), "face -X (tan)");
+        arc += len;
     }
+    tanCorner(-segX, +cP0, kPi, "corner -X+Z (tan)");
+    pushSegT(gp_Pnt(-segX, yAt(arc), +(cP0 + rAt(arc))),
+             gp_Pnt(+segX, yAt(arc + 2.0 * segX), +(cP0 + rAt(arc + 2.0 * segX))),
+             "face +Z (tan)");
+    arc += 2.0 * segX;
+    tanCorner(+segX, +cP0, 3.0 * kPi / 2.0, "corner +X+Z (tan)");
+    {
+        const double len = 2.0 * segZ + ride0 + rideBack0;
+        pushSegT(gp_Pnt(+(segX + rAt(arc)), yAt(arc), +cP0),
+                 gp_Pnt(+(segX + rAt(arc + len)), yAt(arc + len), -cZ0), "face +X (tan)");
+        arc += len;
+    }
+    tanCorner(+segX, -cZ0, 0.0, "corner +X-Z (tan)");
+    pushSegT(gp_Pnt(+segX, yAt(arc), -(cZ0 + rAt(arc))),
+             gp_Pnt(0, yAt(arc + segX), -(cZ0 + rAt(arc + segX))), "face -Z in (tan)");
+    arc += segX;
 }
+
 
 // ---------------------------------------------------------------------------------------
 // TOROIDAL wraps. Build frame: toroid hole axis along +Y, hole plane at y = 0 (the
@@ -5261,6 +5351,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     const bool effectivelyRound =
         columnShape == MAS::ColumnShape::ROUND ||
         (columnShape == MAS::ColumnShape::OBLONG && oblongHalf <= 0.0);
+    // ABT #614 (Alf: option 1, unify): a STADIUM (oblong with a real straight) IS the
+    // rectangular racetrack with the column's X extent absorbed into the corner radius —
+    // run it through the rect machinery with halfW = 0, halfD = the straight half-length.
+    // rectStation then gives clearance = the station radial, cornerR = the cap radius,
+    // segX = 0 (the cap quarters meet directly; zero-length face straights are skipped)
+    // and segZ = the straight — the exact stadium decomposition the old oblong wrap drew,
+    // but with the rect path's rising turns, dragback chains, descent lanes and ride-over
+    // levels instead of the laneless diagonal cap ramps that collided (#614) and skipped
+    // the intra-section Z dragbacks Alf flagged on 25_psps.
+    const bool stadiumColumn =
+        columnShape == MAS::ColumnShape::OBLONG && oblongHalf > 0.0;
+    const bool rectFamily =
+        !isToroidal &&
+        (columnShape == MAS::ColumnShape::RECTANGULAR || stadiumColumn);
+    const double rectHalfW = stadiumColumn ? 0.0 : halfW;
+    const double rectHalfD = stadiumColumn ? oblongHalf : halfD;
     // MKF's 2D window x maps to the connection plane at z = -(x + zoff): the crossing
     // sits one clearance past the column on the -Z side, which for rectangular/oblong
     // columns is columnDepth - columnWidth deeper than the radial position itself.
@@ -5447,15 +5553,23 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         double srcZ, dstZ, diam, xSlot;
         int side;   // which z-side of SPACE its winding's connection face is on
                     // (0 = -Z, 1 = +Z after the per-winding 180-degree seam rotation)
+        bool interSection = false;  // crosses ALIEN sections: routed at MKF's band (ABT #615
+                                    // stage 3), not as the face-level adjacent chain
     };
     std::vector<RectReturn> rectReturns;
+    // ABT #615/Alf 2026-08-09: a cross-layer transition whose SOURCE turn is ALONE in its
+    // layer (intra-section) is not a dragback at all — the wire simply keeps spiraling
+    // outward, U-style, "even if they are Z winding". Realized as a tangential wrap
+    // (radius and pitch distributed over the whole revolution); registers NO descent lane
+    // and NO ride level.
+    std::set<std::pair<size_t, size_t>> rectTangential;   // (conductor, transition)
     // (dstZ, diam) per DISTINCT level, PER SIDE OF SPACE: a return only reserves space on
     // the face it runs on. Every conductor's geometry then displaces on BOTH its z-sides --
     // its connection side by its own side's rides, its BACK side by the opposite side's
     // (the 180-degree-rotated windings interleave, and an undisplaced back face sat 77 um
     // from a displaced connection face on 02_flyback).
     std::vector<std::pair<double, double>> rectRideLevels[2];
-    if (!isToroidal && columnShape == MAS::ColumnShape::RECTANGULAR) {
+    if (rectFamily) {
         std::map<size_t, double> slotOf;   // conductor -> x slot
         double maxDiam = 0.0;
         for (size_t cv = 0; cv < conductors.size(); ++cv) {
@@ -5472,25 +5586,37 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (std::getenv("MVB_DIAG")) {
                 for (size_t i = 0; i < ct.turns.size(); ++i) {
                     const RectStation st =
-                        rectStation(station(ct.turns[i]), halfW, halfD, mb, ct.winding);
+                        rectStation(station(ct.turns[i]), rectHalfW, rectHalfD, mb, ct.winding);
                     std::cerr << "[rect] ci=" << cv << " turn " << i << " zPos=" << st.zPos
                               << " y=" << st.y << " segX=" << st.segX << " segZ=" << st.segZ
                               << "\n";
                 }
             }
+            std::map<std::string, int> turnsInLayer;
+            for (const MAS::Turn* t : ct.turns)
+                if (t->get_layer()) turnsInLayer[t->get_layer().value()]++;
             for (size_t i = 0; i + 1 < ct.turns.size(); ++i) {
                 const RectStation a =
-                    rectStation(station(ct.turns[i]), halfW, halfD, mb, ct.winding);
+                    rectStation(station(ct.turns[i]), rectHalfW, rectHalfD, mb, ct.winding);
                 const RectStation b =
-                    rectStation(station(ct.turns[i + 1]), halfW, halfD, mb, ct.winding);
+                    rectStation(station(ct.turns[i + 1]), rectHalfW, rectHalfD, mb, ct.winding);
                 // ANY depth change is a return -- including a pure layer climb with no axial
                 // move (its descent just has zero length). Requiring a y-move too let a
                 // dy=0 layer change fall into the rising-turn branch, which ignores depth
                 // (02_flyback's secondary: mismatched corners a wire OD apart).
                 if (std::abs(b.zPos - a.zPos) > 1e-12) {
+                    const bool interSection =
+                        ct.turns[i]->get_section() != ct.turns[i + 1]->get_section();
+                    const bool sourceAlone = ct.turns[i]->get_layer() &&
+                        turnsInLayer[ct.turns[i]->get_layer().value()] == 1;
+                    if (!interSection && sourceAlone) {
+                        // Single-turn layer: U-style tangential continuation (Alf), no lane.
+                        rectTangential.insert({cv, i});
+                        continue;
+                    }
                     if (!slotOf.count(cv)) slotOf[cv] = 0.0;   // slot assigned below
                     rectReturns.push_back({cv, i, a.zPos, b.zPos, diam, 0.0,
-                                           windingFace.at(ct.winding)});
+                                           windingFace.at(ct.winding), interSection});
                     maxDiam = std::max(maxDiam, diam);
                 }
             }
@@ -5499,9 +5625,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // apart (layout criterion: insulation touching).
         int k = 0;
         for (auto& [cv, slot] : slotOf) {
-            const int step = (k + 1) / 2;
-            slot = (k % 2 == 1 ? +1.0 : -1.0) * step * maxDiam;
-            if (k == 0) slot = 0.0;
+            if (stadiumColumn) {
+                // Stadium lanes fan on ONE side of the cap apex (the rising turn's shortened
+                // final quarter ends there; a negative slot would overrun the apex into the
+                // next wrap's territory).
+                slot = double(k) * maxDiam;
+            }
+            else {
+                const int step = (k + 1) / 2;
+                slot = (k % 2 == 1 ? +1.0 : -1.0) * step * maxDiam;
+                if (k == 0) slot = 0.0;
+            }
             ++k;
         }
         for (auto& r : rectReturns) r.xSlot = slotOf.at(r.ci);
@@ -6626,7 +6760,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // so the common tip plane must clear the displaced attach too, or the tip lands INSIDE
         // the attach (17_cllc: exit attach ridden to 24.9 mm vs a 24.2 mm tip plane).
         double maxRide = 0.0;
-        if (columnShape == MAS::ColumnShape::RECTANGULAR)
+        if (rectFamily)
             for (int side2 = 0; side2 < 2; ++side2)
                 for (const auto& [lvlZ, diam] : rectRideLevels[side2])
                     maxRide += diam;   // conservative: all reservation levels stacked
@@ -6968,9 +7102,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 PlanePt fLead = first;
                 // Rect columns: the crossing sits on the DISPLACED -Z face (dragback
                 // reservation), so the lead attaches there too.
-                if (columnShape == MAS::ColumnShape::RECTANGULAR) {
+                if (rectFamily) {
                     const RectStation rsF =
-                        rectStation(first, halfW, halfD, minBend, path.name);
+                        rectStation(first, rectHalfW, rectHalfD, minBend, path.name);
                     const double rideF = rectRideFor(rsF.zPos, windingFace.at(ct.winding));
                     fLead.x += rideF;
                     // Corner only when the first transition is a rising turn that was
@@ -7035,11 +7169,25 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // wrap in a flat cap at the station -- every such junction needs the lens.
                 appendRoundWrap(path, s, nxt, wireRadius, label, i, bumpsForTurn(s.x),
                                 crossAz[i], crossAz[i + 1], bumpsForTurn(nxt.x));
-            } else if (columnShape == MAS::ColumnShape::RECTANGULAR) {
+            } else if (rectFamily) {
                 {
-                    const RectStation rs0 = rectStation(s, halfW, halfD, minBend, path.name);
-                    const RectStation rs1 = rectStation(nxt, halfW, halfD, minBend, path.name);
+                    const RectStation rs0 = rectStation(s, rectHalfW, rectHalfD, minBend, path.name);
+                    const RectStation rs1 = rectStation(nxt, rectHalfW, rectHalfD, minBend, path.name);
                     const int side = windingFace.at(ct.winding);
+                    if (rectTangential.count({ci, i})) {
+                        // Single-turn layer -> U-style tangential continuation (Alf).
+                        const double r0a = rectRideFor(rs0.zPos, side);
+                        const double r0b = rectRideFor(rs1.zPos, side);
+                        const double rBa = rectRideFor(rs0.zPos, 1 - side);
+                        const double rBb = rectRideFor(rs1.zPos, 1 - side);
+                        if (std::abs(r0a - r0b) > 1e-12 || std::abs(rBa - rBb) > 1e-12)
+                            throw std::runtime_error(
+                                "ConductorBuilder: tangential wrap of " + label +
+                                " crosses a dragback ride level (unsupported)");
+                        appendRectTangentialWrap(path, rs0, rs1, label + " (tangential)", i,
+                                                 r0a, rBa);
+                        continue;
+                    }
                     const RectReturn* ret = nullptr;
                     const RectReturn* nextRet = nullptr;
                     for (const auto& r : rectReturns) {
@@ -7047,6 +7195,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         if (r.ci == ci && r.trans == i + 1) nextRet = &r;
                     }
                     double chainRide = 0.0, destRide = 0.0, xSlot = 0.0;
+                    double bandY = std::numeric_limits<double>::quiet_NaN();
                     if (ret) {
                         destRide = rectRideFor(rs1.zPos, side);
                         // The descent lies on the destination face displaced only by the
@@ -7059,6 +7208,35 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                 "ConductorBuilder: dragback level accounting negative for " +
                                 label);
                         }
+                        if (ret->interSection) {
+                            // ABT #615 stage 3: an inter-section return follows MKF's DRAWN
+                            // band run — the non-terminal horizontal marker of this conductor
+                            // whose radial span covers both stations. Its row height IS the
+                            // corridor the blocking cleared; anything else re-invents the route.
+                            const double loX = std::min(s.x, nxt.x) - 1e-9;
+                            const double hiX = std::max(s.x, nxt.x) + 1e-9;
+                            double bestExtent = std::numeric_limits<double>::max();
+                            for (const auto& sp : drawn) {
+                                if (sp.winding != ct.winding || sp.parallel != ct.parallel ||
+                                    sp.isTerminal || !sp.layer.empty())
+                                    continue;
+                                if (sp.dimensions.size() < 2 || sp.coordinates.size() < 2)
+                                    continue;
+                                if (sp.dimensions[0] < sp.dimensions[1]) continue;  // stub, not run
+                                const double x0 = sp.coordinates[0] - sp.dimensions[0] / 2.0;
+                                const double x1 = sp.coordinates[0] + sp.dimensions[0] / 2.0;
+                                if (x0 > loX || x1 < hiX) continue;
+                                if (sp.dimensions[0] < bestExtent) {
+                                    bestExtent = sp.dimensions[0];
+                                    bandY = sp.coordinates[1];
+                                }
+                            }
+                            if (std::isnan(bandY))
+                                throw std::runtime_error(
+                                    "ConductorBuilder: inter-section return " + label +
+                                    " has no drawn MKF band run covering its radial span "
+                                    "(MKF ABT #615 stage-1 marker missing)");
+                        }
                     }
                     // RECT-WIRE LEAD CORNERS (Alf, 18_stacked): the first/last face
                     // straight ends a corner radius short of the crossing; the in-plane
@@ -7068,13 +7246,54 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     const double stopX = nextRet ? nextRet->xSlot
                                        : (rw && i + 2 == nEmit && !ret ? rs1.cornerR : kNaN);
                     const double startX = (rw && i == 0 && !ret) ? rs0.cornerR : kNaN;
+                    if (ret) {
+                        // SINGLE-TURN LAYER (Alf, 26_psps: "layers 12 13 14 not drawn"): a
+                        // return draws the CHAIN only, on the assumption the preceding rising
+                        // wrap laid this turn's ring. When the preceding transition was ALSO a
+                        // return (a layer holding one turn) — or this return is the conductor's
+                        // first transition — no ring exists: lay it now as a zero-pitch rising
+                        // wrap at this station, ending at this return's own descent slot.
+                        bool prevRet = false;
+                        for (const auto& r : rectReturns)
+                            if (r.ci == ci && i > 0 && r.trans == i - 1) prevRet = true;
+                        if (i > 0 && rectTangential.count({ci, i - 1})) prevRet = true;
+                        if (i == 0 || prevRet) {
+                            appendRectWrap(path, rs0, rs0, label + " (lone-turn ring)", i,
+                                           wireRadius, rectRideFor(rs0.zPos, side),
+                                           rectRideFor(rs0.zPos, 1 - side), false,
+                                           0.0, 0.0, 0.0, /*stopAtX=*/xSlot, kNaN, kNaN);
+                        }
+                    }
                     appendRectWrap(path, rs0, rs1, label, i, wireRadius,
                                    rectRideFor(rs0.zPos, side),
                                    rectRideFor(rs0.zPos, 1 - side), ret != nullptr,
-                                   chainRide, destRide, xSlot, stopX, startX);
+                                   chainRide, destRide, xSlot, stopX, startX, bandY);
                 }
-            } else {   // OBLONG with a real straight section
-                appendOblongWrap(path, s, nxt, oblongHalf, label, i);
+            } else {
+                // Unreachable: effectivelyRound covers ROUND and degenerate oblong; rectFamily
+                // covers RECTANGULAR and the stadium (ABT #614 unification).
+                throw std::runtime_error(
+                    "ConductorBuilder: wrap loop reached an unhandled column shape for " +
+                    path.name);
+            }
+        }
+
+        // LAST-TURN RING: a last turn delivered by a dragback chain or a tangential wrap has
+        // no outgoing transition to lay its ring — draw it before the exit lead attaches.
+        if (rectFamily && nEmit > 1) {
+            bool lastDelivered = rectTangential.count({ci, nEmit - 2}) > 0;
+            for (const auto& r : rectReturns)
+                if (r.ci == ci && r.trans + 2 == nEmit) lastDelivered = true;
+            if (lastDelivered) {
+                const RectStation rsL =
+                    rectStation(station(turns[nEmit - 1]), rectHalfW, rectHalfD, minBend,
+                                path.name);
+                const int side = windingFace.at(ct.winding);
+                const double kNaNr = std::numeric_limits<double>::quiet_NaN();
+                appendRectWrap(path, rsL, rsL, "'" + turns[nEmit - 1]->get_name() +
+                                   "' (last-turn ring)", nEmit - 1, wireRadius,
+                               rectRideFor(rsL.zPos, side), rectRideFor(rsL.zPos, 1 - side),
+                               false, 0.0, 0.0, 0.0, kNaNr, kNaNr, kNaNr);
             }
         }
 
@@ -7101,9 +7320,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // the entrance).
                 PlanePt lLead = last;
                 // Displaced -Z crossing, exactly like the entrance.
-                if (columnShape == MAS::ColumnShape::RECTANGULAR) {
+                if (rectFamily) {
                     const RectStation rsL =
-                        rectStation(last, halfW, halfD, minBend, path.name);
+                        rectStation(last, rectHalfW, rectHalfD, minBend, path.name);
                     const double rideL = rectRideFor(rsL.zPos, windingFace.at(ct.winding));
                     lLead.x += rideL;
                     bool retLast = false;
@@ -7281,6 +7500,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // spread hiding it.
         rotatePathAboutY(path, seamAngle);
         path.seamRot = seamAngle;
+        if (std::getenv("MVB_LEAD_TIP_DIAG")) {
+            for (const auto& pr : path.prims) {
+                if (!pr.isLead || pr.kind != Primitive::SEG) continue;
+                std::cerr << "[lead-tip] " << path.name << " " << pr.label << " ("
+                          << pr.seg.a.X() * 1e3 << "," << pr.seg.a.Y() * 1e3 << ","
+                          << pr.seg.a.Z() * 1e3 << ")->(" << pr.seg.b.X() * 1e3
+                          << "," << pr.seg.b.Y() * 1e3 << ","
+                          << pr.seg.b.Z() * 1e3 << ") mm\n";
+            }
+        }
         paths.push_back(std::move(path));
     }
 
