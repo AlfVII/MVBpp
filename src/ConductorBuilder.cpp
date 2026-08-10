@@ -3349,7 +3349,17 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
                          path.prims[i].label.c_str());
         }
     }
-    if (path.femReady && !path.isRectangular) {
+    // ASSEMBLY STRATEGY IS NOT A FEM EXTRA (Alf, 2026-08-10). ConductorBuilder only ever runs
+    // for REAL winding, and for real winding the conformal mitre assembly is what makes the
+    // conductor VALID — the whole-spine sweep folds onto itself at junctions and the loose
+    // per-primitive compound leaves unclosed shells (measured with femReady=false: 03_buck and
+    // 16_coupled refused outright; 06/10/13/14/23 built with 1-6 invalid shapes). It costs
+    // essentially nothing next to the geometry itself (24_margin: 23.1 s femReady vs 22.1 s
+    // without), so it now runs for drawing too. femReady keeps only the FEM-specific extras.
+    // (Toroids excluded when drawing — see the toroid note further down: their cheap per-run
+    // compound is already valid, and the conformal assembler cannot close their tight-bore
+    // poloidal corner at exact surfaces, ABT #619.)
+    if (!path.isRectangular && (!path.toroidal || path.femReady)) {
         std::vector<const Primitive*> cptrs;
         cptrs.reserve(path.prims.size());
         for (const auto& pr : path.prims) cptrs.push_back(&pr);
@@ -3439,7 +3449,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // (their fuse is clean; no junction wedge exists).
     const bool multiTurnPath = !path.prims.empty() &&
                                path.prims.back().turnOrdinal != path.prims.front().turnOrdinal;
-    const bool roundFemCompound = path.femReady && !path.isRectangular && !path.toroidal &&
+    const bool roundFemCompound = !path.isRectangular && !path.toroidal &&
                                   multiTurnPath && std::getenv("MVB_SINGLE_BODY") == nullptr;
     // FEM ROUND-WIRE windings (EVERY column type, toroids included): the CONFORMAL
     // MITRE ASSEMBLY -- each primitive its own exact analytic solid, tangent junctions
@@ -3457,7 +3467,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // side face whose boundary tetgen cannot recover -- edge 1/61 on curve 513). Per-run
     // sweeps end AT the crossings, the wrap overshoot supplies the weld lens, and the leads
     // are exact mitred prisms.
-    const bool rectWireCompound = path.femReady && path.isRectangular && !path.toroidal &&
+    const bool rectWireCompound = path.isRectangular && !path.toroidal &&
                                   path.singleBodyCapable && multiTurnPath &&
                                   std::getenv("MVB_SINGLE_BODY") == nullptr;
     if (rectWireCompound) {
@@ -3750,6 +3760,12 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // FEM: a conformal (mitre-jointed) toroid compound -- a valid, non-overlapping, mesh-shareable
     // assembly for the dense toroids where the single-solid sweep can't close. Drawing (femReady
     // false) skips it and keeps the fast overlapping per-run compound below.
+    // TOROIDS ARE THE EXCEPTION to the "assembly is not an FEM extra" rule above. The
+    // conformal mitre exists to give the MESHER non-overlapping shared faces; a VIEWER only
+    // needs valid closed solids, and the cheap per-run compound below already delivers those
+    // for toroids (verified: 07_cmc and 12_boost, zero bad shapes). Forcing the conformal
+    // assembler on them for drawing buys nothing and walks straight into ABT #619, where it
+    // cannot build a valid solid for the tight-bore poloidal corner at exact surfaces.
     if (path.toroidal && path.femReady) {
         return emitToroidConformal(ptrs, path.wireRadius, wirePolygonSegments);
     }
@@ -7196,7 +7212,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                     bumpsForTurn(s.x), bumpsForTurn(nxt.x));
                     continue;
                 }
-                const bool weldable = path.femReady && turns.size() > 1 &&
+                const bool weldable = turns.size() > 1 &&
                                       (!rectWire || std::getenv("MVB_RECT_OVERSHOOT"));
                 // A wrap overshoots wherever the chain BREAKS at its end: terminal leads
                 // (first/last transition), serpentine U-links, and Z end-runs all butt the
