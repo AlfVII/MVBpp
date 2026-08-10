@@ -3957,7 +3957,23 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
     // route is straight at the turn's row and any edgeY-station.y offset is layout
     // noise (03_buck: a sub-micron offset built a degenerate 3-point route; 06_llc:
     // a 0.13 mm one collapsed into a diagonal run). Threshold = MKF's own drawn box.
-    if (std::abs(edgeY - station.y) <= 0.5 * run->dimensions.at(1)) {
+    const double rowOffset = std::abs(edgeY - station.y);
+    if (rowOffset <= 0.5 * run->dimensions.at(1)) {
+        // Sub-half-wire offset: no drawn stub exists (the pink box only marks the joint),
+        // but the RUN ROW itself is still MKF's reservation and can be load-bearing —
+        // 13_current_sense drew its run 24.6 um BELOW the attach turn to clear the outer
+        // layers' bottom row by 12 um bare, and flattening the route to the attach row
+        // (the old behaviour) ate exactly that margin: the 3D lead then grazed the
+        // over-dragback ride 2.2 um inside the gate's limit (ABT #618). Honour the drawn
+        // row: take the offset up in a short SLOPED attach segment confined to one wire
+        // diameter of radial travel — inside the attach turn's own slot, where it can
+        // touch nothing — then run flat at MKF's row. No sub-radius jog (the old OCCT
+        // corner crash), no full-length diagonal (06_llc's cross-row regression).
+        if (rowOffset > 1e-7 && borderX > station.x + run->dimensions.at(1)) {
+            return {{station.x, station.y},
+                    {station.x + run->dimensions.at(1), edgeY},
+                    {borderX, edgeY}};
+        }
         return {{station.x, station.y}, {borderX, station.y}};
     }
     return {{station.x, station.y}, {station.x, edgeY}, {borderX, edgeY}};
@@ -6040,26 +6056,26 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             };
             bool have = false;
             double best = 0.0;
-            // Same-winding parallels' leads go TOGETHER (Alf, 11_pushpull: Secondary 1
-            // parallel 0 next to parallel 1, not among the other windings): once one
-            // member of a (winding, side) group is placed, its siblings pack NEXT TO
-            // that anchor -- the proximity metric becomes distance to the anchor
-            // instead of distance to the plane.
+            // ALL of a winding's leads go TOGETHER — parallels AND both terminals.
+            // Alf, 2026-08-07 (14_dab): "they must have the same x coord" — every parallel
+            // of a winding leaves on the SAME azimuth. Alf, 2026-08-10 (13_current_sense):
+            // the INPUT and OUTPUT terminal are the same pair — "always input and output
+            // terminal must be on the same angle/x coord" (stacked in their rows); 13's
+            // Secondary had its entrance at -35 deg and its exit at -3 deg, and the exit-side
+            // over-dragback wrap then swept through the entrance lead's corridor (#618).
+            // The group key is therefore the WINDING alone, not (winding, side).
             double anchor = 0.0;
             bool anchored = false;
             if (verts[k].kind == 0)
                 for (size_t j = 0; j < k && !anchored; ++j)
-                    if (verts[j].kind == 0 && verts[j].wname == verts[k].wname &&
-                        verts[j].entrance == verts[k].entrance) {
+                    if (verts[j].kind == 0 && verts[j].wname == verts[k].wname) {
                         anchor = az[j];
                         anchored = true;
                     }
-            // Alf, 2026-08-07 (14_dab): "they must have the same x coord" -- every parallel of
-            // a winding leaves on the SAME azimuth, so the connections are aligned and every
-            // strand keeps the same length. The anchor is therefore BINDING, not a preference:
-            // once one member of a (winding, side) group is placed the rest take that exact
-            // slot. If that is infeasible the collision gate says so -- the leads are never
-            // silently fanned apart (Primary parallel 2 sat 2.6 deg off its siblings' plane).
+            // The anchor is BINDING, not a preference: once one member of a winding's lead
+            // group is placed the rest take that exact slot. If that is infeasible the
+            // collision gate says so -- the leads are never silently fanned apart
+            // (Primary parallel 2 sat 2.6 deg off its siblings' plane).
             if (anchored) {
                 az[k] = anchor;
                 continue;
@@ -7131,8 +7147,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (!wp.empty()) {
                 extendBorder(wp);
                 std::reverse(wp.begin(), wp.end());
+                // ABT #618: the lead's ray crosses EVERY ring band from its attach out to
+                // the border, and any wrap it flies over is itself lifted by the bump columns
+                // beneath it — including dragbacks laid OUTSIDE the attach radius, which
+                // bumpsForTurn(attach) excludes. 13_current_sense: the entrance (attached on
+                // the innermost layer) grazed the outer layer's over-dragback ride by 2.2 um.
+                // The lift must clear the tallest column along the whole path.
                 const double entrRaise =
-                    tallestBumpColumn(bumpsForTurn(station(turns.front()).x)).first;
+                    tallestBumpColumn(bumpsForTurn(1e30)).first;
                 pushPlaneSegs(wp, "entrance lead", 0, /*stationAtFront=*/false, entrRaise,
                               azEntrance);
             }
@@ -7346,8 +7368,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // beneath it, so it is z-lifted by the fan's tallest column -- computed by
                 // the SAME helper on the SAME bump list as the last wrap's end raise, so the
                 // two meet at one identical point.
+                // Same rule as the entrance (ABT #618): the whole path's bumps, not the
+                // attach column's.
                 const double exitRaise =
-                    tallestBumpColumn(bumpsForTurn(station(turns[nEmit - 1]).x)).first;
+                    tallestBumpColumn(bumpsForTurn(1e30)).first;
                 pushPlaneSegs(wp, "exit lead", nEmit - 1, /*stationAtFront=*/true, exitRaise,
                               azExit);
             }
