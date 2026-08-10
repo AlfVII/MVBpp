@@ -4015,9 +4015,21 @@ splitTerminalGroups(const std::vector<const RSpace*>& terminalRects, const std::
         if (!groups.empty() && groups.back().empty()) groups.pop_back();
     }
     if (groups.size() == 1) {
+        // MVB++ FOLLOWS MKF'S GEOMETRY, ALWAYS (Alf, 2026-08-10). Synthesizing the missing
+        // exit is builder-invented routing: it is not MKF's data, nothing verifies it against
+        // MKF's blocking, and it silently produced a lead nobody planned. The gap is MKF's to
+        // close (ABT #577), so refuse loudly instead of inventing — MVB_SYNTHESIZE_MISSING_LEAD=1
+        // restores the old behaviour for diagnosis only.
+        if (!std::getenv("MVB_SYNTHESIZE_MISSING_LEAD")) {
+            throw std::runtime_error(
+                "ConductorBuilder: MKF drew only ONE terminal lead for " + who +
+                " — the exit route is missing from its connection reserved spaces. MVB++ builds "
+                "MKF's drawn geometry and never invents a route; fix the MKF data (see ABT #577). "
+                "Set MVB_SYNTHESIZE_MISSING_LEAD=1 to build a straight-out exit for diagnosis.");
+        }
         std::cerr << "[ConductorBuilder] " << who << ": MKF drew only ONE terminal lead; "
-                     "using it as the entrance and synthesizing a straight-out exit at the "
-                     "last turn's level\n";
+                     "SYNTHESIZING a straight-out exit at the last turn's level — this route is "
+                     "INVENTED, not MKF's (MVB_SYNTHESIZE_MISSING_LEAD=1)\n";
         return {groups[0], {}};
     }
     if (groups.size() != 2) {
