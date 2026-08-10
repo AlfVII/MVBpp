@@ -3,6 +3,11 @@
  *
  * Run with:  node bindings/wasm/tests/test_mvbpp.js
  * Requires:  bindings/wasm/dist/mvbpp.js  (built via `npm run build`)
+ *
+ * ABT #631: dist/ is the SHIPPED module, not necessarily the one you just built —
+ * a green run here says nothing about build-wasm/ until it has been copied over.
+ * Point the suite at a fresh build before copying:
+ *     MVBPP_WASM_JS=build-wasm/mvbpp.js node tests/test_mvbpp.js
  */
 
 'use strict';
@@ -10,7 +15,9 @@
 const fs   = require('fs');
 const path = require('path');
 
-const DIST_JS   = path.resolve(__dirname, '../dist/mvbpp.js');
+const DIST_JS   = process.env.MVBPP_WASM_JS
+    ? path.resolve(process.env.MVBPP_WASM_JS)
+    : path.resolve(__dirname, '../dist/mvbpp.js');
 const TESTS_DIR = __dirname;
 
 // ── tiny test harness ─────────────────────────────────────────────────────────
@@ -96,10 +103,14 @@ async function main() {
                                         /*femReady=*/undefined);
     }
 
-    // Use concentric_rectangular_column_one_turn.json — concentric_basic.json
-    // triggers a MKF bug (CORE_SHAPE_NOT_FOUND: EI 101/50) in the WASM build.
-    const basicJson = loadMagneticJson('concentric_rectangular_column_one_turn.json');
-    const etdJson   = loadMagneticJson('ETD49_N87_10uH_5T.json');
+    // concentric_basic.json is the BY-NAME fixture (bobbin "basic", shape "E 19/8/5"),
+    // the shape of design the frontend actually sends. It used to die in the WASM build
+    // with CORE_SHAPE_NOT_FOUND: EI 101/50 (ABT #631) and was swapped out for the
+    // fully-inline fixture, which hid the whole by-name path from these tests. Keep BOTH:
+    // the by-name one is the regression guard.
+    const basicJson    = loadMagneticJson('concentric_rectangular_column_one_turn.json');
+    const byNameJson   = loadMagneticJson('concentric_basic.json');
+    const etdJson      = loadMagneticJson('ETD49_N87_10uH_5T.json');
 
     // ── drawMagnetic ─────────────────────────────────────────────────────────
 
@@ -127,6 +138,15 @@ async function main() {
             text.includes('CLOSED_SHELL') || text.includes('ADVANCED_BREP'),
             'No solid geometry markers found in STEP output'
         );
+    });
+
+    // ABT #631: a design whose bobbin AND core shape are given BY NAME must build.
+    // This is what the frontend sends, and what the whole browser build died on.
+    test('drawMagnetic builds a by-name design (bobbin "basic", shape by name) — ABT #631', () => {
+        const result = mvbpp.drawMagnetic(byNameJson, ...NO_SIDE);
+        assert(result instanceof Uint8Array, 'Expected Uint8Array');
+        assert(result.length > 1000, `Too small: ${result.length} bytes`);
+        assert(isStepBytes(result), 'Does not start with ISO-10303-21');
     });
 
     test('ETD49 produces valid STEP', () => {
