@@ -54,6 +54,13 @@ public:
         // narrow slots); classifying the actual solids around the lead-tip radius finds the
         // genuine free arc. Empty -> no aiming beyond leadExitAzimuth.
         std::vector<TopoDS_Shape> coreObstacles;
+        // DIAGNOSTIC ONLY. Build the conductors even though two of them overlap, so the
+        // overlap can be LOOKED AT in CAD instead of only read about in an exception. A
+        // collision means two pieces of copper occupy the same space: the result is not a
+        // manufacturable part and must never be exported as one, meshed, or handed to a
+        // solver. Nothing in the library sets this — only the tools and tests that exist to
+        // investigate a specific refusal (see the [realwinding][diagnostic] tests).
+        bool diagnosticSkipCollisionCheck = false;
     };
 
     // REAL-PATH POLYLINES: the fully-assembled, collision-checked conductor centrelines

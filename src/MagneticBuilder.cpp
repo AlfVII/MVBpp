@@ -982,13 +982,15 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
     int wirePolygonSegments,
     bool paintCoating,
     bool emitCoatingShells,
-    bool femReady) const {
+    bool femReady,
+    bool diagnosticSkipCollisionCheck) const {
     auto bobbinPd = getBobbinProcessed(magnetic.get_coil());
     patchBobbinDimensions(bobbinPd, magnetic.get_core());
     const bool toroidalCore = isCoreToroidal(magnetic.get_core());
     ConductorBuilder::Options copts;
     copts.wirePolygonSegments = wirePolygonSegments;
     copts.femReady = femReady;   // OM drawing -> fast compound; FEM export -> one-piece/conformal
+    copts.diagnosticSkipCollisionCheck = diagnosticSkipCollisionCheck;
     // Hand the CORE solids to the conductor builder so it can aim the terminal leads at
     // the true window opening (classified from the real geometry -- column metadata
     // under-describes cores like PQ whose plates wrap most of the perimeter; measured on
@@ -1019,14 +1021,16 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingTurnsNamed(
     int wirePolygonSegments,
     int corePolygonSegments,
     bool paintCoating,
-    bool femReady) const {
+    bool femReady,
+    bool diagnosticSkipCollisionCheck) const {
     // The core is built but NOT returned: the conductor builder needs the real core solids
     // to aim the terminal leads at the true window opening. Skipping them here would make a
     // viewer's leads land somewhere else than the exported assembly's for the same design —
     // the kind of divergence nobody notices until a STEP and a screenshot disagree.
     auto coreShapes = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
     return buildRealWindingConductorsNamed(magnetic, coreShapes, wirePolygonSegments,
-                                           paintCoating, /*emitCoatingShells=*/false, femReady);
+                                           paintCoating, /*emitCoatingShells=*/false, femReady,
+                                           diagnosticSkipCollisionCheck);
 }
 
 std::vector<NamedShape> MagneticBuilder::buildTurnsNamedFromTurns(

@@ -190,12 +190,18 @@ public:
     // same precondition as buildAllNamed with the flag on. The core is built internally
     // (not returned) because the conductor builder aims the terminal leads at the real
     // window opening; see buildRealWindingConductorsNamed.
+    //
+    // diagnosticSkipCollisionCheck builds the conductors even when two of them overlap, so
+    // the overlap can be LOOKED AT instead of only read about in an exception. The result is
+    // interpenetrating copper: a picture, never a part. Tools and tests investigating a
+    // specific refusal only — nothing in the library sets it.
     std::vector<NamedShape> buildRealWindingTurnsNamed(
         const OpenMagnetics::Magnetic& magnetic,
         int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
         int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
         bool paintCoating = true,
-        bool femReady = false) const;
+        bool femReady = false,
+        bool diagnosticSkipCollisionCheck = false) const;
 
   private:
     // Single implementation of real-winding conductor emission, shared by buildAllNamed
@@ -208,7 +214,8 @@ public:
         int wirePolygonSegments,
         bool paintCoating,
         bool emitCoatingShells,
-        bool femReady) const;
+        bool femReady,
+        bool diagnosticSkipCollisionCheck = false) const;
 };
 
 } // namespace mvb

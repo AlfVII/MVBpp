@@ -6,6 +6,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Utils.h"
+#include "mvb/StepExporter.h"
 #include "constructive_models/Magnetic.h"
 #include "json.hpp"
 #include <BRepAlgoAPI_Common.hxx>
@@ -888,6 +889,71 @@ TEST_CASE("Real winding: pre-enriched input with the flag on throws", "[realwind
                               mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
                               /*useRealWindingGeometry=*/true),
         Catch::Matchers::ContainsSubstring("geometricalDescription"));
+}
+
+// ABT #646 — the entrance lead is routed straight through an inter-layer dragback.
+//
+// The fixture is a real user design (E 16/8/8, N87-class 95, one winding, 12 turns of
+// Synthesized Litz 31x0.100mm, 2 conduction layers). Idealised per-turn loops build fine;
+// real winding refuses, because the Primary entrance lead and the turn 5 -> 6 dragback are
+// not merely close but COINCIDENT — centreline distance 8.3e-19 m, i.e. exactly zero:
+//
+//   entrance lead seg 0   (0, -0.00467262, -0.018706)  -> (0, -0.00467262, -0.0135774)
+//   dragback     seg 1   (0,  0.00467262, -0.0144321) -> (0, -0.00467262, -0.0144321)
+//
+// Both lie in the plane x = 0; the lead runs along Z at a fixed y, the dragback runs along
+// Y at a fixed z, the dragback's END y equals the lead's y to every digit, and its z falls
+// inside the lead's z span. So they cross. The same signature appears on an auto-advised
+// Flyback with a different core and a different wire, so this is a placement rule
+// colliding with itself, not a tolerance being missed.
+//
+// The refusal is CORRECT — turn positions come from MKF and are never moved to paper over
+// an overlap — so this test pins the refusal rather than expecting success. It flips to a
+// build once the upstream placement is fixed, and the assertion below is what will tell us.
+TEST_CASE("Real winding: entrance lead crosses an inter-layer dragback (ABT #646)",
+          "[realwinding][abt646]") {
+    auto magneticJson = loadFixture("realwinding_e16_litz_2layer_leadcollision.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+
+    // Idealised loops are unaffected: the defect is in the routed conductor, not the turns.
+    REQUIRE_NOTHROW(builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                          mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true));
+
+    REQUIRE_THROWS_WITH(
+        builder.buildAllNamed(enriched, true, 0, /*wireSeg=*/0,
+                              mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
+                              /*useRealWindingGeometry=*/true),
+        Catch::Matchers::ContainsSubstring("collision between") &&
+            Catch::Matchers::ContainsSubstring("entrance lead") &&
+            Catch::Matchers::ContainsSubstring("dragback"));
+}
+
+// The artifact for investigating the refusal above: the same conductors, built WITH the
+// collision gate deliberately open, exported so the overlap can be measured in CAD. The
+// result contains interpenetrating copper by construction — it is a diagnostic picture, not
+// a part, which is why it lives behind an explicit flag and its own tag.
+TEST_CASE("Real winding: export the ABT #646 collision for inspection",
+          "[realwinding][abt646][diagnostic]") {
+    auto magneticJson = loadFixture("realwinding_e16_litz_2layer_leadcollision.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto core = builder.buildCoreNamed(enriched.get_core(), mvb::DEFAULT_CORE_POLYGON_SEGMENTS);
+
+    auto conductors = builder.buildRealWindingTurnsNamed(
+        enriched, /*wirePolygonSegments=*/0, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+        /*paintCoating=*/false,   // bare copper: the overlap is a COPPER overlap
+        /*femReady=*/false,
+        /*diagnosticSkipCollisionCheck=*/true);
+    REQUIRE_FALSE(conductors.empty());
+
+    std::vector<mvb::NamedShape> all = core;
+    all.insert(all.end(), conductors.begin(), conductors.end());
+    const std::string path = "abt646_e16_litz_leadcollision.step";
+    REQUIRE(mvb::exportSTEP(all, path));
+    WARN("ABT #646 collision geometry written to " << path
+         << " — copper OVERLAPS in this file by construction; it is a diagnostic, not a part.");
 }
 
 TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre compound",

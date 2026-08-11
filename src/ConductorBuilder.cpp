@@ -7608,7 +7608,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                       << " retrace primitive(s) (out-and-back spurs)\n";
     }
 
-    checkCollisions(paths);
+    if (opts.diagnosticSkipCollisionCheck) {
+        // Loud on purpose: a build that skipped this gate produces overlapping copper and
+        // must not be mistaken for a valid part further downstream.
+        std::cerr << "[ConductorBuilder] DIAGNOSTIC: collision check SKIPPED — the geometry "
+                     "below may contain overlapping conductors and is not a valid part.\n";
+    }
+    else {
+        checkCollisions(paths);
+    }
 
     // Polyline capture mode: everything above ran (assembly, seam aiming, end-run planning,
     // the collision gate) but NO solid is built -- return the sampled centrelines instead.
