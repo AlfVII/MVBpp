@@ -89,7 +89,7 @@ bool resolvePaintCoating(const val& v) {
     return v.as<bool>();
 }
 
-// useRealWindingGeometry is an optional trailing argument (drawMagnetic only); omitted/undefined
+// useRealWindingGeometry is an optional trailing argument (drawMagnetic and drawTurns); omitted/undefined
 // keeps the legacy per-turn-loop geometry. Pass true for ONE continuous copper body per (winding,
 // parallel) via MKF real winding.
 bool resolveUseRealWinding(const val& v) {
@@ -97,7 +97,7 @@ bool resolveUseRealWinding(const val& v) {
     return v.as<bool>();
 }
 
-// femReady is an optional trailing argument (drawMagnetic only, with useRealWindingGeometry=true);
+// femReady is an optional trailing argument (drawMagnetic/drawTurns, with useRealWindingGeometry=true);
 // omitted/undefined keeps the FAST per-run compound (drawing). Pass true for the SLOW meshable
 // geometry: one-piece per parallel where a sweep closes, conformal mitre for dense toroids.
 bool resolveFemReady(const val& v) {
@@ -382,9 +382,27 @@ std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int polyg
 }
 
 std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments,
-                                         bool paintCoating) {
+                                         bool paintCoating, bool useRealWindingGeometry = false,
+                                         bool femReady = false) {
     auto j = json::parse(json_str);
     mvb::MagneticBuilder b;
+    if (useRealWindingGeometry) {
+        // Real winding needs MKF to (re-)wind, which needs the whole magnetic — a bare
+        // turnsDescription array carries no wire, bobbin or core to route against. Say so
+        // instead of silently falling back to the per-turn loops the caller asked NOT to get.
+        if (!j.is_object() || !(j.contains("coil") && j.contains("core"))) {
+            throw std::runtime_error(
+                "drawTurns: useRealWindingGeometry=true needs a full Magnetic JSON with "
+                "'coil' and 'core' (MKF must re-wind to route the real conductor); a bare "
+                "turnsDescription array cannot be used.");
+        }
+        auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
+        // The conductor cross-section stays an exact circle regardless of segments, so the
+        // wire segment count is moot (0); polygonSegments still facets the core built
+        // internally for lead aiming.
+        return b.buildRealWindingTurnsNamed(magnetic, /*wirePolygonSegments=*/0,
+                                            polygonSegments, paintCoating, femReady);
+    }
     if (j.is_array()) {
         // Standalone path: each Turn must carry its own dimensions and
         // cross_sectional_shape. Throws for toroidal turns (which need
@@ -652,8 +670,12 @@ val _drawTurns(const std::string& json_str,
                int polygonSegments,
                const std::string& symmetry,
                const std::string& side,
-               val paintCoating) {
-    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating));
+               val paintCoating,
+               val useRealWindingGeometry,
+               val femReady) {
+    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating),
+                             resolveUseRealWinding(useRealWindingGeometry),
+                             resolveFemReady(femReady));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     return makeUint8Array(data);
@@ -669,8 +691,12 @@ std::string _drawTurnsToPath(const std::string& json_str,
                              int polygonSegments,
                              const std::string& symmetry,
                              const std::string& side,
-                             val paintCoating) {
-    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating));
+                             val paintCoating,
+                             val useRealWindingGeometry,
+                             val femReady) {
+    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating),
+                             resolveUseRealWinding(useRealWindingGeometry),
+                             resolveFemReady(femReady));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     write_bytes(path, data);

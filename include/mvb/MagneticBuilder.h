@@ -179,6 +179,36 @@ public:
         const std::vector<MAS::Turn>& turns,
         int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
         bool paintCoating = true) const;
+
+    // Turns ONLY, in real-winding form: one continuous copper body per (winding, parallel),
+    // with the real leads, pitch and dragbacks. The turns-only counterpart of
+    // buildAllNamed(..., useRealWindingGeometry=true), for a consumer that draws core,
+    // bobbin and turns as SEPARATE meshes (the web 3D viewer, which colours and toggles
+    // them independently) and so cannot use the single-call assembly.
+    //
+    // The magnetic must already be enriched through MKF's real-winding autocomplete —
+    // same precondition as buildAllNamed with the flag on. The core is built internally
+    // (not returned) because the conductor builder aims the terminal leads at the real
+    // window opening; see buildRealWindingConductorsNamed.
+    std::vector<NamedShape> buildRealWindingTurnsNamed(
+        const OpenMagnetics::Magnetic& magnetic,
+        int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
+        int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
+        bool paintCoating = true,
+        bool femReady = false) const;
+
+  private:
+    // Single implementation of real-winding conductor emission, shared by buildAllNamed
+    // and buildRealWindingTurnsNamed so the assembly and the viewer cannot drift apart.
+    // coreShapes are handed to ConductorBuilder as lead-aiming obstacles (ignored for
+    // toroids); they are not part of the result.
+    std::vector<NamedShape> buildRealWindingConductorsNamed(
+        const OpenMagnetics::Magnetic& magnetic,
+        const std::vector<NamedShape>& coreShapes,
+        int wirePolygonSegments,
+        bool paintCoating,
+        bool emitCoatingShells,
+        bool femReady) const;
 };
 
 } // namespace mvb

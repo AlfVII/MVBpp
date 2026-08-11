@@ -85,19 +85,23 @@ async function main() {
     // below keep exercising that default. rawDraw* keep the unwrapped handles
     // for the explicit copper-vs-coating test.
     const rawDrawMagnetic = mvbpp.drawMagnetic.bind(mvbpp);
+    // Bind BEFORE the wrappers below, or "raw" would still carry the appended paintCoating.
+    const rawDrawTurns = mvbpp.drawTurns.bind(mvbpp);
     for (const fn of ['drawMagnetic', 'drawMagneticToPath',
                       'drawTurns', 'drawTurnsToPath',
                       'drawWinding', 'drawWindingToPath']) {
         const orig = mvbpp[fn].bind(mvbpp);
         mvbpp[fn] = (...a) => orig(...a, /*paintCoating=*/true);
     }
-    // drawMagnetic / drawMagneticToPath ALSO gained two trailing real-winding arguments
+    // drawMagnetic / drawTurns (+ *ToPath) ALSO take two trailing real-winding arguments
     // (useRealWindingGeometry, femReady). They are documented as optional, but embind enforces
     // exact arity, so they must be PASSED -- undefined selects the documented default (per-turn
-    // closed loops, fast drawing compound). Without this every drawMagnetic test fails with
+    // closed loops, fast drawing compound). Without this every such test fails with
     // "called with 10 arguments, expected 12", which looks like a broken binding rather than a
-    // stale test.
-    for (const fn of ['drawMagnetic', 'drawMagneticToPath']) {
+    // stale test. rawDrawTurns (bound above) keeps the unwrapped handle for the
+    // real-winding test.
+    for (const fn of ['drawMagnetic', 'drawMagneticToPath',
+                      'drawTurns', 'drawTurnsToPath']) {
         const orig = mvbpp[fn].bind(mvbpp);
         mvbpp[fn] = (...a) => orig(...a, /*useRealWindingGeometry=*/undefined,
                                         /*femReady=*/undefined);
@@ -314,6 +318,33 @@ async function main() {
         const turnsJson = JSON.stringify(j.coil.turnsDescription);
         const result = mvbpp.drawTurns(turnsJson, ...NO_SIDE);
         assert(isStepBytes(result), 'drawTurns STEP header invalid');
+    });
+
+    // drawTurns gained the real-winding form so a viewer that draws core, bobbin and
+    // turns as SEPARATE meshes can show the real copper — the single-call drawMagnetic
+    // assembly is not an option there, since each component needs its own colour and
+    // visibility toggle.
+    test('drawTurns builds real-winding conductors, and they differ from the loops', () => {
+        const ideal = rawDrawTurns(etdJson, ...NO_SIDE, true, false, false);
+        const real  = rawDrawTurns(etdJson, ...NO_SIDE, true, true,  false);
+        assert(isStepBytes(ideal), 'ideal drawTurns STEP header invalid');
+        assert(isStepBytes(real), 'real-winding drawTurns STEP header invalid');
+        assert(real.length > 1000, `real-winding turns too small: ${real.length}`);
+        // One continuous body per (winding, parallel) vs one closed loop per turn is a
+        // different topology; identical bytes would mean the flag did nothing.
+        assert(real.length !== ideal.length,
+               'real-winding turns are byte-identical to the idealised ones');
+    });
+
+    test('drawTurns real winding refuses a bare turns array instead of silently idealising', () => {
+        const enriched = mvbpp._enrichMagnetic(basicJson);
+        const turnsJson = JSON.stringify(JSON.parse(enriched).coil.turnsDescription);
+        let threw = null;
+        try { rawDrawTurns(turnsJson, ...NO_SIDE, true, true, false); }
+        catch (e) { threw = String(e.message || e); }
+        assert(threw !== null, 'expected a refusal for a bare turnsDescription array');
+        assert(/useRealWindingGeometry/.test(threw),
+               `error should name the flag, got: ${threw}`);
     });
 
     // ── drawWinding ──────────────────────────────────────────────────────────

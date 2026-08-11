@@ -841,32 +841,10 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     std::vector<std::string> turnNames;
     std::vector<TopoDS_Shape> turnShapes;
     if (useRealWindingGeometry) {
-        auto bobbinPd = getBobbinProcessed(magnetic.get_coil());
-        patchBobbinDimensions(bobbinPd, magnetic.get_core());
-        const bool toroidalCore = isCoreToroidal(magnetic.get_core());
-        ConductorBuilder::Options copts;
-        copts.wirePolygonSegments = wirePolygonSegments;
-        copts.femReady = femReady;   // OM drawing -> fast compound; FEM export -> one-piece/conformal
-        // Hand the CORE solids to the conductor builder so it can aim the terminal leads at
-        // the true window opening (classified from the real geometry -- column metadata
-        // under-describes cores like PQ whose plates wrap most of the perimeter; measured on
-        // 03_buck_pq3230, whose lead tip landed on an oblique plate face at both column-derived
-        // azimuths).
-        if (!toroidalCore)
-            for (const auto& ns : all) copts.coreObstacles.push_back(ns.shape);
-        auto emitConductors = [&](bool coat, const std::string& suffix) {
-            copts.paintCoating = coat;
-            for (auto& ns : ConductorBuilder::buildAll(magnetic.get_coil(), bobbinPd,
-                                                       toroidalCore, copts)) {
-                turnShapes.push_back(ns.shape);
-                turnNames.push_back(ns.name + suffix);
-            }
-        };
-        if (emitCoatingShells) {
-            emitConductors(false, "");           // bare copper conductor
-            emitConductors(true, " coating");    // outer insulated footprint
-        } else {
-            emitConductors(paintCoating, "");
+        for (auto& ns : buildRealWindingConductorsNamed(magnetic, all, wirePolygonSegments,
+                                                        paintCoating, emitCoatingShells, femReady)) {
+            turnShapes.push_back(ns.shape);
+            turnNames.push_back(ns.name);
         }
     } else {
         turnShapes = buildTurnsImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(
@@ -992,6 +970,63 @@ NamedShape MagneticBuilder::buildBobbinNamedFromBobbin(const MAS::Bobbin& bobbin
         return NamedShape{TopoDS_Shape(), name};
     }
     return NamedShape{s, name};
+}
+
+// The ONE place real-winding conductors are emitted. buildAllNamed (whole assembly, one
+// call) and buildRealWindingTurnsNamed (turns only, for a viewer that draws core, bobbin
+// and turns as separate meshes) both come through here, so the two can never drift into
+// drawing different copper for the same magnetic.
+std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
+    const OpenMagnetics::Magnetic& magnetic,
+    const std::vector<NamedShape>& coreShapes,
+    int wirePolygonSegments,
+    bool paintCoating,
+    bool emitCoatingShells,
+    bool femReady) const {
+    auto bobbinPd = getBobbinProcessed(magnetic.get_coil());
+    patchBobbinDimensions(bobbinPd, magnetic.get_core());
+    const bool toroidalCore = isCoreToroidal(magnetic.get_core());
+    ConductorBuilder::Options copts;
+    copts.wirePolygonSegments = wirePolygonSegments;
+    copts.femReady = femReady;   // OM drawing -> fast compound; FEM export -> one-piece/conformal
+    // Hand the CORE solids to the conductor builder so it can aim the terminal leads at
+    // the true window opening (classified from the real geometry -- column metadata
+    // under-describes cores like PQ whose plates wrap most of the perimeter; measured on
+    // 03_buck_pq3230, whose lead tip landed on an oblique plate face at both column-derived
+    // azimuths).
+    if (!toroidalCore)
+        for (const auto& ns : coreShapes) copts.coreObstacles.push_back(ns.shape);
+
+    std::vector<NamedShape> out;
+    auto emitConductors = [&](bool coat, const std::string& suffix) {
+        copts.paintCoating = coat;
+        for (auto& ns : ConductorBuilder::buildAll(magnetic.get_coil(), bobbinPd,
+                                                   toroidalCore, copts)) {
+            out.push_back({ns.shape, ns.name + suffix});
+        }
+    };
+    if (emitCoatingShells) {
+        emitConductors(false, "");           // bare copper conductor
+        emitConductors(true, " coating");    // outer insulated footprint
+    } else {
+        emitConductors(paintCoating, "");
+    }
+    return out;
+}
+
+std::vector<NamedShape> MagneticBuilder::buildRealWindingTurnsNamed(
+    const OpenMagnetics::Magnetic& magnetic,
+    int wirePolygonSegments,
+    int corePolygonSegments,
+    bool paintCoating,
+    bool femReady) const {
+    // The core is built but NOT returned: the conductor builder needs the real core solids
+    // to aim the terminal leads at the true window opening. Skipping them here would make a
+    // viewer's leads land somewhere else than the exported assembly's for the same design —
+    // the kind of divergence nobody notices until a STEP and a screenshot disagree.
+    auto coreShapes = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
+    return buildRealWindingConductorsNamed(magnetic, coreShapes, wirePolygonSegments,
+                                           paintCoating, /*emitCoatingShells=*/false, femReady);
 }
 
 std::vector<NamedShape> MagneticBuilder::buildTurnsNamedFromTurns(
