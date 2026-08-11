@@ -891,69 +891,70 @@ TEST_CASE("Real winding: pre-enriched input with the flag on throws", "[realwind
         Catch::Matchers::ContainsSubstring("geometricalDescription"));
 }
 
-// ABT #646 — the entrance lead is routed straight through an inter-layer dragback.
+// ABT #646 — a design that could not be routed until the layout was re-wound.
 //
-// The fixture is a real user design (E 16/8/8, N87-class 95, one winding, 12 turns of
-// Synthesized Litz 31x0.100mm, 2 conduction layers). Idealised per-turn loops build fine;
-// real winding refuses, because the Primary entrance lead and the turn 5 -> 6 dragback are
-// not merely close but COINCIDENT — centreline distance 8.3e-19 m, i.e. exactly zero:
+// A real user design: E 16/8/8, N87-class 95, one winding, 12 turns of Synthesized Litz
+// 31x0.100mm, 2 conduction layers. Real winding used to refuse it, because the Primary
+// entrance lead and an inter-layer dragback were COINCIDENT — centreline distance 8.3e-19 m,
+// i.e. exactly zero, against 0.000802 m required.
 //
-//   entrance lead seg 0   (0, -0.00467262, -0.018706)  -> (0, -0.00467262, -0.0135774)
-//   dragback     seg 1   (0,  0.00467262, -0.0144321) -> (0, -0.00467262, -0.0144321)
+// The cause was upstream and not in the router: MKF's magnetic_autocomplete only wound a coil
+// that had no turnsDescription, so a design arriving already wound kept a layout laid out
+// WITHOUT the connection corridors. Layer 1 spanned the full 10.2 mm window with a turn sitting
+// exactly on the input connection's reserved rectangle, and the router was handed turn positions
+// that had never reserved a slot for the lead it then had to route. MKF 90594876 re-winds when
+// real winding is asked for; layer 1 comes back one wire slot shorter at the bottom and the
+// conductor routes.
 //
-// Both lie in the plane x = 0; the lead runs along Z at a fixed y, the dragback runs along
-// Y at a fixed z, the dragback's END y equals the lead's y to every digit, and its z falls
-// inside the lead's z span. So they cross. The same signature appears on an auto-advised
-// Flyback with a different core and a different wire, so this is a placement rule
-// colliding with itself, not a tolerance being missed.
-//
-// The refusal is CORRECT — turn positions come from MKF and are never moved to paper over
-// an overlap — so this test pins the refusal rather than expecting success. It flips to a
-// build once the upstream placement is fixed, and the assertion below is what will tell us.
-TEST_CASE("Real winding: entrance lead crosses an inter-layer dragback (ABT #646)",
+// This asserts the ROUTE, not the refusal: a design that regresses to a collision here is a
+// layout regression, and the exception text will say exactly which two runs met.
+TEST_CASE("Real winding: the ABT #646 litz design routes once the layout is re-wound",
           "[realwinding][abt646]") {
     auto magneticJson = loadFixture("realwinding_e16_litz_2layer_leadcollision.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
     mvb::MagneticBuilder builder;
 
-    // Idealised loops are unaffected: the defect is in the routed conductor, not the turns.
+    // Idealised loops were never affected: the defect was in the routed conductor.
     REQUIRE_NOTHROW(builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true));
 
-    REQUIRE_THROWS_WITH(
-        builder.buildAllNamed(enriched, true, 0, /*wireSeg=*/0,
-                              mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
-                              /*useRealWindingGeometry=*/true),
-        Catch::Matchers::ContainsSubstring("collision between") &&
-            Catch::Matchers::ContainsSubstring("entrance lead") &&
-            Catch::Matchers::ContainsSubstring("dragback"));
+    std::vector<mvb::NamedShape> named;
+    REQUIRE_NOTHROW(named = builder.buildAllNamed(enriched, true, 0, /*wireSeg=*/0,
+                                                  mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false,
+                                                  false, 0.0, /*useRealWindingGeometry=*/true));
+    REQUIRE_FALSE(named.empty());
+
+    // The re-wound layer must actually be shorter than the window — that is the fix, and a
+    // full-height layer would mean the corridors were not reserved even if nothing collided.
+    auto enrichedCoil = enriched.get_coil();
+    auto layers = enrichedCoil.get_layers_description().value();
+    double windowHeight = enrichedCoil.resolve_bobbin()
+                              .get_processed_description().value()
+                              .get_winding_windows()[0].get_height().value();
+    bool anyShortened = false;
+    for (const auto& layer : layers) {
+        if (layer.get_type() != MAS::ElectricalType::CONDUCTION) continue;
+        if (layer.get_dimensions()[1] < windowHeight - 1e-9) anyShortened = true;
+    }
+    INFO("window height " << windowHeight);
+    CHECK(anyShortened);
 }
 
-// The artifact for investigating the refusal above: the same conductors, built WITH the
-// collision gate deliberately open, exported so the overlap can be measured in CAD. The
-// result contains interpenetrating copper by construction — it is a diagnostic picture, not
-// a part, which is why it lives behind an explicit flag and its own tag.
-TEST_CASE("Real winding: export the ABT #646 collision for inspection",
+// The routed conductors, exported so the winding can be inspected in CAD. No collision gate is
+// skipped here any more: this design routes, so the file is real geometry.
+TEST_CASE("Real winding: export the ABT #646 design",
           "[realwinding][abt646][diagnostic]") {
     auto magneticJson = loadFixture("realwinding_e16_litz_2layer_leadcollision.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
 
     mvb::MagneticBuilder builder;
-    auto core = builder.buildCoreNamed(enriched.get_core(), mvb::DEFAULT_CORE_POLYGON_SEGMENTS);
-
-    auto conductors = builder.buildRealWindingTurnsNamed(
-        enriched, /*wirePolygonSegments=*/0, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
-        /*paintCoating=*/false,   // bare copper: the overlap is a COPPER overlap
-        /*femReady=*/false,
-        /*diagnosticSkipCollisionCheck=*/true);
-    REQUIRE_FALSE(conductors.empty());
-
-    std::vector<mvb::NamedShape> all = core;
-    all.insert(all.end(), conductors.begin(), conductors.end());
-    const std::string path = "abt646_e16_litz_leadcollision.step";
+    auto all = builder.buildAllNamed(enriched, /*includeBobbin=*/true, 0, /*wireSeg=*/0,
+                                     mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/true,
+                                     false, false, 0.0, /*useRealWindingGeometry=*/true);
+    REQUIRE_FALSE(all.empty());
+    const std::string path = "abt646_e16_litz_realwinding.step";
     REQUIRE(mvb::exportSTEP(all, path));
-    WARN("ABT #646 collision geometry written to " << path
-         << " — copper OVERLAPS in this file by construction; it is a diagnostic, not a part.");
+    WARN("ABT #646 real-winding geometry written to " << path);
 }
 
 TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre compound",
