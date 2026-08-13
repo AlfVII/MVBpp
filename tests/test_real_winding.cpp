@@ -334,6 +334,31 @@ TEST_CASE("Real winding: U order with margin tape builds a continuous conductor"
                                        /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
                                        /*useRealWindingGeometry=*/true, /*femReady=*/true);
 
+    // The layers must connect HORIZONTALLY (MKF ABT #683): U exists so the next layer starts
+    // level with the turn it connects to. Read it off the geometry MVB++ actually builds from.
+    {
+        auto& enrichedCoil = enriched.get_mutable_coil();
+        auto enrichedTurnsOptional = enrichedCoil.get_turns_description();
+        REQUIRE(enrichedTurnsOptional);
+        const auto& enrichedTurns = enrichedTurnsOptional.value();
+        std::vector<std::string> layerOrder;
+        std::map<std::string, std::vector<double>> heightsPerLayer;
+        for (const auto& turn : enrichedTurns) {
+            if (!turn.get_layer()) continue;
+            const std::string layerName = turn.get_layer().value();   // BY VALUE: the optional comes back by value, so .value() would dangle
+            if (!heightsPerLayer.count(layerName)) layerOrder.push_back(layerName);
+            heightsPerLayer[layerName].push_back(turn.get_coordinates()[1]);
+        }
+        REQUIRE(layerOrder.size() >= 2);
+        for (size_t i = 0; i + 1 < layerOrder.size(); ++i) {
+            double arrival = heightsPerLayer[layerOrder[i]].back();
+            double landing = heightsPerLayer[layerOrder[i + 1]].front();
+            INFO(layerOrder[i] << " leaves at " << arrival * 1000 << " mm, "
+                 << layerOrder[i + 1] << " starts at " << landing * 1000 << " mm");
+            CHECK(std::abs(arrival - landing) < 0.0002);
+        }
+    }
+
     const mvb::NamedShape* conductor = nullptr;
     for (const auto& ns : named) {
         if (ns.name == "Primary parallel 0") {
