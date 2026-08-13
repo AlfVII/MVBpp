@@ -498,6 +498,19 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
         for (const auto& pr : paths[ci].prims)
             polys[ci].push_back(samplePrim(pr, paths[ci].wireRadius));
     }
+    if (std::getenv("MVB_PATH_DUMP")) {
+        for (size_t ci = 0; ci < paths.size(); ++ci) {
+            for (const auto& pr : paths[ci].prims) {
+                gp_Pnt a, bEnd;
+                if (pr.kind != Primitive::SEG) continue;
+                a = pr.seg.a; bEnd = pr.seg.b;
+                std::cerr << "[prim] ci=" << ci << " '" << pr.label << "'"
+                          << " a=(" << a.X() << "," << a.Y() << "," << a.Z() << ")"
+                          << " b=(" << bEnd.X() << "," << bEnd.Y() << "," << bEnd.Z() << ")"
+                          << " lead=" << pr.isLead << std::endl;
+            }
+        }
+    }
     for (size_t ci = 0; ci < paths.size(); ++ci) {
         for (size_t cj = ci; cj < paths.size(); ++cj) {
             const auto& A = paths[ci];
@@ -5599,6 +5612,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     // (0 = -Z, 1 = +Z after the per-winding 180-degree seam rotation)
         bool interSection = false;  // crosses ALIEN sections: routed at MKF's band (ABT #615
                                     // stage 3), not as the face-level adjacent chain
+        bool levelLink = false;     // U turnaround: steps out at the SAME height, so it reserves
+                                    // no space (see rectRideLevels)
     };
     std::vector<RectReturn> rectReturns;
     // ABT #615/Alf 2026-08-09: a cross-layer transition whose SOURCE turn is ALONE in its
@@ -5653,6 +5668,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         ct.turns[i]->get_section() != ct.turns[i + 1]->get_section();
                     const bool sourceAlone = ct.turns[i]->get_layer() &&
                         turnsInLayer[ct.turns[i]->get_layer().value()] == 1;
+                    // A U turnaround changes depth with NO axial move: the wire steps straight
+                    // out to the next layer and carries on. It is not a return and reserves no
+                    // space — where a Z dragback flies back across the layer and every turn at
+                    // or outside it has to ride over the returning wire. Treating the level link
+                    // as a return laid a ride level per link, so each layer sat one EXTRA wire
+                    // OD further out (measured on Alf's E16: layer faces 1.710 mm apart for a
+                    // 0.855 mm wire) and the link itself came out as two segments — the bump he
+                    // flagged: "a bump that is not needed in U winding, just in Z windings with
+                    // dragbacks". Level is judged against the wire: anything that moves less
+                    // than half a diameter axially cannot be flying back over anything.
+                    const bool levelLink = std::abs(b.y - a.y) <= 0.5 * diam;
                     if (!interSection && sourceAlone) {
                         // Single-turn layer: U-style tangential continuation (Alf), no lane.
                         rectTangential.insert({cv, i});
@@ -5660,7 +5686,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     }
                     if (!slotOf.count(cv)) slotOf[cv] = 0.0;   // slot assigned below
                     rectReturns.push_back({cv, i, a.zPos, b.zPos, diam, 0.0,
-                                           windingFace.at(ct.winding), interSection});
+                                           windingFace.at(ct.winding), interSection, levelLink});
                     maxDiam = std::max(maxDiam, diam);
                 }
             }
@@ -5686,6 +5712,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // Distinct destination depths, ascending, PER SIDE. Each level displaces everything
         // at or beyond it (on that side) by the level's largest laid wire OD.
         for (const auto& r : rectReturns) {
+            // ABT #683: a U turnaround steps straight out at the SAME height — nothing flies
+            // back over the layer, so no turn has to ride over anything. Only a real Z dragback
+            // reserves a level. Counting the level links laid one ride per link, which pushed
+            // every layer an extra wire OD outward (Alf's E16: 1.710 mm between layer faces for
+            // a 0.855 mm wire) and split the link into a step plus a riser — the bump.
+            if (r.levelLink) continue;
             auto& levels = rectRideLevels[r.side];
             bool merged = false;
             for (auto& lv : levels) {
@@ -7250,8 +7282,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         destRide = rectRideFor(rs1.zPos, side);
                         // The descent lies on the destination face displaced only by the
                         // levels INSIDE it -- its own level's reservation is the space the
-                        // descent itself occupies.
-                        chainRide = destRide - ret->diam;
+                        // descent itself occupies. ABT #683: a U turnaround reserves NO level
+                        // (it steps out at the same height and nothing rides over it), so there
+                        // is none of its own to take back out.
+                        chainRide = ret->levelLink ? destRide : destRide - ret->diam;
                         xSlot = ret->xSlot;
                         if (chainRide < -1e-12) {
                             throw std::runtime_error(
