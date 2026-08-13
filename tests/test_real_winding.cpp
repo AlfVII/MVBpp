@@ -309,6 +309,68 @@ TEST_CASE("Real winding: rect-column conductor fuses into ONE connected solid",
     REQUIRE(conductors > 0);
 }
 
+// The web case Alf hit on 2026-08-13 (E 16/8/8, 19 turns of litz 31x0.1, 3 stacks, U winding
+// order and ~2.92 mm of margin tape at the top). U alone built, margin alone built, and the two
+// together died in ConductorBuilder with the entrance lead running through a turn's wrap — the
+// 3D view showed a core and a bobbin with no copper at all (MKF ABT #682: the overflowing layer
+// was centred on a span it did not fit and landed on the lead's own row; it now gives back the
+// deeper reservation instead). Kept as a fixture because it is the combination, not either half,
+// that regressed: a design carrying BOTH is the only thing that would have caught it.
+TEST_CASE("Real winding: U order with margin tape builds a continuous conductor",
+          "[realwinding][abt682]") {
+    auto magneticJson = loadFixture("realwinding_u_order_margin_e16.json");
+    // The fixture is the design as the web hands it over: already wound, U on the bobbin's
+    // winding window, margin on the section.
+    REQUIRE(magneticJson.at("coil").at("bobbin").at("processedDescription")
+                        .at("windingWindows").at(0).at("windingOrder") == "U");
+
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/true, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+
+    const mvb::NamedShape* conductor = nullptr;
+    for (const auto& ns : named) {
+        if (ns.name == "Primary parallel 0") {
+            REQUIRE(conductor == nullptr);
+            conductor = &ns;
+        }
+    }
+    REQUIRE(conductor != nullptr);
+    REQUIRE(!conductor->shape.IsNull());
+    REQUIRE(shapeVolume(conductor->shape) > 0.0);
+    REQUIRE(connectedSolidComponents(conductor->shape) == 1);
+
+    // The margin is geometry, not decoration (MKF ABT #676): no copper above the tape's inner
+    // face. Read the face from the design rather than hard-coding it, so the fixture stays the
+    // source of truth.
+    const auto& window = magneticJson.at("coil").at("bobbin").at("processedDescription")
+                                     .at("windingWindows").at(0);
+    const double windowTop = window.at("coordinates").at(1).get<double>()
+                           + window.at("height").get<double>() / 2;
+    double margin = 0.0;
+    for (const auto& section : magneticJson.at("coil").at("sectionsDescription")) {
+        if (section.at("type") != "conduction" || !section.contains("margin")) continue;
+        const auto& m = section.at("margin");
+        margin = std::max(margin, m.is_array() ? m.at(0).get<double>()
+                                               : m.at("topOrLeftWidth").get<double>());
+    }
+    REQUIRE(margin > 0.0);
+    Bnd_Box box;
+    BRepBndLib::Add(conductor->shape, box);
+    double xMin, yMin, zMin, xMax, yMax, zMax;
+    box.Get(xMin, yMin, zMin, xMax, yMax, zMax);
+    // Bounding box is in mm; a faceting tolerance of one polygon sagitta is expected on round wire.
+    INFO("copper top " << yMax << " mm against the margin's inner face "
+                       << (windowTop - margin) * 1000 << " mm");
+    REQUIRE(yMax <= (windowTop - margin) * 1000 + 0.05);
+}
+
 TEST_CASE("Real winding: single-parallel PQ33 becomes one continuous conductor",
           "[realwinding]") {
     auto magneticJson = loadFixture("realwinding_round_U.json");
