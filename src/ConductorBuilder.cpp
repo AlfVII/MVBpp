@@ -3075,7 +3075,14 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
         // diameter of radial travel — inside the attach turn's own slot, where it can
         // touch nothing — then run flat at MKF's row. No sub-radius jog (the old OCCT
         // corner crash), no full-length diagonal (06_llc's cross-row regression).
-        if (rowOffset > 1e-7 && borderX > station.x + run->dimensions.at(1)) {
+        // ABT #685 (Alf, 2026-08-17): "terminals should always be parallel to X axis". The
+        // slope below is retired — a terminal run is axis-parallel, and a height change is
+        // taken by a CORNER PLUS A VERTICAL, which is the only other thing the Terminal chunk
+        // allows. A slope is neither, and at 3D emission time it stops being small: the exit
+        // attach moves to where the stretched wrap truly ends (exitAttachY), so pushpull's
+        // Secondary 1 parallel 3 turned a drawn 40 um offset into a 2.79 mm diagonal over its
+        // whole 16 mm run.
+        if (false && rowOffset > 1e-7 && borderX > station.x + run->dimensions.at(1)) {
             // ABT #685 (Alf, 2026-08-15): the offset is taken up as a SLOPE over the whole run,
             // not as a one-wire-OD radial excursion at the attach. The excursion made this lead
             // leave from a radius one OD outside its siblings', and since a straight -Z run keeps
@@ -3090,7 +3097,11 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
             // sits at the turn.
             return {{station.x, station.y}, {borderX, edgeY}};
         }
-        return {{station.x, station.y}, {borderX, station.y}};
+        // Sub-micron offsets are layout noise, not a drawn stub: run flat at the turn's row.
+        if (rowOffset <= 1e-7) {
+            return {{station.x, station.y}, {borderX, station.y}};
+        }
+        return {{station.x, station.y}, {station.x, edgeY}, {borderX, edgeY}};
     }
     return {{station.x, station.y}, {station.x, edgeY}, {borderX, edgeY}};
 }
@@ -6556,6 +6567,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // within it turned the route into a diagonal that crossed the other lead's edge
             // row (measured: entrance seg crossing the exit row, centreline distance 0). The
             // conservative correct bound is the THIN half-dimension.
+            // ABT #685 (Alf, 2026-08-17): "terminals should always be parallel to X axis".
+            // TRIED AND REVERTED: absorbing only sub-micron residue, so every drawn corner
+            // survives and no run can slope. It is the right shape and it holds all the way
+            // down -- but restoring a corner puts the run back on MKF's reserved row, and on
+            // 11_pushpull_etd49 that row is 0.84 mm from the SIBLING PARALLEL's terminal
+            // stub, which the fan does not reserve against (chordExtra exempts same-winding
+            // parallels). The design then refuses. The stub is a CHORD sweeping from its own
+            // slot toward the plane, so it crosses its neighbour's lane -- the same
+            // wrap-follows-the-connection coupling that stretches sibling wraps, and it has to
+            // be fixed at the Turn, not by widening a reservation here.
+            //
+            // So the bound stays the wire radius: a jog shorter than that lies inside the pipe
+            // body of its neighbouring edge. What no longer happens is a corner being absorbed
+            // and the offset then reappearing at 3D scale -- see the corner reinstated after
+            // exitAttachY moves the attach, which is what made Secondary 1 parallel 3's exit a
+            // 2.79 mm diagonal.
             const double absorbTol = rectWire
                 ? 0.5 * std::min(path.wireWidth, path.wireHeight) : wireRadius;
             if (std::getenv("MVB_DIAG")) {
@@ -6564,6 +6591,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 for (const auto& q : wp) std::cerr << " (" << q.x << "," << q.y << ")";
                 std::cerr << "\n";
             }
+            // ABT #685 (Alf, 2026-08-17): absorb a NEGLIGIBLE KINK, never a corner. The test is
+            // the waypoint's distance from the straight line joining its neighbours — how much
+            // geometry dropping it actually loses — not its distance to a neighbour POINT.
+            // Those differ exactly at an L: the corner of a 0.4 mm stub sits 0.4 mm off that
+            // line however close it is to its neighbour, so the old test deleted it and turned
+            // the route into a diagonal. "Terminals should always be parallel to X axis": an
+            // axis-parallel run plus a vertical is the shape, and a short vertical stays a
+            // vertical.
             for (size_t i = 1; i + 1 < wp.size(); ++i) {
                 if (std::hypot(wp[i].x - kept.back().x, wp[i].y - kept.back().y) <
                         absorbTol ||
@@ -6573,6 +6608,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 kept.push_back(wp[i]);
             }
             kept.push_back(wp.back());
+
             // ROUND wire gets rounded corners (the toroidal treatment); RECT wire keeps the
             // mitred butt its own machinery expects.
             std::vector<gp_Pnt> leadPts;
@@ -7203,6 +7239,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // moves; every other waypoint, including the row the lead runs out on, is MKF's.
                 if (!std::isnan(exitAttachY)) {
                     wp.front().y = exitAttachY;
+                    // ABT #685: moving the attach must not SLANT the run. The route was shaped
+                    // against MKF's drawn station; once the attach follows the wrap's true end,
+                    // any row offset it opens up is taken by a vertical at the attach radius,
+                    // exactly as a drawn offset would be.
+                    if (wp.size() == 2 && std::abs(wp.front().y - wp.back().y) > 1e-7) {
+                        wp.insert(wp.begin() + 1, {wp.front().x, wp.back().y});
+                    }
                 }
                 extendBorder(wp);
                 // The exit lead leaves the OUTERMOST turn, which rides over every dragback
