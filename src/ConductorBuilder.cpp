@@ -3263,9 +3263,23 @@ bool isZReturn(const PlanePt& s, const PlanePt& n, double wireRadius, double med
     if (layerChange && zOrderAdvance != 0.0 &&
         (n.y - s.y) * (zOrderAdvance > 0.0 ? 1.0 : -1.0) < -2.0 * wireRadius)
         return true;
-    const double thr = layerChange ? std::max(medianPitch, 2.0 * wireRadius)
-                                   : std::max(6.0 * wireRadius, 1.6 * medianPitch);
-    return std::abs(n.y - s.y) > thr;
+    // ABT #685 (Alf, 2026-08-16): WITHIN ONE LAYER THERE IS NO DRAGBACK. A dragback exists to
+    // carry the wire back across the window so the NEXT LAYER can start at the far end; a step
+    // that does not change radius has no next layer to serve. However far it moves axially, it
+    // is the turn's own pitch — "just a normal spiral (or bumped) turn whose pitch is the whole
+    // layer height ... without requiring a bump".
+    //
+    // The old intra-layer threshold (6 wire radii, or 1.6 median pitches) called any big axial
+    // step a return, and that is what put a lane and a BUMP under Secondary 1 of the pushpull:
+    // its turns 3 and 4 both sit in layer 1 at x = 14.231 mm, 14.65 mm apart axially because
+    // turn 4 is the conductor's last and MKF places it at the far edge. MVB++ read that as a
+    // return, laid a dragback for it, and made every layer outside it ride over a lane that no
+    // winder lays. MKF emits no connection marker for an intra-layer step at all — the
+    // heuristic was inventing one.
+    if (!layerChange) {
+        return false;
+    }
+    return std::abs(n.y - s.y) > std::max(medianPitch, 2.0 * wireRadius);
 }
 
 // ROUND column: within a layer, one full 360-degree cylindrical spiral about the column
