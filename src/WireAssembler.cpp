@@ -756,7 +756,8 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
 }
 
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wireRadius,
-                          int segments, CornerStyle corners) {
+                          int segments, CornerStyle corners,
+                          std::vector<size_t>* primIndexPerSolid) {
     const double over = 1.3 * wireRadius;   // covers a bisector tilt up to ~50 deg half-angle
     const double tanThresh = 0.05;          // rad (~3 deg): below this a junction is tangent -> no cut
     const bool diag = std::getenv("MVB_MITRE_DIAG") != nullptr;
@@ -894,7 +895,20 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                 throw std::runtime_error(detail.str());
             }
         }
-        builder.Add(compound, solid);
+        // ABT #685: add SOLIDS, never a sub-compound. A mitre trim can fragment one primitive
+        // into two solids, and adding that compound as one shape made the assembly's component
+        // count differ from its solid count -- 21 solids, 20 components on the pushpull's
+        // Primary 1. Every consumer that walks solids and then indexes components (the STEP
+        // exporter's per-solid naming, above all) is off by one from that point on, which is how
+        // 'turn 15 -> turn 16' ended up naming the wrong piece of copper. One solid, one
+        // component, one name.
+        for (TopExp_Explorer solidExplorer(solid, TopAbs_SOLID); solidExplorer.More();
+             solidExplorer.Next()) {
+            builder.Add(compound, solidExplorer.Current());
+            if (primIndexPerSolid != nullptr) {
+                primIndexPerSolid->push_back(i);
+            }
+        }
         if (diag) {
             built.push_back(solid);
             GProp_GProps gpr;

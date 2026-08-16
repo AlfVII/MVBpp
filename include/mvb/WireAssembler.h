@@ -144,8 +144,13 @@ enum class CornerStyle {
 // perpendicular discs, corner junctions are grown and sliced per `corners`. No boolean fuse,
 // no overlap: coincidence is exact by construction, which is the input class OCCT's boolean
 // spec and gmsh's fragment actually support.
+// `primIndexPerSolid`, when given, receives one entry per SOLID of the returned compound: the
+// index into `centreline` of the piece that solid was built from. That is the only correct way to
+// name the parts -- a solid count can exceed the primitive count (a mitre trim may fragment a
+// piece), so neither an index nor a centroid match is reliable.
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& centreline, double wireRadius,
-                          int polygonSegments, CornerStyle corners = CornerStyle::BisectionMitre);
+                          int polygonSegments, CornerStyle corners = CornerStyle::BisectionMitre,
+                          std::vector<size_t>* primIndexPerSolid = nullptr);
 
 // Sampling / geometry queries on a centreline piece, shared by the chunk builders and the
 // collision gate. Pure measurement — they build no copper.

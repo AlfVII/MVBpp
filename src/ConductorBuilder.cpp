@@ -2411,7 +2411,12 @@ TopoDS_Shape sweepRunChunked(const Primitive* const* prims, size_t count, double
 
 
 
-TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
+// ABT #685: `primIndexPerSolid`, when given, receives the solid -> centreline-piece mapping the
+// conformal assembler produced, so the caller can NAME each solid exactly instead of guessing by
+// index or centroid. Left EMPTY by every other emission path (single-body sweeps, rect fuses),
+// whose solids do not correspond one-to-one to primitives at all; a caller must check.
+TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
+                           std::vector<size_t>* primIndexPerSolid = nullptr) {
     if (std::getenv("MVB_DIAG"))
         std::cerr << "[emitConductor] '" << path.name << "' prims=" << path.prims.size()
                   << " useRectSolids=" << path.useRectSolids << " roundProfile="
@@ -2448,7 +2453,8 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
         for (const auto& pr : path.prims) cptrs.push_back(&pr);
         // NO prune: the conformal assembler runs no booleans, so it cannot make slivers --
         // every solid is a swept primitive, and it throws rather than dropping any.
-        return assembleWire(cptrs, path.wireRadius, wirePolygonSegments);
+        return assembleWire(cptrs, path.wireRadius, wirePolygonSegments,
+                            CornerStyle::BisectionMitre, primIndexPerSolid);
     }
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
@@ -2850,7 +2856,8 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments) {
     // assembler on them for drawing buys nothing and walks straight into ABT #619, where it
     // cannot build a valid solid for the tight-bore poloidal corner at exact surfaces.
     if (path.toroidal && path.femReady) {
-        return assembleWire(ptrs, path.wireRadius, wirePolygonSegments);
+        return assembleWire(ptrs, path.wireRadius, wirePolygonSegments,
+                        CornerStyle::BisectionMitre, primIndexPerSolid);
     }
 
     BRep_Builder builder;
@@ -7498,7 +7505,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     std::vector<NamedShape> out;
     out.reserve(paths.size());
     for (const auto& p : paths) {
-        TopoDS_Shape cond = emitConductor(p, opts.wirePolygonSegments);
+        // ABT #685: ask the assembler which centreline piece each solid came from, rather than
+        // reconstructing it afterwards. Empty for the emission paths whose solids are not one
+        // per primitive (single-body sweeps, rect fuses) — those keep the centroid match.
+        std::vector<size_t> primIndexPerSolid;
+        TopoDS_Shape cond = emitConductor(p, opts.wirePolygonSegments, &primIndexPerSolid);
         // ABT #685: name every SOLID of the conductor, so a STEP viewer shows what each piece is
         // instead of numbering the compound's parts itself. Each solid is matched to the primitive
         // whose midpoint it is centred on — not by index, because degenerate slivers are pruned and
@@ -7531,7 +7542,19 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // sliver, or the single-body sweep): a full-revolution solid's centre of mass sits on
             // the column axis, equidistant from every ring, so on its own it cannot tell which
             // primitive it belongs to — it named three solids "turn 0 -> turn 1".
+            // The assembler's own mapping wins whenever it produced one. Index equality is only
+            // the fallback for the other emission paths, and centroid matching the fallback to
+            // that — a full-revolution solid's centre of mass sits on the column axis,
+            // equidistant from every ring, so on its own it cannot tell which primitive it
+            // belongs to (it once named three solids "turn 0 -> turn 1").
             const bool indexMaps = solidCount == p.prims.size();
+            if (!primIndexPerSolid.empty() && primIndexPerSolid.size() != solidCount) {
+                throw std::runtime_error(
+                    "ConductorBuilder: the assembler reported " +
+                    std::to_string(primIndexPerSolid.size()) + " solids for '" + p.name +
+                    "' but the shape holds " + std::to_string(solidCount) +
+                    " -- the per-solid naming would be wrong, and a wrong name is worse than none");
+            }
             size_t solidIndex = 0;
             for (TopExp_Explorer e(cond, TopAbs_SOLID); e.More(); e.Next(), ++solidIndex) {
                 if (primLabel.empty()) {
@@ -7539,7 +7562,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     continue;
                 }
                 size_t best = solidIndex;
-                if (!indexMaps) {
+                if (solidIndex < primIndexPerSolid.size()) {
+                    best = primIndexPerSolid[solidIndex];   // exact: the assembler said so
+                }
+                else if (!indexMaps) {
                     GProp_GProps props;
                     BRepGProp::VolumeProperties(e.Current(), props);
                     const gp_Pnt centre = props.CentreOfMass();
