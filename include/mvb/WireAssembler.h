@@ -35,6 +35,19 @@ constexpr double kTwoPi = 2.0 * std::numbers::pi;
 // a DISCRETIZATION-DENSITY parameter of the measurement (like polygonSegments), not a
 // clearance policy.
 constexpr double kMaxSagFraction = 0.02;
+// ABT #685: a ROUND corner's bend radius, as a multiple of the wire radius. It must be
+// strictly greater than 1: a centreline radius EQUAL to the wire radius sweeps a HORN TORUS,
+// whose tube touches its own axis of revolution, so no valid solid exists. It is also the
+// physics — a wire does not bend tighter than its own radius. Where a corner has no room for
+// this, it takes the BisectionMitre construction instead, which has no radius to violate.
+//
+// 1.05 is the smallest margin that is buildable, and it is deliberately the SAME floor
+// appendFilletedPolyline already applies to its fillets — one number for one constraint. It is
+// not slack to be spent: a round corner intrudes (factor - 1) * wireRadius into its own inside,
+// and on a toroid that space belongs to the terminal lead's drop. Measured on the common-mode
+// choke, a 1.5 factor put the poloidal corner 0.5 * wireRadius = 219 um into the entrance
+// lead's corridor and the router (correctly) refused the design.
+constexpr double kRoundCornerBendFactor = 1.05;
 // The measurement's own error bound: a sampled polyline lies within this sag of the true
 // curve, so a measured polyline-polyline distance can under-read the true centreline
 // distance by at most the two prims' sag bounds. Derived from the sampling rule actually

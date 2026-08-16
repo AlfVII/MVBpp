@@ -6438,12 +6438,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               << " azOut=" << std::atan2(c0.pout.Y(), c0.pout.X()) * 180.0 / kPi
                               << " azNextIn=" << std::atan2(c1.pin.Y(), c1.pin.X()) * 180.0 / kPi
                               << "\n";
+                // ABT #685: the poloidal corner's BEND RADIUS, not the wire radius. Passing
+                // wireRadius made every toroid's corner a HORN TORUS by construction — the
+                // swept tube touches its own axis of revolution, so no valid solid exists and
+                // the assembler refused primitive 10 on 05_pfc, 07_cmc and 12_boost alike. A
+                // round corner is only buildable strictly outside the wire radius; 1.5 is the
+                // same margin appendFilletedPolyline already uses for exactly this reason, and
+                // it is also the honest physics — a wire does not bend tighter than its own
+                // radius.
+                const double toroBend = kRoundCornerBendFactor * wireRadius;
                 if (r0 != r1)
-                    appendToroTransitionBand(path, c0, c1, wireRadius,
+                    appendToroTransitionBand(path, c0, c1, toroBend,
                                              std::max(0, std::max(r0, r1) - 1) * od,
                                              0.5 * (maxInnerRadial + minRawOuter), wlabel, i);
                 else
-                    appendToroWrap(path, c0, c1, wireRadius, wrapDepthOds(i) * od, wlabel, i);
+                    appendToroWrap(path, c0, c1, toroBend, wrapDepthOds(i) * od, wlabel, i);
             }
 
             const size_t wrapPrimCount = path.prims.size();

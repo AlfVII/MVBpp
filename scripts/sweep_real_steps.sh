@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # Real-winding FEM STEP sweep over the whole MAS corpus (numbered examples + the
-# `complete` fixtures). One process per design, capped memory, bounded parallelism —
-# the point is a PASS/FAIL table with the real reason, not a pile of STEPs.
+# `complete` fixtures). One process per design, capped memory, bounded parallelism.
 #
 #   scripts/sweep_real_steps.sh <outdir> [jobs]
+#
+# Every design produces a STEP to look at:
+#   <name>.step             — built clean, collision gate satisfied. FEM-grade.
+#   <name>.DIAGNOSTIC.step  — the gate REFUSED this geometry; exported anyway with
+#                             MVB_LEAD_NO_VALIDATE so the fault can be seen. The copper
+#                             in it interpenetrates. Never feed one of these to a mesher.
+# RESULTS.tsv carries the verdict and, for a refusal, the reason verbatim.
 #
 # NB every design gets its OWN directory: mvbpp_step_generator always writes
 # <outdir>/magnetic.step before renaming, so parallel jobs sharing one directory
 # clobber each other's intermediate file.
 #
-# Env passed through: MVB_ALLOW_SQUISH, MVB_LEAD_NO_VALIDATE, MVB_PATH_DUMP.
+# Env passed through: MVB_ALLOW_SQUISH, MVB_PATH_DUMP.
 set -u
 
 ROOT=/home/alf/OpenMagnetics/MVB++
@@ -30,19 +36,22 @@ run_one() {
     ( ulimit -v 16000000; timeout 3600 "$GEN" --real --fem --segments 0 -o "$step" "$src" ) \
         > "$log" 2>&1
     local rc=$?
-    local dt=$((SECONDS - t0))
     local status reason=""
     if [ $rc -eq 0 ] && [ -s "$step" ]; then
         status=OK
     elif [ $rc -eq 124 ]; then
         status=TIMEOUT
     else
-        status=FAIL
-        # The thrown reason, on one line, with the leading noise stripped.
         reason=$(grep -m1 -a 'Error processing' "$log" \
-                 | sed 's/.*\.json": //' | tr -d '\n' | cut -c1-220)
-        [ -z "$reason" ] && reason=$(tail -2 "$log" | tr -d '\n' | cut -c1-220)
+                 | sed 's/.*\.json": //' | tr -d '\n' | cut -c1-400)
+        [ -z "$reason" ] && reason=$(tail -2 "$log" | tr -d '\n' | cut -c1-400)
+        # Export it anyway so the fault is visible, clearly marked as not FEM-grade.
+        local diag="$dir/$name.DIAGNOSTIC.step"
+        ( ulimit -v 16000000; MVB_LEAD_NO_VALIDATE=1 timeout 3600 \
+              "$GEN" --real --fem --segments 0 -o "$diag" "$src" ) >> "$log" 2>&1
+        if [ -s "$diag" ]; then status=REFUSED_DIAG; else status=FAIL; fi
     fi
+    local dt=$((SECONDS - t0))
     printf '%s\t%s\t%ss\t%s\n' "$name" "$status" "$dt" "$reason" >> "$out/RESULTS.tsv"
     printf '[%s] %s (%ss)\n' "$status" "$name" "$dt"
 }
