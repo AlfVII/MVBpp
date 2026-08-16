@@ -137,21 +137,23 @@ static std::string drawMagneticCommon(const std::vector<NamedShape>& named,
                                       const std::string& outputPath,
                                       const std::string& format,
                                       double scale) {
+    // ABT #685: keep the NamedShapes WHOLE. Splitting them into parallel {shape, name}
+    // vectors and calling the shapes+names overload silently dropped `partNames`, so every
+    // STEP written through drawMagnetic (i.e. everything the CLI and the bindings produce)
+    // came out with one unnamed multi-solid product per conductor and the viewer invented
+    // its own numbering for the pieces. Only the tests, which call exportSTEP(NamedShape)
+    // directly, ever saw the per-solid names.
+    std::vector<NamedShape> scaled = named;
     std::vector<TopoDS_Shape> allShapes;
-    std::vector<std::string>  allNames;
-    allShapes.reserve(named.size());
-    allNames.reserve(named.size());
-    for (const auto& ns : named) {
-        allShapes.push_back(ns.shape);
-        allNames.push_back(ns.name);
-    }
+    allShapes.reserve(scaled.size());
 
     if (scale != 1.0) {
         gp_Trsf trsf;
         trsf.SetScale(gp_Pnt(0, 0, 0), scale);
-        for (auto& s : allShapes)
-            s = BRepBuilderAPI_Transform(s, trsf).Shape();
+        for (auto& ns : scaled)
+            ns.shape = BRepBuilderAPI_Transform(ns.shape, trsf).Shape();
     }
+    for (const auto& ns : scaled) allShapes.push_back(ns.shape);
 
     std::filesystem::path out = outputPath;
     if (format == "stl") {
@@ -171,7 +173,7 @@ static std::string drawMagneticCommon(const std::vector<NamedShape>& named,
         return out.string();
     }
     out /= "magnetic.step";
-    exportSTEP(allShapes, allNames, out.string());
+    exportSTEP(scaled, out.string());
     return out.string();
 }
 
@@ -840,11 +842,15 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     // closed loops; positions come verbatim from the MKF-wound coil.
     std::vector<std::string> turnNames;
     std::vector<TopoDS_Shape> turnShapes;
+    // ABT #685: per-solid names, kept alongside the shape/name vectors this path splits things
+    // into. Indexed like turnShapes/turnNames; empty for anything that has none.
+    std::vector<std::vector<std::string>> turnPartNames;
     if (useRealWindingGeometry) {
         for (auto& ns : buildRealWindingConductorsNamed(magnetic, all, wirePolygonSegments,
                                                         paintCoating, emitCoatingShells, femReady)) {
             turnShapes.push_back(ns.shape);
             turnNames.push_back(ns.name);
+            turnPartNames.push_back(std::move(ns.partNames));
         }
     } else {
         turnShapes = buildTurnsImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(
@@ -867,7 +873,12 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         const std::string n = (i < turnNames.size() && !turnNames[i].empty())
                                 ? turnNames[i]
                                 : "Turn_" + std::to_string(i);
-        all.emplace_back(turnShapes[i], n);
+        if (i < turnPartNames.size() && !turnPartNames[i].empty()) {
+            all.emplace_back(turnShapes[i], n, turnPartNames[i]);   // ABT #685
+        }
+        else {
+            all.emplace_back(turnShapes[i], n);
+        }
     }
 
     if (includeInsulation) {
@@ -1004,7 +1015,10 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
         copts.paintCoating = coat;
         for (auto& ns : ConductorBuilder::buildAll(magnetic.get_coil(), bobbinPd,
                                                    toroidalCore, copts)) {
-            out.push_back({ns.shape, ns.name + suffix});
+            // Carry the per-solid names through (ABT #685) — rebuilding the NamedShape from
+            // {shape, name} alone silently dropped them, and the STEP went back to one unnamed
+            // multi-solid product.
+            out.push_back({ns.shape, ns.name + suffix, std::move(ns.partNames)});
         }
     };
     if (emitCoatingShells) {

@@ -319,7 +319,33 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
         return om;
     }
 
+    // ABT #685 (Alf, 2026-08-16): opt-in fit relaxations for diagnostic/test flows. Default
+    // off, like the MKF settings themselves; MVB_ALLOW_SQUISH turns both on so over-full
+    // examples wind WITH blocking (bulging radially) instead of declining it.
+    OpenMagnetics::SettingsGuard<bool> squishGuard(
+        OpenMagnetics::Settings::GetInstance(),
+        &OpenMagnetics::Settings::get_coil_allow_coating_squish,
+        &OpenMagnetics::Settings::set_coil_allow_coating_squish,
+        std::getenv("MVB_ALLOW_SQUISH") != nullptr);
+    OpenMagnetics::SettingsGuard<bool> overflowGuard(
+        OpenMagnetics::Settings::GetInstance(),
+        &OpenMagnetics::Settings::get_coil_allow_horizontal_overflow,
+        &OpenMagnetics::Settings::set_coil_allow_horizontal_overflow,
+        std::getenv("MVB_ALLOW_SQUISH") != nullptr);
     auto enriched = OpenMagnetics::magnetic_autocomplete(om, json{});
+    // ABT #685 (Alf, 2026-08-16): a layout whose real-winding blocking was DECLINED (the ABT
+    // #650 gate: ideal wind does not fit) has turns sitting inside the connection corridors —
+    // building it can only end in a gate collision that reads as a 3D bug. Refuse with the
+    // real reason instead (no-fallbacks rule: the broken thing is named, not routed around).
+    if (useRealWindingGeometry &&
+        !enriched.get_coil().is_real_winding_blocking_applied()) {
+        throw std::runtime_error(
+            "magnetic_autocomplete_safe: real winding geometry was requested but MKF did NOT "
+            "apply connection blocking (the ideal wind does not fit its window — see MKF's "
+            "coil log / MKF_BLOCKING_DIAG). The layout has turns inside the connection "
+            "corridors and cannot be built as FEM-grade CAD. Fix the design data, or set "
+            "MVB_ALLOW_SQUISH=1 (diagnostic) to allow coating squish and horizontal overflow.");
+    }
 
     // No-fallbacks rule: if the design has windings but MKF produced zero
     // turnsDescription (typically because the winding does not fit the

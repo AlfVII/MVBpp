@@ -36,6 +36,16 @@ public:
         // true  -> conductor swept at the OUTER (insulation) footprint (visualisation)
         // false -> swept at the CONDUCTING (copper) footprint (FEM)
         bool paintCoating = true;
+        // ABT #685 (Alf, 2026-08-15): the TWO standard corner constructions for lead/connection
+        // polylines, selected here. false (DEFAULT) -> BISECTION MITRE: plain segments meeting at
+        // the waypoint, the conformal assembler slicing both sides on the angle-bisector plane —
+        // the same joint as the wrap elbows, identical for every parallel regardless of stub
+        // height. true -> ROUNDED: exact tangent fillet arcs where a leg has room (a corner whose
+        // leg is too short for a valid fillet radius still falls back to the mitre — a fillet at
+        // the wire radius is a horn torus OCC cannot build). The conditional fallback is exactly
+        // what made 06_llc's three parallels show three different exit joints, which is why the
+        // deterministic mitre is the default.
+        bool roundedLeadCorners = false;
         // false (OM / drawing) -> fast per-run compound: overlapping swept pipes, perfect for the
         //   3D viewer, seconds to build.
         // true  (FEM export)   -> the slow one-piece machinery: single continuous body per parallel

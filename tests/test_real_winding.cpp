@@ -1,6 +1,7 @@
 // Real-winding geometry ([realwinding]): ONE continuous conductor per (winding, parallel)
 // replacing the per-turn closed loops, with every MKF turn position honoured exactly.
 #include <catch2/catch_test_macros.hpp>
+#include <filesystem>
 #include <set>
 #include <functional>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -41,6 +42,17 @@
 using json = nlohmann::json;
 
 namespace {
+
+// Every artifact a test writes goes to <repo>/output, never the working directory: run from the
+// build tree or the repo root, the STEPs land in one place and the project root stays clean
+// (Alf, 2026-08-14: "can you clean the root of the project and just put all generated files in
+// output?"). The path is derived from THIS source file, so it does not depend on the CWD.
+std::string outputPath(const std::string& name) {
+    const auto dir = std::filesystem::path{__FILE__}.parent_path().parent_path() / "output";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return (dir / name).string();
+}
 
 json loadFixture(const std::string& name) {
     std::ifstream f("testData/" + name);
@@ -316,6 +328,53 @@ TEST_CASE("Real winding: rect-column conductor fuses into ONE connected solid",
 // was centred on a span it did not fit and landed on the lead's own row; it now gives back the
 // deeper reservation instead). Kept as a fixture because it is the combination, not either half,
 // that regressed: a design carrying BOTH is the only thing that would have caught it.
+// TEMP sweep: every MAS example through the real-winding builder, checked for what a mesh needs
+// — every solid valid (BRepCheck), ONE connected component per conductor, and no volumetric
+// interpenetration at the junctions.
+TEST_CASE("Tmp mesh sweep", "[meshsweep]") {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> files;
+    for (const auto& e : fs::directory_iterator(MAS_EXAMPLES_DIR)) {
+        if (e.path().extension() == ".json" && std::isdigit(e.path().filename().string()[0])) {
+            files.push_back(e.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    for (const auto& f : files) {
+        std::ifstream in(f.string());
+        json j = json::parse(in);
+        json magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+        std::string name = f.filename().string();
+        try {
+            auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+            mvb::MagneticBuilder builder;
+            auto named = builder.buildAllNamed(enriched, false, 0,
+                                               mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                               mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false,
+                                               false, 0.0, true, true);
+            int conductors = 0, bad = 0;
+            std::string why;
+            for (const auto& ns : named) {
+                if (ns.name.find(" parallel ") == std::string::npos) continue;
+                std::vector<TopoDS_Shape> solids;
+                if (!ns.shape.IsNull())
+                    for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next())
+                        solids.push_back(e.Current());
+                if (solids.empty()) continue;   // coating shells / empty helpers, not the copper
+                ++conductors;
+                if (connectedSolidComponents(ns.shape) != 1) { ++bad; why += " disconnected"; }
+                for (const auto& sol : solids)
+                    if (!BRepCheck_Analyzer(sol).IsValid()) { ++bad; why += " invalid"; break; }
+            }
+            std::cout << "[mesh] " << name << " conductors=" << conductors
+                      << (bad == 0 ? "  OK (valid, connected)" : ("  PROBLEM:" + why)) << std::endl;
+        }
+        catch (const std::exception& e) {
+            std::cout << "[mesh] " << name << "  THREW: " << std::string(e.what()).substr(0, 90) << std::endl;
+        }
+    }
+}
+
 TEST_CASE("Real winding: U order with margin tape builds a continuous conductor",
           "[realwinding][abt682]") {
     auto magneticJson = loadFixture("realwinding_u_order_margin_e16.json");
@@ -1039,7 +1098,7 @@ TEST_CASE("Real winding: export the ABT #646 design",
                                      mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/true,
                                      false, false, 0.0, /*useRealWindingGeometry=*/true);
     REQUIRE_FALSE(all.empty());
-    const std::string path = "abt646_e16_litz_realwinding.step";
+    const std::string path = outputPath("abt646_e16_litz_realwinding.step");
     REQUIRE(mvb::exportSTEP(all, path));
     WARN("ABT #646 real-winding geometry written to " << path);
 }
@@ -1088,4 +1147,94 @@ TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre
     // pairs of this toroid ground >10 min/pair in 2d-extrema root-finding or returned !IsDone
     // (both measured here) -- the exact OCC-boolean pathology the conformal build avoids.
     requireConformalConductor(conductor->shape);
+}
+
+TEST_CASE("Real winding: export the 8t x 2p multi-parallel design",
+          "[realwinding][abt685][diagnostic]") {
+    // ABT #685 before/after comparison (Alf: "can you show me one STEP from before and one from
+    // after"). MVB_STEP_OUT names the file so the same binary can write both sides of a
+    // rebuild; MVB_LEAD_NO_VALIDATE skips the collision gate when the point IS to look at a
+    // collision.
+    auto magneticJson = loadFixture("realwinding_round_2p.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto all = builder.buildAllNamed(enriched, /*includeBobbin=*/true, 0, /*wireSeg=*/0,
+                                     mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/true,
+                                     false, false, 0.0, /*useRealWindingGeometry=*/true);
+    REQUIRE_FALSE(all.empty());
+    const char* out = std::getenv("MVB_STEP_OUT");
+    const std::string path = out ? out : outputPath("abt685_multiparallel.step");
+    REQUIRE(mvb::exportSTEP(all, path));
+    WARN("8t x 2p real-winding geometry written to " << path);
+}
+
+TEST_CASE("TMP failing-case export and overlap location", "[tmpfail]") {
+    auto magneticJson = loadFixture("realwinding_round_2p.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
+                                       true);
+    const mvb::NamedShape* p0 = nullptr;
+    const mvb::NamedShape* p1 = nullptr;
+    for (const auto& ns : named) {
+        if (ns.name == "Primary parallel 0") p0 = &ns;
+        if (ns.name == "Primary parallel 1") p1 = &ns;
+    }
+    REQUIRE(p0);
+    REQUIRE(p1);
+    // Solids in EXPORT ORDER — the order a STEP viewer numbers them ("Primary parallel 0",
+    // then 001, 002, ...). Prim indices are not it: degenerate slivers are pruned first.
+    auto solidsOf = [](const TopoDS_Shape& sh) {
+        std::vector<TopoDS_Shape> out;
+        for (TopExp_Explorer e(sh, TopAbs_SOLID); e.More(); e.Next()) out.push_back(e.Current());
+        return out;
+    };
+    const auto s0 = solidsOf(p0->shape);
+    const auto s1 = solidsOf(p1->shape);
+    auto nameOf = [](const char* base, size_t k) {
+        char buf[64];
+        if (k == 0) std::snprintf(buf, sizeof buf, "%s", base);
+        else std::snprintf(buf, sizeof buf, "%s%02zu", base, k);
+        return std::string(buf);
+    };
+    std::fprintf(stderr, "[solids] Primary parallel 0: %zu solids, Primary parallel 1: %zu\n",
+                 s0.size(), s1.size());
+    for (size_t a = 0; a < s0.size(); ++a) {
+        for (size_t b = 0; b < s1.size(); ++b) {
+            Bnd_Box ba, bb;
+            BRepBndLib::Add(s0[a], ba);
+            BRepBndLib::Add(s1[b], bb);
+            if (ba.IsOut(bb)) continue;
+            BRepAlgoAPI_Common common(s0[a], s1[b]);
+            if (!common.IsDone()) continue;
+            const double v = shapeVolume(common.Shape());
+            if (v <= 1e-15) continue;
+            std::fprintf(stderr, "[hit] %-24s  vs  %-24s   common = %.4e mm3\n",
+                         nameOf("Primary parallel 0", a).c_str(),
+                         nameOf("Primary parallel 1", b).c_str(), v * 1e9);
+        }
+    }
+}
+
+TEST_CASE("TMP fixture probe", "[tmpfix]") {
+    const char* name = std::getenv("MVB_FIXTURE");
+    REQUIRE(name != nullptr);
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/" + name);
+    REQUIRE(f.good());
+    json j = json::parse(f);
+    auto magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+    mvb::MagneticBuilder builder;
+    try {
+        auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                           mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false,
+                                           0.0, true);
+        std::fprintf(stderr, "[fix] %s BUILT ok\n", name);
+        const char* out = std::getenv("MVB_STEP_OUT");
+        if (out) REQUIRE(mvb::exportSTEP(named, out));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[fix] %s THROW: %s\n", name, e.what());
+    }
 }

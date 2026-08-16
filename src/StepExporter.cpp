@@ -16,6 +16,7 @@
 #include <TDocStd_Application.hxx>
 #include <TDocStd_Document.hxx>
 #include <TCollection_ExtendedString.hxx>
+#include <TopExp_Explorer.hxx>
 #include <TopoDS_Builder.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Shape.hxx>
@@ -78,12 +79,46 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
         if (ns.shape.IsNull()) continue;
         const TopoDS_Shape shapeMm =
             BRepBuilderAPI_Transform(ns.shape, metresToMillimetres).Shape();
+        // ABT #685: with per-solid names supplied, the shape goes in as an ASSEMBLY so every solid
+        // becomes its own named product. Without them a multi-solid conductor arrives as one
+        // unnamed-parts product and the viewer invents the numbering ("Primary parallel 001"),
+        // which exists nowhere in the file — so a part cannot be named unambiguously when
+        // discussing a build. Guarded on the count matching the solids actually present: a
+        // mismatch means the caller's list is stale, and a wrong name is worse than none.
+        std::size_t solidCount = 0;
+        for (TopExp_Explorer e(shapeMm, TopAbs_SOLID); e.More(); e.Next()) ++solidCount;
+        const bool nameParts = !ns.partNames.empty() && ns.partNames.size() == solidCount &&
+                               solidCount > 1;
         // AddShape(isAssembly=false): register the shape as a free top-level
         // component so STEPCAFControl_Writer emits it as a discrete product
         // (with our name attached) rather than burying it in a compound.
-        TDF_Label lab = shapeTool->AddShape(shapeMm, Standard_False);
+        TDF_Label lab = shapeTool->AddShape(shapeMm, nameParts ? Standard_True : Standard_False);
         if (!ns.name.empty()) {
             TDataStd_Name::Set(lab, TCollection_ExtendedString(ns.name.c_str()));
+        }
+        if (std::getenv("MVB_STEP_NAME_DIAG")) {
+            std::fprintf(stderr, "[step] '%s': solids=%zu partNames=%zu nameParts=%d\n",
+                         ns.name.c_str(), solidCount, ns.partNames.size(), int(nameParts));
+        }
+        if (nameParts) {
+            TDF_LabelSequence components;
+            shapeTool->GetComponents(lab, components);
+            if (std::getenv("MVB_STEP_NAME_DIAG")) {
+                std::fprintf(stderr, "[step]   components=%d\n", components.Length());
+            }
+            for (Standard_Integer k = 1;
+                 k <= components.Length() && std::size_t(k) <= ns.partNames.size(); ++k) {
+                const std::string& partName = ns.partNames[k - 1];
+                if (partName.empty()) continue;
+                TDF_Label component = components.Value(k);
+                TDataStd_Name::Set(component, TCollection_ExtendedString(partName.c_str()));
+                // The name belongs on the referred PRODUCT too: STEP writes the component as an
+                // occurrence of a product, and most viewers show the product's name.
+                TDF_Label referred;
+                if (shapeTool->GetReferredShape(component, referred)) {
+                    TDataStd_Name::Set(referred, TCollection_ExtendedString(partName.c_str()));
+                }
+            }
         }
     }
 
