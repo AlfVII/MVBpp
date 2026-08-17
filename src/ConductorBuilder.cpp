@@ -7256,8 +7256,19 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // attach column's.
                 const double exitRaise =
                     tallestBumpColumn(bumpsForTurn(1e30)).first;
+                // ABT #685 (Alf, 2026-08-17): "Primary 1 parallel 0 / exit lead seg 0 is not
+                // reaching the layer." The lift is PER WAYPOINT, at that waypoint's own radius
+                // -- exactly the correction the entrance already had. Applying the whole-path
+                // maximum to every point lifts the ATTACH too, and the attach sits inside every
+                // bump column, where it flies over nothing: the lead then starts that far
+                // outboard of the turn it is supposed to leave. Measured here, the last wrap
+                // ended at z = -9.4065 mm (on the 9.424 mm layer) while the exit lead began at
+                // z = -15.4755 mm -- a 6.069 mm gap, exactly the three stacked wire diameters
+                // the secondaries' lanes had accumulated. The outer waypoints keep the full
+                // lift, so the ride-over protection is unchanged where it applies.
                 pushPlaneSegs(wp, "exit lead", nEmit - 1, /*stationAtFront=*/true, exitRaise,
-                              azExit);
+                              azExit,
+                              [&](double r) { return tallestBumpColumn(bumpsForTurn(r)).first; });
             }
         }
 
