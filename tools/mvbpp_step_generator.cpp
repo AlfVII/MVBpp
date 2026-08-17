@@ -5,6 +5,7 @@
 #include "Magnetic.h"
 #include "Mas.h"
 #include "Utils.h"
+#include "support/Painter.h"
 #include <BRepBuilderAPI_Transform.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
@@ -29,6 +30,52 @@ static void printUsage(const char* prog) {
                  "default is the fast drawing compound\n"
               << "  --segments <N>        Wire+core polygon segments (0 = exact analytic curves)\n"
               << "  -h, --help            Show this help\n";
+}
+
+
+// ABT #685 (Alf, 2026-08-17): "always produce step and 2D SVG together." The 2D view is the
+// faster diagnosis for most 3D faults -- a wrap collision is usually a layout problem visible
+// in the cross-section -- so the STEP never ships without it. Painted from the SAME enriched
+// magnetic the 3D was built from, so the two cannot describe different coils.
+//
+// Failures here are reported and swallowed: a projection the Painter does not implement for
+// this core (the whole-magnetic views are two-piece-set + rectangular-window only) must not
+// cost the caller the STEP it asked for.
+static void paintProjections(const MAS::Magnetic& rawMagnetic, bool useRealWinding,
+                             const fs::path& stepPath) {
+    using OpenMagnetics::Painter;
+    using OpenMagnetics::PainterProjection;
+    OpenMagnetics::Magnetic magnetic;
+    try {
+        auto enriched = useRealWinding
+            ? mvb::magnetic_autocomplete_safe(nlohmann::json(rawMagnetic), true)
+            : mvb::magnetic_autocomplete_safe(nlohmann::json(rawMagnetic));
+        magnetic = enriched;
+    } catch (const std::exception& e) {
+        std::cerr << "2D painter: could not enrich for painting: " << e.what() << "\n";
+        return;
+    }
+    const std::vector<std::pair<PainterProjection, std::string>> views{
+        {PainterProjection::XY, ""},          // the winding-window cross-section
+        {PainterProjection::XZ, ".top"},      // looking down the column: lanes and bumps
+    };
+    for (const auto& [projection, suffix] : views) {
+        fs::path svg = stepPath;
+        svg.replace_extension("");
+        svg += suffix + std::string(".svg");
+        try {
+            fs::remove(svg);
+            Painter painter(svg);
+            painter.paint_magnetic(magnetic, projection);
+            painter.export_svg();
+            if (fs::exists(svg)) {
+                std::cout << "Generated: " << svg << "\n";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "2D painter (" << (suffix.empty() ? "XY" : "XZ") << "): " << e.what()
+                      << "\n";
+        }
+    }
 }
 
 static bool processFile(const fs::path& inputPath, const fs::path& outputPath, bool useMkf,
@@ -125,6 +172,7 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
                 fs::rename(generated, outputPath);
             }
             std::cout << "Generated: " << outputPath << "\n";
+            paintProjections(magnetic, useRealWinding, outputPath);
             return true;
         } else {
             std::cerr << "Failed to generate STEP for " << inputPath << "\n";
