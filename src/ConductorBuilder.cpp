@@ -3427,8 +3427,8 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
     // A sweep short enough to live entirely inside the -Z half is emitted raised end to end:
     // both its ends are station-side, already inside the raised region, so no riser is due.
     if (azEnd - azStart <= kPi + 1e-9) {
-        pushPiece(azStart, azEnd, radiusAt(azStart) + c, radiusAt(azEnd) + c, y0, y1, false,
-                  " (over dragback)");
+        pushPiece(azStart, azEnd, radiusAt(azStart), radiusAt(azEnd), y0, y1, false,
+                  " (over dragback)", -c);
         return;
     }
     // Full wrap: raised head [station .. XY plane at x=-r], level +Z half [exactly pi..2pi in
@@ -3446,7 +3446,7 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
     // The riser at a plane crossing: straight along z, from the raised half's endpoint to the
     // level half's endpoint (or back), length exactly `raise`.
     auto pushRiser = [&](double az, double rAt, double yAt, bool up) {
-        const gp_Pnt raised = azPointC(0, 0.0, rAt + c, yAt, az);
+        const gp_Pnt raised = azPointC(0, -c, rAt, yAt, az);
         const gp_Pnt level = azPointC(0, 0.0, rAt, yAt, az);
         Primitive pr;
         pr.kind = Primitive::SEG;
@@ -3456,14 +3456,14 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
         pr.isConnection = isConnection;
         path.prims.push_back(std::move(pr));
     };
-    pushPiece(azStart, aHead, radiusAt(azStart) + c, radiusAt(aHead) + c, heightAt(azStart),
-              heightAt(aHead), false, " (over dragback)");
+    pushPiece(azStart, aHead, radiusAt(azStart), radiusAt(aHead), heightAt(azStart),
+              heightAt(aHead), false, " (over dragback)", -c);
     pushRiser(aHead, radiusAt(aHead), heightAt(aHead), /*up=*/true);
     pushPiece(aHead, aTail, radiusAt(aHead), radiusAt(aTail), heightAt(aHead), heightAt(aTail),
               false, "");
     pushRiser(aTail, radiusAt(aTail), heightAt(aTail), /*up=*/false);
-    pushPiece(aTail, azEnd, radiusAt(aTail) + c, radiusAt(azEnd) + c, heightAt(aTail), y1, false,
-              " (over dragback)");
+    pushPiece(aTail, azEnd, radiusAt(aTail), radiusAt(azEnd), heightAt(aTail), y1, false,
+              " (over dragback)", -c);
 }
 
 // azS / azE are the CROSSING azimuths at the wrap's two stations: kPlaneAz normally, a fan
@@ -3528,8 +3528,8 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         // does: the wire is pushed over one wire and carries on.
         Primitive step;
         step.kind = Primitive::SEG;
-        step.seg = {azPointC(0, 0, s.x + rsRaise, s.y, azS),
-                    azPointC(0, 0, n.x + reRaise, s.y, azS)};
+        step.seg = {azPointC(0, -rsRaise, s.x, s.y, azS),
+                    azPointC(0, -reRaise, n.x, s.y, azS)};
         step.label = label + " (layer link)";
         if (std::getenv("MVB_PATH_DUMP")) {
             std::fprintf(stderr,
@@ -3581,8 +3581,8 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
     auto pushStub = [&](double az0, double az1, double raise) {
         Primitive stub;
         stub.kind = Primitive::SEG;
-        stub.seg = {azPointC(0, 0, radiusAtAz(az0) + raise, heightAtAz(az0), az0),
-                    azPointC(0, 0, radiusAtAz(az1) + raise, heightAtAz(az1), az1)};
+        stub.seg = {azPointC(0, -raise, radiusAtAz(az0), heightAtAz(az0), az0),
+                    azPointC(0, -raise, radiusAtAz(az1), heightAtAz(az1), az1)};
         stub.label = label + " (terminal stub)";
         stub.turnOrdinal = ordinal;
         stub.isConnection = false;
@@ -3775,7 +3775,7 @@ void appendZDragback(ConductorPath& path, const PlanePt& s, const PlanePt& n, do
     // same radius, z dropped by raise) on the SAME bump lists, so chain and wraps meet at identical
     // points.
     const double chainRaise = tallestBumpColumn(bumpsOut).first;
-    const gp_Pnt pS = azPointC(0, 0, s.x + chainRaise, s.y, azD);
+    const gp_Pnt pS = azPointC(0, -chainRaise, s.x, s.y, azD);
     // The turn this return FEEDS rides over it, exactly as every turn at or outside the return's
     // radius does: its first station therefore sits one wire OD further out than the bare layer
     // radius. bumpsIn comes from the WINDOW-WIDE pre-scan and already CONTAINS this return (it is
@@ -3787,14 +3787,40 @@ void appendZDragback(ConductorPath& path, const PlanePt& s, const PlanePt& n, do
     // on that turn's ACTUAL start: the conformal assembler bridges an endpoint mismatch by GROWING
     // the piece, so a descent stopping at the bare station (one OD short of the lifted turn) grew
     // 1.58 mm further down, straight through the entrance lead.
+    // ABT #685 (Alf, 2026-08-17): "the dragback connection to the turns must always be radial";
+    // "the bump risers have to always be parallel to z axis". Both hold here, and they are
+    // different pieces, so they are emitted as different pieces.
+    //
+    // The DRAGBACK proper is the run-out, the descent and the run-in, all at ONE ride level:
+    // every point carries the same dropped centre, so each step's DIRECTION is exactly the
+    // radial unit at azD (measured: seg 0 = (-0.840, 0, -1.841) against a radial unit times
+    // its length of (-0.8398, 0, -1.8411)) or purely axial. Nothing there slides.
+    //
+    // The RIDE CHANGE from the source layer's raise to the destination's is not part of that
+    // chain: it is a bump riser, parallel to z by construction, and it was only ever mistaken
+    // for a dragback segment because it was appended to the same polyline and inherited its
+    // label. Naming it for what it is keeps the dragback's own segments radial without moving
+    // any copper. (Tried and reverted in between: making the whole ride RADIAL instead. It made
+    // the risers radial too, which is exactly what Alf rejected, and it bulged the rings
+    // outward into 13_current_sense's and 23_interleaved_llc's neighbours.)
     std::vector<gp_Pnt> direct{
         pS,
-        azPointC(0, 0, n.x + chainRaise, s.y, azD),
-        azPointC(0, 0, n.x + chainRaise, n.y, azD),
-        azPointC(0, 0, n.x + destRaise,  n.y, azD)};
+        azPointC(0, -chainRaise, n.x, s.y, azD),
+        azPointC(0, -chainRaise, n.x, n.y, azD)};
     appendFilletedPolyline(path.prims, direct, wireRadius, label + " (dragback)", ordinal,
                            /*isLead=*/false, /*isConnection=*/true,
                            /*rounded=*/g_roundedLeadCorners || path.isRectangular);
+    const gp_Pnt rideFrom = azPointC(0, -chainRaise, n.x, n.y, azD);
+    const gp_Pnt rideTo = azPointC(0, -destRaise, n.x, n.y, azD);
+    if (rideFrom.Distance(rideTo) > 1e-12) {
+        Primitive riser;
+        riser.kind = Primitive::SEG;
+        riser.seg = {rideFrom, rideTo};
+        riser.label = label + " (bump riser)";
+        riser.turnOrdinal = ordinal;
+        riser.isConnection = true;
+        path.prims.push_back(std::move(riser));
+    }
 }
 
 std::vector<Primitive> buildZEndRun(const PlanePt& s, const PlanePt& n, double azA, double azOff,
@@ -6638,7 +6664,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     // so #618's protection is unchanged where it actually applies.
                     const double liftHere = raiseAt ? raiseAt(kept[i].x) : liftRaise;
                     if (liftHere > 0.0)
-                        leadPts[i] = azPointC(0, 0, kept[i].x + zoff + liftHere,
+                        leadPts[i] = azPointC(0, -liftHere, kept[i].x + zoff,
                                               kept[i].y, azLead);
                 }
                 // The terminal RUN is a totally straight wire PARALLEL TO THE Z AXIS
