@@ -3776,14 +3776,18 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
     // wire advances (y1 - y0) while turning (azEnd - azStart), so per full revolution it advances
     // pitch = (y1 - y0) * 2pi / (azEnd - azStart) at radius r, and tan(theta) = pitch / (2 pi r).
     // The lane it rides is crossed at that angle, so the clearance it needs is D / cos(theta).
-    const double sweptAz = azEnd - azStart;
-    const double meanR = 0.5 * (r0 + r1);
-    double cosTheta = 1.0;
-    if (std::abs(sweptAz) > 1e-9 && meanR > 1e-9) {
-        const double pitch = (y1 - y0) * kTwoPi / sweptAz;
-        cosTheta = 1.0 / std::sqrt(1.0 + (pitch / (kTwoPi * meanR)) * (pitch / (kTwoPi * meanR)));
-    }
-    const double raise = tallestBumpColumn(bumps, cosTheta).first;
+    // NO PITCH PROJECTION (ABT #685, Alf 2026-08-19: "I thought the D/cos(theta) rule was for
+    // the bump in the XY plane" -- it was, and the geometry agrees). The exact line-line distance
+    // between the riding wire (direction cos(t)*tangential + sin(t)*axial) and the lane's AXIAL
+    // leg is |delta . (yHat x tHat) cos(t)| / |cos(t) (yHat x tHat)|: the helix cosine divides
+    // out, so a horizontal displacement D clears the vertical by exactly D at any pitch. The
+    // cosine that genuinely belongs to the bump is the OFF-PLANE one inside tallestBumpColumn
+    // (a -z displacement reaches a lane phi off the YZ plane with only D cos(phi)), which stays.
+    // Dividing by the per-wrap pitch cosine did two harms and no good: it over-cleared the very
+    // pairs it was meant for, and -- because every wrap's pitch differs -- it de-quantised the
+    // ride stack (raises 2.151126 vs 2.151102 mm on adjacent transitions of 06_llc), feeding
+    // nanometre jitter into clearance budgets that are exact-touch multiples of the coated OD.
+    const double raise = tallestBumpColumn(bumps).first;
     if (raise <= 0.0) {
         // A full revolution at CONSTANT radius and height (the first turn of a U layer -- see
         // appendRoundWrap) is a CLOSED circle: swept whole it makes a periodic surface with a
