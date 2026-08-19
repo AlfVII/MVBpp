@@ -4083,11 +4083,32 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
     auto radiusAtAz = [&](double az) {
         return s.x + (n.x - s.x) * ((az - azS) / sweepSpan);
     };
+    // ARC STUB (ABT #685, Alf 2026-08-20: "make the stub just curve -- same diameter as the
+    // turn it is connected to, same curvature"). The stub is an ARC OF THE TURN'S OWN CIRCLE:
+    // same radius, same raise, same helix profile. It cannot collide with anything the turn
+    // itself does not -- unlike the two straight constructions it replaces. The CHORD (both
+    // ends on the ring) is a secant whose interior sags inside the ring by up to rw^2/2r
+    // (certified 7-10 nm into the od-spaced inner turn); the TANGENT (straight out of the ring)
+    // moves the terminal r*(1/cos(stubAz)-1) outward, which on fat wire (168 um at rw/r = 0.083)
+    // exceeds the interleaved corridor slack outright (pushpull: 136 um into the sibling's ring
+    // copper). The lead now mitres straight-against-arc; the assembler's junction machinery owns
+    // that seam, and the gate holds it to the same zero-tolerance as every other joint.
     auto pushStub = [&](double az0, double az1, double raise) {
+        const double y0s = heightAtAz(az0), y1s = heightAtAz(az1);
+        const double r0s = radiusAtAz(az0), r1s = radiusAtAz(az1);
         Primitive stub;
-        stub.kind = Primitive::SEG;
-        stub.seg = {azPointC(0, -raise, radiusAtAz(az0), heightAtAz(az0), az0),
-                    azPointC(0, -raise, radiusAtAz(az1), heightAtAz(az1), az1)};
+        if (std::abs(r1s - r0s) < 1e-12 && std::abs(y1s - y0s) < 1e-12) {
+            // Zero-pitch, constant radius: a plain circular arc -- the spiral machinery
+            // degenerates on it (same rule as appendBumpedSweep's pushPiece).
+            stub.kind = Primitive::ARC3;
+            stub.arc.c = gp_Pnt(0, y0s, -raise);
+            stub.arc.axis = gp_XYZ(0, 1, 0);
+            stub.arc.v0 = azPointC(0, -raise, r0s, y0s, az0).XYZ() - stub.arc.c.XYZ();
+            stub.arc.sweep = az1 - az0;
+        } else {
+            stub.kind = Primitive::SPIRAL;
+            stub.spiral = {0, -raise, r0s, y0s, az0, r1s, y1s, az1};
+        }
         stub.label = label + " (terminal stub)";
         stub.turnOrdinal = ordinal;
         stub.isConnection = false;
