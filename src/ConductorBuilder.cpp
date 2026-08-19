@@ -4084,7 +4084,12 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         return s.x + (n.x - s.x) * ((az - azS) / sweepSpan);
     };
     // ARC STUB (ABT #685, Alf 2026-08-20: "make the stub just curve -- same diameter as the
-    // turn it is connected to, same curvature"). The stub is an ARC OF THE TURN'S OWN CIRCLE:
+    // turn it is connected to, same curvature"). ROUND COLUMNS ONLY -- Alf, 2026-08-20: "the
+    // old corner with straight stub will be needed for rectangular columns". On a rect column
+    // the terminal region of a turn is a STRAIGHT face, so a straight stub is exact there
+    // (straight-to-straight mitre, no sagitta -- the sag only exists against a curved body);
+    // that construction lives in appendRectWrap / rectLeadCornerPrim and stays.
+    // The stub here is an ARC OF THE TURN'S OWN CIRCLE:
     // same radius, same raise, same helix profile. It cannot collide with anything the turn
     // itself does not -- unlike the two straight constructions it replaces. The CHORD (both
     // ends on the ring) is a secant whose interior sags inside the ring by up to rw^2/2r
