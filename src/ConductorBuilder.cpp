@@ -3857,6 +3857,9 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
     // ride stack (raises 2.151126 vs 2.151102 mm on adjacent transitions of 06_llc), feeding
     // nanometre jitter into clearance budgets that are exact-touch multiples of the coated OD.
     const double raise = tallestBumpColumn(bumps).first;
+    if (std::getenv("MVB_RAISE_DIAG") && raise > 0.0)
+        std::fprintf(stderr, "[raise] wrap '%s' raise=%.9f (bumps=%zu)\n", label.c_str(),
+                     raise, bumps.size());
     if (raise <= 0.0) {
         // A full revolution at CONSTANT radius and height (the first turn of a U layer -- see
         // appendRoundWrap) is a CLOSED circle: swept whole it makes a periodic surface with a
@@ -4091,12 +4094,18 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         path.prims.push_back(std::move(stub));
     };
     if (azFrom > azS) {
+        if (std::getenv("MVB_RAISE_DIAG"))
+            std::fprintf(stderr, "[raise] stub-start '%s' raise=%.9f (bumps=%zu)\n",
+                         label.c_str(), tallestBumpColumn(bumps).first, bumps.size());
         pushStub(azS, azFrom, tallestBumpColumn(bumps).first);
     }
     appendBumpedSweep(path, radiusAtAz(azFrom), heightAtAz(azFrom), azFrom, radiusAtAz(azTo),
                       heightAtAz(azTo), azTo, bumps, wireRadius, label, ordinal,
                       /*isConnection=*/false);
     if (azTo < azE + kTwoPi) {
+        if (std::getenv("MVB_RAISE_DIAG"))
+            std::fprintf(stderr, "[raise] stub-end '%s' raise=%.9f (bumpsEnd=%zu)\n",
+                         label.c_str(), tallestBumpColumn(bumpsEnd).first, bumpsEnd.size());
         pushStub(azTo, azE + kTwoPi, tallestBumpColumn(bumpsEnd).first);
     }
 }
@@ -4482,6 +4491,10 @@ struct RectStation {
 RectStation rectStation(const PlanePt& p, double halfW, double halfD, double minBend,
                         const std::string& who) {
     double clearance = p.x - halfW;
+    if (std::getenv("MVB_RECT_DIAG")) {
+        std::fprintf(stderr, "[rectStation] %s p.x=%.6f halfW=%.6f halfD=%.6f minBend=%.6f clearance=%.6f\n",
+                     who.c_str(), p.x, halfW, halfD, minBend, clearance);
+    }
     if (clearance <= 0.0) {
         throw std::runtime_error(
             "ConductorBuilder: crossing radial position " + std::to_string(p.x) +
@@ -4511,6 +4524,27 @@ RectStation rectStation(const PlanePt& p, double halfW, double halfD, double min
 // (isReturn): chainRide = displacement of the DESCENT's face (returns of deeper levels
 // only), destRide = displacement of the destination crossing (own level included), xSlot =
 // this conductor's descent lane on the face.
+// The end-cut a descent slot takes from a rising turn's path (stadium: the cap arc to the
+// slot azimuth; rect: the straight from the slot to the crossing). Shared by the wrap and by
+// the callers that need the pitch-true attach height before the wrap is emitted.
+double rectRisingEndCut(const RectStation& s0, double stopAtX) {
+    if (std::isnan(stopAtX)) return 0.0;
+    const bool stadium = s0.segX < 1e-12;
+    if (stadium) {
+        return s0.cornerR * std::asin(std::min(1.0, std::max(0.0, stopAtX) / s0.cornerR));
+    }
+    return stopAtX;
+}
+
+// A rising rect turn's travelled path length (straights + corner arcs + ride extensions,
+// minus the lead/descent cuts). Must stay in lockstep with appendRectWrap's emission.
+double rectRisingLength(const RectStation& s0, double ride0, double rideBack0, double endCut,
+                        double begX) {
+    const double q = 0.5 * kPi * s0.cornerR;
+    return 4.0 * s0.segX + 4.0 * s0.segZ + 2.0 * ride0 + 2.0 * rideBack0 + 4.0 * q - endCut -
+           begX;
+}
+
 void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStation& s1,
                     const std::string& label, size_t ordinal, double wireRadius,
                     double ride0, double rideBack0, bool isReturn, double chainRide,
@@ -4526,7 +4560,13 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                     // (stub up beside the source's extreme turn, run outward at the band over the
                     // band-blocked intervening sections, drop onto the receiving section's first
                     // turn). NaN = adjacent-layer chain (the classic face-level dragback).
-                    double bandY = std::numeric_limits<double>::quiet_NaN()) {
+                    double bandY = std::numeric_limits<double>::quiet_NaN(),
+                    // Pitch-true bookkeeping (ABT #685/#831, the rect twin of the round side's
+                    // attach heights): the rising branch reports where its climb ACTUALLY ends
+                    // (one endCut share short of s1.y when a descent slot cuts the path), and a
+                    // return chain starts at the height the preceding rising wrap delivered.
+                    double* riseEndYOut = nullptr,
+                    double chainStartY = std::numeric_limits<double>::quiet_NaN()) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -4612,8 +4652,7 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                 "ConductorBuilder: entrance corner offset " + std::to_string(begX) +
                 " m lies outside the -Z face straight of " + label);
         const double endCut = stadium ? s0.cornerR * stadiumTheta : endX;
-        const double L = 4.0 * s0.segX + 4.0 * s0.segZ + 2.0 * ride0 + 2.0 * rideBack0 +
-                         4.0 * q - endCut - begX;
+        const double L = rectRisingLength(s0, ride0, rideBack0, endCut, begX);
         if (L < 1e-12) {
             throw std::runtime_error(
                 "ConductorBuilder: rect turn of " + label +
@@ -4628,7 +4667,22 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                 rideBack0, endCut, begX);
         }
         double arc = 0.0;
-        auto yAt = [&](double at) { return s0.y + dy * at / L; };
+        // PITCH-TRUE PROFILE (ABT #685/#831, the rect twin of the round A2 fix): the climb rate
+        // is the turn's advance over its FULL path -- straights, corners, ride extensions, AND
+        // the pieces the lead slot (begX) or a descent slot (endCut) take away. Climbing the
+        // whole dy over only the travelled remainder made a slot-shortened wrap a steeper helix
+        // than its siblings', and MKF's stations only fund the full-path slope: parallel 1's
+        // lead-slotted entrance wrap ran 0.0689 against the layer's 0.0649 on isolated_buck and
+        // met its sibling 145 nm inside the coated envelope at the face crossing. The wrap now
+        // starts begX-share above its station (where the full-path helix truly is at the slot --
+        // the lead attaches there, exactly like the round side's entranceAttachY) and ends
+        // endCut-share short of s1.y (the descent chain starts there and covers the rest).
+        const double Lplain = L + begX + endCut;
+        const double slopeBand = dy / Lplain;
+        auto yAt = [&](double at) { return s0.y + slopeBand * (begX + at); };
+        if (riseEndYOut) {
+            *riseEndYOut = yAt(L);
+        }
         auto riseSeg = [&](double ax, double az2, double bx, double bz2, double len,
                            const char* what) {
             pushSeg(gp_Pnt(ax, yAt(arc), az2), gp_Pnt(bx, yAt(arc + len), bz2), what);
@@ -4681,6 +4735,10 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
     // to the next crossing. Everything wound at or outside the destination depth rides one
     // OD further out (the reservation), so the descent always has its own free face.
     {
+        // Pitch-true chain start: the preceding rising wrap delivered the wire endCut-share
+        // short of this station's height; the chain's level runs carry that height and the
+        // axial descent absorbs the difference (it descends anyway).
+        const double yChain = std::isnan(chainStartY) ? y : chainStartY;
         const double zDesc = s1.zPos + chainRide;   // the descent's face depth
         const double zDest = s1.zPos + destRide;    // the destination crossing's depth
         // The chain STARTS at the slot: the preceding rising turn already ends there
@@ -4699,15 +4757,15 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             // adjacent to the band and the receiving section's first turn just under it, so
             // the stubs are stumps; the run crosses the intervening sections at the band row,
             // where MKF blocked their turns one OD below — clearance is the model's own.
-            pts.insert(pts.end(), {gp_Pnt(xSlot, y, -(zN0 - slotSag)),
+            pts.insert(pts.end(), {gp_Pnt(xSlot, yChain, -(zN0 - slotSag)),
                                     gp_Pnt(xSlot, bandY, -(zN0 - slotSag)),
                                     gp_Pnt(xSlot, bandY, -zDest),
                                     gp_Pnt(xSlot, s1.y, -zDest),
                                     gp_Pnt(0, s1.y, -zDest)});
         }
         else {
-            pts.insert(pts.end(), {gp_Pnt(xSlot, y, -(zN0 - slotSag)),
-                                    gp_Pnt(xSlot, y, -zDesc),
+            pts.insert(pts.end(), {gp_Pnt(xSlot, yChain, -(zN0 - slotSag)),
+                                    gp_Pnt(xSlot, yChain, -zDesc),
                                     gp_Pnt(xSlot, s1.y, -zDesc),
                                     gp_Pnt(xSlot, s1.y, -zDest),
                                     gp_Pnt(0, s1.y, -zDest)});
@@ -8797,6 +8855,44 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             std::vector<PlanePt> wp;
             std::optional<RectStation> entranceCorner;
             double entranceCornerRide = 0.0;
+            // RECT PITCH-TRUE ENTRANCE (ABT #685/#831, the rect twin of entranceAttachY): the
+            // first rising wrap starts a lead slot (and, for rect wire, a corner radius) along
+            // its own path, where the full-path helix is begX-share above the station. The lead
+            // must attach THERE: attaching at the bare station made the wrap climb its whole
+            // advance over the shortened remainder -- a steeper helix than its siblings', 145 nm
+            // inside the coated envelope at the face crossing on isolated_buck.
+            double rectEntranceAttachY = std::numeric_limits<double>::quiet_NaN();
+            if (rectFamily && turns.size() > 1) {
+                bool ret0e = false;
+                const RectReturn* nextRet0 = nullptr;
+                for (const auto& r : rectReturns) {
+                    if (r.ci == ci && r.trans == 0) ret0e = true;
+                    if (r.ci == ci && r.trans == 1) nextRet0 = &r;
+                }
+                if (!ret0e && !rectTangential.count({ci, 0})) {
+                    const RectStation rsE =
+                        rectStation(first, rectHalfW, rectHalfD, minBend, path.name);
+                    const RectStation rsE1 = rectStation(station(turns[1]), rectHalfW,
+                                                         rectHalfD, minBend, path.name);
+                    const int sideE = windingFace.at(ct.winding);
+                    const double leadSlotE = leadSlotOf.count(ci) ? leadSlotOf.at(ci) : 0.0;
+                    const double begX0 = (rectWire ? rsE.cornerR : 0.0) + leadSlotE;
+                    const double stopX0 =
+                        nextRet0 ? nextRet0->xSlot
+                                 : (rectWire && turns.size() == 2
+                                        ? rsE1.cornerR
+                                        : std::numeric_limits<double>::quiet_NaN());
+                    if (begX0 > 1e-12) {
+                        const double endCut0 = rectRisingEndCut(rsE, stopX0);
+                        const double L0 = rectRisingLength(
+                            rsE, rectRideFor(rsE.zPos, sideE),
+                            rectRideFor(rsE.zPos, 1 - sideE), endCut0, begX0);
+                        const double dy0 = station(turns[1]).y - first.y;
+                        rectEntranceAttachY =
+                            first.y + dy0 * begX0 / (L0 + begX0 + endCut0);
+                    }
+                }
+            }
             if (effectivelyRound && rectWire) {
                 // The tangent corner replaces the straight radial attach; it is only
                 // defined for MKF routes WITHOUT a vertical connection. If MKF draws an
@@ -8816,7 +8912,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // step between corner and wrap in the spine (7 um on 03_buck), and the rect
                 // single-body MakePipeShell refuses a discontinuous spine.
                 PlanePt firstAttach = first;
-                if (!std::isnan(entranceAttachY)) {
+                if (!std::isnan(rectEntranceAttachY)) {
+                    firstAttach.y = rectEntranceAttachY;   // rect pitch-true attach (above)
+                } else if (!std::isnan(entranceAttachY)) {
                     firstAttach.y = entranceAttachY;
                 }
                 rectLeadCorner(firstAttach, azEntrance, /*isExit=*/false, sIn, "entrance lead");
@@ -8852,7 +8950,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         fLead.x += rsF.cornerR;
                     }
                 }
-                if (!std::isnan(entranceAttachY)) {
+                if (!std::isnan(rectEntranceAttachY)) {
+                    fLead.y = rectEntranceAttachY;   // rect pitch-true attach (above)
+                } else if (!std::isnan(entranceAttachY)) {
                     fLead.y = entranceAttachY;
                 }
                 wp = terminalWaypoints(entranceGroup, fLead, path.name + " entrance");
@@ -8875,7 +8975,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               rectFamily && leadSlotOf.count(ci) ? -leadSlotOf.at(ci) : 0.0);
             }
             if (entranceCorner)
-                rectLeadCornerPrim(*entranceCorner, entranceCornerRide, first.y,
+                rectLeadCornerPrim(*entranceCorner, entranceCornerRide,
+                                   std::isnan(rectEntranceAttachY) ? first.y
+                                                                   : rectEntranceAttachY,
                                    /*isExit=*/false, 0);
         }
         const bool dragDiag = std::getenv("MVB_DRAG_DIAG") != nullptr;
@@ -8885,6 +8987,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // ABT #685 (A2): pitch-true landing heights, keyed by the landing turn's index -- set
         // where the dragback is emitted, consumed by the landing wrap's start (see below).
         std::map<size_t, double> landingAttach;
+        // ABT #685/#831 (rect): where each rising rect wrap ACTUALLY ended (pitch-true, one
+        // endCut share short of the station when a descent slot cut its path) -- consumed by
+        // the following return's chain start and the exit lead corner.
+        std::map<size_t, double> rectRiseEndY;
         for (size_t i = 0; i + 1 < nEmit; ++i) {
             PlanePt s = station(turns[i]);
             PlanePt nxt = station(turns[i + 1]);
@@ -9061,6 +9167,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     const double startX = (i == 0 && !ret)
                                               ? (rw ? rs0.cornerR : 0.0) + leadSlot
                                               : kNaN;
+                    double ringEndY = std::numeric_limits<double>::quiet_NaN();
                     if (ret) {
                         // SINGLE-TURN LAYER (Alf, 26_psps: "layers 12 13 14 not drawn"): a
                         // return draws the CHAIN only, on the assumption the preceding rising
@@ -9076,13 +9183,31 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                             appendRectWrap(path, rs0, rs0, label + " (lone-turn ring)", i,
                                            wireRadius, rectRideFor(rs0.zPos, side),
                                            rectRideFor(rs0.zPos, 1 - side), false,
-                                           0.0, 0.0, 0.0, /*stopAtX=*/xSlot, kNaN, kNaN);
+                                           0.0, 0.0, 0.0, /*stopAtX=*/xSlot, kNaN, kNaN,
+                                           &ringEndY);
                         }
                     }
+                    // Pitch-true joins (ABT #685/#831): a return's chain starts where the wire
+                    // actually arrived -- the just-laid ring's end, or the preceding rising
+                    // wrap's recorded end; a rising wrap reports its own end for the next one.
+                    double chainStartY = std::numeric_limits<double>::quiet_NaN();
+                    if (ret) {
+                        if (!std::isnan(ringEndY)) {
+                            chainStartY = ringEndY;
+                        } else if (auto reIt = rectRiseEndY.find(i - 1);
+                                   i > 0 && reIt != rectRiseEndY.end()) {
+                            chainStartY = reIt->second;
+                        }
+                    }
+                    double riseEndY = std::numeric_limits<double>::quiet_NaN();
                     appendRectWrap(path, rs0, rs1, label, i, wireRadius,
                                    rectRideFor(rs0.zPos, side),
                                    rectRideFor(rs0.zPos, 1 - side), ret != nullptr,
-                                   chainRide, destRide, xSlot, stopX, startX, bandY);
+                                   chainRide, destRide, xSlot, stopX, startX, bandY,
+                                   ret ? nullptr : &riseEndY, chainStartY);
+                    if (!ret && !std::isnan(riseEndY)) {
+                        rectRiseEndY[i] = riseEndY;
+                    }
                 }
             } else {
                 // Unreachable: effectivelyRound covers ROUND and degenerate oblong; rectFamily
@@ -9130,7 +9255,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               (kTwoPi * std::max(station(turns[nEmit - 1]).x, 1e-9))
                         : 0.0;
                 PlanePt lastAttach = last;
-                if (!std::isnan(exitAttachY)) {
+                if (auto reIt = rectRiseEndY.find(nEmit - 2);
+                    nEmit > 1 && reIt != rectRiseEndY.end() &&
+                    std::abs(reIt->second - last.y) > 1e-12) {
+                    lastAttach.y = reIt->second;   // rect pitch-true end (slot-shortened wrap)
+                } else if (!std::isnan(exitAttachY)) {
                     lastAttach.y = exitAttachY;   // the stretched wrap's true end height
                 }
                 rectLeadCorner(lastAttach, azExit, /*isExit=*/true, sOut, "exit lead");
@@ -9148,7 +9277,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     for (const auto& r : rectReturns)
                         if (r.ci == ci && r.trans + 2 == nEmit) retLast = true;
                     if (rectWire && nEmit > 1 && !retLast) {
-                        rectLeadCornerPrim(rsL, rideL, last.y, /*isExit=*/true, nEmit - 1);
+                        double exitRowY = last.y;
+                        if (auto reIt = rectRiseEndY.find(nEmit - 2);
+                            reIt != rectRiseEndY.end()) {
+                            exitRowY = reIt->second;   // rect pitch-true end (see above)
+                        }
+                        rectLeadCornerPrim(rsL, rideL, exitRowY, /*isExit=*/true, nEmit - 1);
                         lLead.x += rsL.cornerR;
                     }
                 }
