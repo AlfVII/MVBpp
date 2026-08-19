@@ -684,6 +684,30 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                                     cert::provePairClears(pa, pb, coatedEnvelope);
                                 if (!verdict.clears) {
                                     ++coatedIntrusions;
+                                    if (std::getenv("MVB_ENAMEL_LIST")) {
+                                        const gp_Pnt qa = cert::evalPrim(pa, verdict.tA);
+                                        const gp_Pnt qb = cert::evalPrim(pb, verdict.tB);
+                                        std::fprintf(stderr,
+                                            "[enamel-pair] depth=%.4fnm  %s '%s' t=%.6f "
+                                            "(%.6f,%.6f,%.6f) vs %s '%s' t=%.6f (%.6f,%.6f,%.6f)\n",
+                                            (coatedEnvelope - verdict.violationUB) * 1e9,
+                                            A.name.c_str(), pa.label.c_str(), verdict.tA,
+                                            qa.X()*1e3, qa.Y()*1e3, qa.Z()*1e3,
+                                            B.name.c_str(), pb.label.c_str(), verdict.tB,
+                                            qb.X()*1e3, qb.Y()*1e3, qb.Z()*1e3);
+                                        auto spDump = [](const char* tag, const Primitive& pr) {
+                                            if (pr.kind != Primitive::SPIRAL) return;
+                                            std::fprintf(stderr,
+                                                "[enamel-prim] %s SPIRAL az=[%.12f,%.12f] "
+                                                "r=[%.12f,%.12f] y=[%.12f,%.12f] c=[%.12f,%.12f]\n",
+                                                tag, pr.spiral.az0, pr.spiral.az1,
+                                                pr.spiral.r0*1e3, pr.spiral.r1*1e3,
+                                                pr.spiral.y0*1e3, pr.spiral.y1*1e3,
+                                                pr.spiral.cx*1e3, pr.spiral.cz*1e3);
+                                        };
+                                        spDump("A", pa);
+                                        spDump("B", pb);
+                                    }
                                     if (verdict.violationUB < worstCoatedGap) {
                                         worstCoatedGap = verdict.violationUB;
                                         worstCoatedEnvelope = coatedEnvelope;
