@@ -9060,7 +9060,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                             landingAttach[i + 1] = nDest.y;
                         }
                     }
-                    appendZDragback(path, s, nDest, wireRadius, zit->second, label, i,
+                    // ABT #685 (A5): pitch-true SOURCE -- the preceding wrap now ENDS at the
+                    // band helix's height at this slot (see the endY stretch above), so the
+                    // chain starts there. Same formula from this side: the source layer's grid
+                    // advance, the slot's plane offset.
+                    PlanePt sSrc = s;
+                    if (i > 0) {
+                        const PlanePt before = station(turns[i - 1]);
+                        if (std::abs(before.x - s.x) <= wireRadius &&
+                            std::abs(crossAz[i] - kPlaneAz) > 1e-9) {
+                            const double rem =
+                                std::remainder(crossAz[i] - kPlaneAz, kTwoPi);
+                            sSrc.y = s.y + (s.y - before.y) * rem / kTwoPi;
+                        }
+                    }
+                    appendZDragback(path, sSrc, nDest, wireRadius, zit->second, label, i,
                                     bumpsForTurn(s.x), bumpsForTurn(nxt.x));
                     continue;
                 }
@@ -9085,6 +9099,20 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     !(std::abs(nxt.x - s.x) > wireRadius)) {
                     endY = nxt.y + (nxt.y - s.y) * (crossAz[i + 1] - crossAz[i]) / kTwoPi;
                     exitAttachY = endY;
+                }
+                // ABT #685 (A5, 2026-08-20): the SAME pitch-true stretch for a wrap feeding a
+                // DRAGBACK -- the ending-side mirror of the pitch-true landing. The _ending
+                // station sits at its fan slot, so ending the wrap at the bare station height
+                // made it climb its grid advance over the fan-lengthened span -- a SHALLOWER
+                // helix than its siblings' -- and by the overshoot passage it had drifted
+                // band*rem (38 um on isolated_buckboost) below the K-filar family, eating the
+                // (advance - spacing) margin over the sibling's next wrap: certified 20.5 and
+                // 21.4 um. The wrap now ends where the band helix truly is at the slot; the
+                // dragback's source starts there (see the dragback branch).
+                else if (zDragbackAzimuth.count(i + 1) &&
+                         std::abs(crossAz[i + 1] - crossAz[i]) > 1e-9 &&
+                         !(std::abs(nxt.x - s.x) > wireRadius)) {
+                    endY = nxt.y + (nxt.y - s.y) * (crossAz[i + 1] - crossAz[i]) / kTwoPi;
                 }
                 PlanePt sWrap = s;
                 if (i == 0 && !std::isnan(entranceAttachY)) {
