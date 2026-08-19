@@ -136,6 +136,215 @@ constexpr double kMaxSagFraction = 0.02;
 // decision (vertical-fan slots, drift windows, lead corridors) demands precisely this.
 // At the CHECK, the measured distance is credited with the sampling sag bounds above, so
 // the gate throws exactly when copper overlap is certain beyond measurement resolution.
+// ---- CERTIFIED MINIMUM DISTANCE (ABT #685, Alf 2026-08-19: "no collisions at all, 0
+// nanometers of overlapping"). Sampled polyline distances can neither prove nor disprove an
+// overlap smaller than their sampling sag, and crediting that sag lets an optimiser park true
+// geometry inside the envelope by exactly the credit (measured: a spiral pair at 0.6785 mm
+// against a 0.6790 mm envelope -- 500 nm of real interpenetration -- passed every sampled
+// check). This engine bounds the true minimum distance between two analytic primitives by
+// branch and bound: each parameter interval is enclosed by its chord plus a rigorous sag bound
+// (max |p''| h^2 / 8 from the primitive's exact second derivative), giving a certain lower
+// bound; evaluated curve points give a certain upper bound. Intervals are split until one side
+// proves. kCertEpsilon is machine slack for the arithmetic itself -- one picometre -- not a
+// tolerance: any true deficit beyond it is reported.
+constexpr double kCertEpsilon = 1e-12;
+
+namespace cert {
+
+inline gp_Pnt evalPrim(const Primitive& pr, double t) {
+    switch (pr.kind) {
+        case Primitive::SEG:
+            return gp_Pnt(pr.seg.a.XYZ() + (pr.seg.b.XYZ() - pr.seg.a.XYZ()) * t);
+        case Primitive::ARC3: {
+            const gp_XYZ v = rotateXYZ(pr.arc.v0, pr.arc.axis, pr.arc.sweep * t);
+            return gp_Pnt(pr.arc.c.XYZ() + v);
+        }
+        case Primitive::SPIRAL: {
+            const double az = pr.spiral.az0 + (pr.spiral.az1 - pr.spiral.az0) * t;
+            const double r = pr.spiral.r0 + (pr.spiral.r1 - pr.spiral.r0) * t;
+            const double y = pr.spiral.y0 + (pr.spiral.y1 - pr.spiral.y0) * t;
+            return gp_Pnt(pr.spiral.cx + r * std::cos(az), y, pr.spiral.cz - r * std::sin(az));
+        }
+        default:
+            throw std::runtime_error("cert::evalPrim: unsupported primitive kind");
+    }
+}
+
+// max |d^2 p / dt^2| over the whole primitive (t in [0,1]) -- exact per kind, never a guess.
+inline double maxSecondDerivative(const Primitive& pr) {
+    switch (pr.kind) {
+        case Primitive::SEG:
+            return 0.0;
+        case Primitive::ARC3:
+            // p(t) = c + R(t.sweep) v0: |p''| = |v0| sweep^2
+            return pr.arc.v0.Modulus() * pr.arc.sweep * pr.arc.sweep;
+        case Primitive::SPIRAL: {
+            // p(t) = (r cos az, y, -r sin az), r and az linear in t, y linear (y'' = 0):
+            // p'' decomposes into an azimuthal part 2 dr S and a radial part r S^2 (orthogonal),
+            // S = az-span, dr = r1 - r0.
+            const double S = pr.spiral.az1 - pr.spiral.az0;
+            const double dr = pr.spiral.r1 - pr.spiral.r0;
+            const double rMax = std::max(std::abs(pr.spiral.r0), std::abs(pr.spiral.r1));
+            return std::sqrt(4.0 * dr * dr * S * S + rMax * rMax * S * S * S * S);
+        }
+        default:
+            throw std::runtime_error("cert::maxSecondDerivative: unsupported primitive kind");
+    }
+}
+
+inline double segSegDistance(const gp_Pnt& p1, const gp_Pnt& q1, const gp_Pnt& p2,
+                             const gp_Pnt& q2) {
+    // standard closed-form segment-segment minimum distance
+    const gp_XYZ d1 = q1.XYZ() - p1.XYZ(), d2 = q2.XYZ() - p2.XYZ(), r = p1.XYZ() - p2.XYZ();
+    const double a = d1.Dot(d1), e = d2.Dot(d2), f = d2.Dot(r);
+    double sN, tN;
+    if (a <= kCertEpsilon && e <= kCertEpsilon) return p1.Distance(p2);
+    if (a <= kCertEpsilon) {
+        sN = 0.0;
+        tN = std::clamp(f / e, 0.0, 1.0);
+    }
+    else {
+        const double c = d1.Dot(r);
+        if (e <= kCertEpsilon) {
+            tN = 0.0;
+            sN = std::clamp(-c / a, 0.0, 1.0);
+        }
+        else {
+            const double b = d1.Dot(d2), denom = a * e - b * b;
+            sN = denom > kCertEpsilon ? std::clamp((b * f - c * e) / denom, 0.0, 1.0) : 0.0;
+            tN = (b * sN + f) / e;
+            if (tN < 0.0) {
+                tN = 0.0;
+                sN = std::clamp(-c / a, 0.0, 1.0);
+            }
+            else if (tN > 1.0) {
+                tN = 1.0;
+                sN = std::clamp((b - c) / a, 0.0, 1.0);
+            }
+        }
+    }
+    const gp_Pnt c1(p1.XYZ() + d1 * sN), c2(p2.XYZ() + d2 * tN);
+    return c1.Distance(c2);
+}
+
+struct Verdict {
+    bool clears = false;        // proven: true minimum >= threshold - kCertEpsilon
+    double violationUB = 0.0;   // when !clears: an ACHIEVED distance below the threshold
+    double tA = 0.0, tB = 0.0;  // parameters of the violating points
+};
+
+// Prove min distance(A, B) >= threshold, or exhibit a violating point pair. Exact curves,
+// rigorous bounds, no sampling credit anywhere.
+inline Verdict provePairClears(const Primitive& A, const Primitive& B, double threshold) {
+    const double ddA = maxSecondDerivative(A), ddB = maxSecondDerivative(B);
+    struct Box {
+        double a0, a1, b0, b1;
+    };
+    std::vector<Box> work{{0.0, 1.0, 0.0, 1.0}};
+    Verdict v;
+    // Depth is bounded: the sag of an interval of width h is dd h^2 / 8, so it falls by 4x per
+    // split; from a metre-scale bound to kCertEpsilon takes ~20 levels, and the queue is pruned
+    // by the lower bound almost everywhere. The hard cap only guards against degenerate input.
+    for (size_t guard = 0; !work.empty() && guard < 4000000; ++guard) {
+        const Box bx = work.back();
+        work.pop_back();
+        const double hA = bx.a1 - bx.a0, hB = bx.b1 - bx.b0;
+        const double sagA = ddA * hA * hA / 8.0, sagB = ddB * hB * hB / 8.0;
+        const gp_Pnt a0 = evalPrim(A, bx.a0), a1 = evalPrim(A, bx.a1);
+        const gp_Pnt b0 = evalPrim(B, bx.b0), b1 = evalPrim(B, bx.b1);
+        const double lower = segSegDistance(a0, a1, b0, b1) - sagA - sagB;
+        if (lower >= threshold - kCertEpsilon) continue;   // this box proves itself
+        // achieved distances (points ON the curves) can certify a violation
+        const double am = 0.5 * (bx.a0 + bx.a1), bm = 0.5 * (bx.b0 + bx.b1);
+        const gp_Pnt aM = evalPrim(A, am), bM = evalPrim(B, bm);
+        const struct {
+            double d, ta, tb;
+        } cand[] = {{aM.Distance(bM), am, bm}, {a0.Distance(b0), bx.a0, bx.b0},
+                    {a1.Distance(b1), bx.a1, bx.b1}, {a0.Distance(bM), bx.a0, bm},
+                    {aM.Distance(b0), am, bx.b0}};
+        for (const auto& c : cand) {
+            if (c.d < threshold - kCertEpsilon) {
+                v.clears = false;
+                v.violationUB = c.d;
+                v.tA = c.ta;
+                v.tB = c.tb;
+                return v;
+            }
+        }
+        if (sagA <= kCertEpsilon && sagB <= kCertEpsilon) {
+            // Bounds are exact to machine precision and neither side resolves: the minimum sits
+            // within kCertEpsilon of the threshold. That is touching, which is allowed.
+            continue;
+        }
+        if (sagA >= sagB) {
+            work.push_back({bx.a0, am, bx.b0, bx.b1});
+            work.push_back({am, bx.a1, bx.b0, bx.b1});
+        }
+        else {
+            work.push_back({bx.a0, bx.a1, bx.b0, bm});
+            work.push_back({bx.a0, bx.a1, bm, bx.b1});
+        }
+    }
+    v.clears = true;
+    return v;
+}
+
+// Certified LOWER and UPPER bounds on the minimum distance, refined until they agree to tol or
+// the box budget runs out. The LB is the safe side: reporting it can only understate clearance,
+// never overstate it. Used by continuous refinement, where pass/fail alone cannot steer.
+struct Bounds {
+    double lb = 0.0, ub = std::numeric_limits<double>::max();
+};
+inline Bounds boundedMinDist(const Primitive& A, const Primitive& B, double tol, size_t budget) {
+    const double ddA = maxSecondDerivative(A), ddB = maxSecondDerivative(B);
+    struct Box {
+        double a0, a1, b0, b1, lb;
+    };
+    auto boxOf = [&](double a0, double a1, double b0, double b1) {
+        const double sagA = ddA * (a1 - a0) * (a1 - a0) / 8.0;
+        const double sagB = ddB * (b1 - b0) * (b1 - b0) / 8.0;
+        return Box{a0, a1, b0, b1,
+                   segSegDistance(evalPrim(A, a0), evalPrim(A, a1), evalPrim(B, b0),
+                                  evalPrim(B, b1)) -
+                       sagA - sagB};
+    };
+    std::vector<Box> boxes{boxOf(0.0, 1.0, 0.0, 1.0)};
+    Bounds out;
+    out.ub = evalPrim(A, 0.0).Distance(evalPrim(B, 0.0));
+    for (size_t n = 0; n < budget && !boxes.empty(); ++n) {
+        size_t best = 0;
+        for (size_t k = 1; k < boxes.size(); ++k)
+            if (boxes[k].lb < boxes[best].lb) best = k;
+        const Box bx = boxes[best];
+        boxes[best] = boxes.back();
+        boxes.pop_back();
+        out.lb = bx.lb;
+        const double am = 0.5 * (bx.a0 + bx.a1), bm = 0.5 * (bx.b0 + bx.b1);
+        out.ub = std::min(out.ub, evalPrim(A, am).Distance(evalPrim(B, bm)));
+        if (out.ub - bx.lb < tol) break;
+        const double sagA = ddA * (bx.a1 - bx.a0) * (bx.a1 - bx.a0) / 8.0;
+        const double sagB = ddB * (bx.b1 - bx.b0) * (bx.b1 - bx.b0) / 8.0;
+        if (sagA >= sagB) {
+            boxes.push_back(boxOf(bx.a0, am, bx.b0, bx.b1));
+            boxes.push_back(boxOf(am, bx.a1, bx.b0, bx.b1));
+        }
+        else {
+            boxes.push_back(boxOf(bx.a0, bx.a1, bx.b0, bm));
+            boxes.push_back(boxOf(bx.a0, bx.a1, bm, bx.b1));
+        }
+        for (const auto& b2 : boxes)
+            if (b2.lb < out.lb) out.lb = b2.lb;
+    }
+    if (!boxes.empty()) {
+        double m = std::numeric_limits<double>::max();
+        for (const auto& b2 : boxes) m = std::min(m, b2.lb);
+        out.lb = m;
+    }
+    return out;
+}
+
+}  // namespace cert
+
 constexpr double gateMinSeparation(double bareA, double bareB) {
     return bareA + bareB;
 }
@@ -342,10 +551,18 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
             for (const auto& pr : paths[ci].prims) {
                 gp_Pnt a, bEnd;
                 if (pr.kind == Primitive::SPIRAL) {
-                    std::fprintf(stderr, "[arc] ci=%zu '%s' SPIRAL az=[%.2f,%.2f] deg r=[%.4f,%.4f] y=[%.4f,%.4f]\n",
+                    // ABT #685 (Alf, 2026-08-18, zero tolerance): the CENTRE OFFSET must be in
+                    // the dump. A raised piece is the same circle with cz = -raise, so a reader
+                    // reconstructing its endpoints from (az, r, y) alone misplaces them by
+                    // exactly the raise -- which reads as a junction gap of exactly one riser
+                    // length at every riser, and sent me chasing 181 gaps that were not there.
+                    std::fprintf(stderr,
+                                 "[arc] ci=%zu '%s' SPIRAL az=[%.2f,%.2f] deg r=[%.4f,%.4f] "
+                                 "y=[%.4f,%.4f] c=[%.6f,%.6f]\n",
                                  ci, pr.label.c_str(), pr.spiral.az0 * 180 / kPi,
                                  pr.spiral.az1 * 180 / kPi, pr.spiral.r0 * 1e3, pr.spiral.r1 * 1e3,
-                                 pr.spiral.y0 * 1e3, pr.spiral.y1 * 1e3);
+                                 pr.spiral.y0 * 1e3, pr.spiral.y1 * 1e3,
+                                 pr.spiral.cx * 1e3, pr.spiral.cz * 1e3);
                     continue;
                 }
                 if (pr.kind == Primitive::ARC3) {
@@ -381,6 +598,17 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
         for (const auto& pr : paths[ci].prims)
             polys[ci].push_back(samplePrim(pr, paths[ci].wireRadius));
     }
+    // ENAMEL IS COPPER'S EQUAL HERE. ABT #685 (Alf, 2026-08-19: "they should NOT overlap
+    // enamel!"). The gate throws on the CONDUCTING envelope only -- that is what
+    // gateMinSeparation is -- so a design can pass with its insulation interpenetrating and
+    // nothing says a word. Measured on the buck inductor: 141 sampled pairs sat inside the coated
+    // envelope, the worst 0.6502 mm against 0.6790, which is 15 um of real overlap even after
+    // crediting both wires' sampling sag. Counted here and reported unconditionally, so no design
+    // can hide it again; whether it should THROW is a corpus-wide decision, not one to slip in.
+    size_t coatedIntrusions = 0, coatedUncertifiable = 0;
+    double worstCoatedGap = std::numeric_limits<double>::max();
+    double worstCoatedEnvelope = 0.0, worstUncertifiable = std::numeric_limits<double>::max();
+    std::string worstCoatedWhere;
     for (size_t ci = 0; ci < paths.size(); ++ci) {
         for (size_t cj = ci; cj < paths.size(); ++cj) {
             const auto& A = paths[ci];
@@ -431,6 +659,43 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                     }
                     if (ci == cj && shareEndpoint(pa, pb)) continue;
                     double d = polyPolyDistance(polys[ci][i], polys[cj][j]);
+                    {   // THE ENAMEL RULE, CERTIFIED (ABT #685, Alf: "0 nanometers of
+                        // overlapping"). The sampled distance d is only a pre-filter: when it
+                        // cannot vouch for the pair within the documented sampling bound, the
+                        // exact curves are proven clear -- or the violation is exhibited -- by
+                        // the branch-and-bound engine above. No credit is ever subtracted from
+                        // the envelope itself.
+                        const double coatedEnvelope = A.wireRadius + B.wireRadius;
+                        const double documentedSag =
+                            samplingSag(A.wireRadius) + samplingSag(B.wireRadius);
+                        const bool vouchedBySampling =
+                            d - documentedSag >= coatedEnvelope - kCertEpsilon;
+                        if (!vouchedBySampling && !rectPair) {
+                            const bool certifiable =
+                                pa.kind != Primitive::BLEND && pb.kind != Primitive::BLEND;
+                            if (!certifiable) {
+                                ++coatedUncertifiable;
+                                if (d < coatedEnvelope && d < worstUncertifiable) {
+                                    worstUncertifiable = d;
+                                }
+                            }
+                            else {
+                                const auto verdict =
+                                    cert::provePairClears(pa, pb, coatedEnvelope);
+                                if (!verdict.clears) {
+                                    ++coatedIntrusions;
+                                    if (verdict.violationUB < worstCoatedGap) {
+                                        worstCoatedGap = verdict.violationUB;
+                                        worstCoatedEnvelope = coatedEnvelope;
+                                        worstCoatedWhere = A.name + " '" + pa.label + "' (t=" +
+                                                           std::to_string(verdict.tA) + ") vs " +
+                                                           B.name + " '" + pb.label + "' (t=" +
+                                                           std::to_string(verdict.tB) + ")";
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if (std::getenv("MVB_GATE_DIAG") && d < minGap) {
                         // Closest sampled pair, so a reported overlap can be located in space.
                         double best = 1e30; gp_Pnt ba, bb;
@@ -508,6 +773,39 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                 }
             }
         }
+    }
+    if (coatedIntrusions > 0) {
+        // Certified violations: the branch-and-bound engine exhibited real points of the real
+        // curves closer than the coated envelope. Not a sampling artefact, not creditable.
+        std::ostringstream m;
+        m << "ConductorBuilder: enamel overlap, CERTIFIED -- " << coatedIntrusions
+          << " primitive pairs whose true curves come closer than their coated envelope; worst "
+          << worstCoatedGap << " m against " << worstCoatedEnvelope << " m ("
+          << (worstCoatedEnvelope - worstCoatedGap) * 1e9 << " nm of interpenetration): "
+          << worstCoatedWhere
+          << ". Wires may touch at their coated envelopes, never interpenetrate.";
+        if (std::getenv("MVB_ALLOW_ENAMEL")) {
+            std::cerr << "[gate] " << m.str() << "  (MVB_ALLOW_ENAMEL set: reported, not refused)"
+                      << std::endl;
+        }
+        else {
+            throw std::runtime_error(m.str());
+        }
+    }
+    else if (coatedUncertifiable > 0) {
+        // BLEND-involved pairs have no rigorous sag bound yet, so they can be neither proven nor
+        // refuted beyond the sampled figure -- said out loud rather than silently passed.
+        std::cerr << "[gate] enamel rule: certified clear except " << coatedUncertifiable
+                  << " BLEND-involved pair(s), sampled-only (closest sampled "
+                  << (worstUncertifiable == std::numeric_limits<double>::max()
+                          ? 0.0
+                          : worstUncertifiable * 1e3)
+                  << " mm)." << std::endl;
+    }
+    else {
+        std::cerr << "[gate] enamel rule: CERTIFIED -- every pair proven at or beyond its coated "
+                     "envelope (0 nm interpenetration)."
+                  << std::endl;
     }
 }
 
@@ -3316,6 +3614,10 @@ bool isZReturn(const PlanePt& s, const PlanePt& n, double wireRadius, double med
 // A dragback the wrap must ride OVER: its azimuth, and the height the wire is lifted there.
 struct WrapBump {
     double azimuth = 0.0;   // the dragback's azimuth; the raised half-turn is centred on it
+    // ABT #685 (Alf, 2026-08-18): the lane's RADIUS. The global bump accumulates one step per
+    // dragback LEVEL, so lanes must be grouped by where they sit radially -- the K parallels of a
+    // winding all return at the same layer boundary and count once between them, not K times.
+    double radius = 0.0;
     // How far the wire is RAISED, as a distance. Not a count of dragbacks: the wire that laid
     // the dragback sets the clearance needed, and different windings use different wire.
     double distance = 0.0;
@@ -3327,8 +3629,87 @@ struct WrapBump {
 // side by side, so a wire riding over the whole fan only needs to clear the tallest stack.
 // Every junction raise (wrap ends, dragback chain ends, the exit lead's lift) MUST come from
 // this one helper on the same bump list, so abutting pieces land on exactly the same offset.
-std::pair<double, double> tallestBumpColumn(const std::vector<WrapBump>& bumps) {
-    std::vector<std::pair<double, double>> cols;   // (azimuth, summed distance)
+// `cosTheta`: the cosine of the RIDING wire's inclination to the XY plane. A wire crossing a lane
+// is not at the bump's apogee -- it meets the lane obliquely -- so it must clear D / cos(theta),
+// not D (Alf, 2026-08-18). 1.0 (the default) is the un-projected height, for callers that have no
+// helix of their own.
+std::pair<double, double> tallestBumpColumn(const std::vector<WrapBump>& bumps,
+                                            double cosTheta = 1.0) {
+    // ABT #685 (Alf, 2026-08-18): "bumps never decrease or are reset" -- and equally, there is
+    // ONE bump common to all the parallels, not one per parallel.
+    //
+    // Both halves of that matter, and they pull in opposite directions:
+    //   * lanes SHARING an azimuth stack. A return lies in its destination layer's space, the
+    //     step over it puts the wire where the next layer would be, and so on outward, so their
+    //     clearances ADD as you go radially out. That is the sum inside a column below.
+    //   * lanes at DIFFERENT azimuths do NOT. The K parallels of a winding return side by side in
+    //     their own fan slots; a turn crosses each at a different angle and needs one wire's
+    //     clearance at each, not K. Summing across columns made the flyback's Secondary riser
+    //     5.101 mm where one wire is 1.1155 -- Alf: "the bump is huge!! did you add the bump for
+    //     each parallel instead of just one common for all parallels?" (Tried 2026-08-18,
+    //     reverted.)
+    //
+    // The ride is applied as ONE displacement over a turn's whole raised half, so it has to be
+    // the DEEPEST COLUMN: that clears every lane, over-clearing the shallower slots, which is the
+    // safe direction.
+    // Group by LEVEL (radius), not by azimuth: one step per dragback level. Lanes within half a
+    // wire of each other are the same level -- that is what makes a winding's K parallels, which
+    // all return at one layer boundary, count once. Within a level take the DEEPEST wire, since
+    // the ride has to clear the thickest thing at that level.
+    std::vector<std::pair<double, double>> levels;   // (radius, height)
+    for (const auto& bmp : bumps) {
+        bool found = false;
+        for (auto& lv : levels) {
+            if (std::abs(bmp.radius - lv.first) <= 0.5 * bmp.distance) {
+                lv.second = std::max(lv.second, bmp.distance);
+                found = true;
+                break;
+            }
+        }
+        if (!found) levels.push_back({bmp.radius, bmp.distance});
+    }
+    // ...and SUM the levels: the global bump grows by one wire at every dragback it passes and
+    // never decreases. bumpsForTurn() has already selected the lanes at or inside this turn.
+    double raise = 0.0;
+    for (const auto& lv : levels) {
+        raise += lv.second;
+    }
+    if (cosTheta > 1e-6) {
+        raise /= cosTheta;
+    }
+    // SECOND COSINE: THE LANE'S ANGLE OFF THE CONNECTION PLANE. ABT #685 (Alf, 2026-08-18):
+    // "for the bump you have to use the angle from the farther away parallel of the dragback to
+    // the plane YZ."
+    //
+    // `raise` above is a RADIAL pile thickness, but the ride delivers it as a rigid translation
+    // along -Z (the approved bump model). A translation T raises the wire radially by T only ON
+    // the plane; at a lane sitting phi off it, the radial gain is just T*cos(phi). Dragbacks do
+    // not sit on the plane -- the fan gives each parallel its own slot -- so the wire passed
+    // UNDER the very lane it was supposed to clear: measured on the flyback, a lane 24.59 deg off
+    // the plane got 1.7596*cos(24.59) = 1.600 mm of radial rise where it needed 1.693, and the
+    // gate found the ride 0.124 mm inside the dragback's copper (0.9919 against 1.1154).
+    // The FARTHEST parallel sets it: one displacement covers the whole raised half, so it must
+    // satisfy the worst lane, and over-clearing the nearer ones is the safe direction.
+    double maxOffPlane = 0.0;
+    for (const auto& bmp : bumps)
+        maxOffPlane = std::max(maxOffPlane,
+                               std::abs(std::remainder(bmp.azimuth - kPlaneAz, kTwoPi)));
+    const double cosOff = std::cos(maxOffPlane);
+    if (cosOff < 0.2) {
+        // A rigid -Z translation cannot lift a wire away from a lane approaching 90 deg off the
+        // plane -- there the displacement is purely tangential and buys no radial clearance at
+        // all. Never emit an "almost enough" ride: say which lane made it impossible.
+        throw std::runtime_error(
+            "ConductorBuilder: a dragback lane sits " +
+            std::to_string(maxOffPlane * 180.0 / kPi) +
+            " degrees off the connection plane, where the ride's -Z displacement buys almost no "
+            "radial clearance (cos = " + std::to_string(cosOff) +
+            "); the wire cannot be lifted over it. Fix the fan slot or the winding data.");
+    }
+    raise /= cosOff;
+    // The azimuth reported is the deepest single column, which is where the raised region is
+    // centred; only the HEIGHT is the accumulated global bump.
+    std::vector<std::pair<double, double>> cols;
     for (const auto& bmp : bumps) {
         bool found = false;
         for (auto& c : cols) {
@@ -3340,9 +3721,9 @@ std::pair<double, double> tallestBumpColumn(const std::vector<WrapBump>& bumps) 
         }
         if (!found) cols.push_back({bmp.azimuth, bmp.distance});
     }
-    double raise = 0.0, az = 0.0;
+    double deepest = 0.0, az = 0.0;
     for (const auto& c : cols)
-        if (c.second > raise) { raise = c.second; az = c.first; }
+        if (c.second > deepest) { deepest = c.second; az = c.first; }
     return {raise, az};
 }
 
@@ -3391,7 +3772,18 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
     // raised treatment centred on the plane clears every one of them: same-azimuth columns
     // stack (clearances add), columns side by side do not, and the ride-over only needs the
     // tallest stack.
-    const double raise = tallestBumpColumn(bumps).first;
+    // ABT #685 (Alf, 2026-08-18): project by THIS wrap's own inclination. Over the swept span the
+    // wire advances (y1 - y0) while turning (azEnd - azStart), so per full revolution it advances
+    // pitch = (y1 - y0) * 2pi / (azEnd - azStart) at radius r, and tan(theta) = pitch / (2 pi r).
+    // The lane it rides is crossed at that angle, so the clearance it needs is D / cos(theta).
+    const double sweptAz = azEnd - azStart;
+    const double meanR = 0.5 * (r0 + r1);
+    double cosTheta = 1.0;
+    if (std::abs(sweptAz) > 1e-9 && meanR > 1e-9) {
+        const double pitch = (y1 - y0) * kTwoPi / sweptAz;
+        cosTheta = 1.0 / std::sqrt(1.0 + (pitch / (kTwoPi * meanR)) * (pitch / (kTwoPi * meanR)));
+    }
+    const double raise = tallestBumpColumn(bumps, cosTheta).first;
     if (raise <= 0.0) {
         // A full revolution at CONSTANT radius and height (the first turn of a U layer -- see
         // appendRoundWrap) is a CLOSED circle: swept whole it makes a periodic surface with a
@@ -3526,10 +3918,31 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         // The junction is a genuine CORNER now rather than a tangent, which is exactly what MKF
         // draws in the winding window (a horizontal box between two layers) and what a winder
         // does: the wire is pushed over one wire and carries on.
+        // ABT #685 (Alf, 2026-08-18): the link ENDS ON ITS OWN TURN, at that turn's station
+        // height -- not level at the height it departed from.
+        //
+        // It was level on the reading that a U turnaround joins two turns at the same height, and
+        // MKF's own emitter says as much ("any residual height difference is the destination
+        // turn's own helix, not a drawn stub"). But the source and destination layers stack their
+        // parallels on slightly different offsets, so the residual is real: on 14_dab the link
+        // left Primary parallel 0's turn 10_ending at y = 18.8561 and its turn 11 sits at
+        // 18.7106, 145 um below. Two faults followed from that one gap:
+        //
+        //   * THE MITRE. The conformal assembler bridges an endpoint mismatch by GROWING both
+        //     pieces to a plane through the midpoint, so the joint came out as a wedge with the
+        //     two end faces not coincident -- the artefact Alf photographed. Eight junctions on
+        //     this design carried such a gap, the largest 145 um.
+        //   * THE COLLISION. Arriving 145 um high put the link between its own turn and the
+        //     SIBLING parallel's: 0.7515 mm to Primary parallel 1's turn 11 against 0.800 mm of
+        //     conducting copper. Landing on its own station restores the layer's full 0.897 mm
+        //     stacking pitch.
+        //
+        // The step is still one radial move; it simply settles the wire onto the station it is
+        // handing over to, which is what the winder's hand does.
         Primitive step;
         step.kind = Primitive::SEG;
         step.seg = {azPointC(0, -rsRaise, s.x, s.y, azS),
-                    azPointC(0, -reRaise, n.x, s.y, azS)};
+                    azPointC(0, -reRaise, n.x, n.y, azS)};
         step.label = label + " (layer link)";
         if (std::getenv("MVB_PATH_DUMP")) {
             std::fprintf(stderr,
@@ -3539,10 +3952,26 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         step.turnOrdinal = ordinal;
         step.isConnection = true;
         path.prims.push_back(std::move(step));
-        // The new layer's FIRST turn: a normal round turn from where the radial step landed,
-        // carrying the WHOLE descent to the layer's first station (the step itself is level).
-        appendBumpedSweep(path, n.x, s.y, azS, n.x, n.y, azE + kTwoPi, bumpsEnd,
-                          wireRadius, label, ordinal, false);
+        // ABT #685 (Alf, 2026-08-17): the link is the radial step and NOTHING ELSE. It used to be
+        // followed by a full revolution "carrying the whole descent to the layer's first station",
+        // which was right when a layer's first station WAS its first turn -- N + 1 stations, so
+        // the wire had to spiral down to it.
+        //
+        // With one crossing per layer the station immediately after the link IS the beginning of
+        // the next turn, at the height the link just arrived at, so that revolution now carries
+        // no pitch at all: measured on Secondary 2 parallel 3, a 360-degree sweep spending 0.9 um
+        // of height. A full revolution at constant radius and height is a CLOSED CIRCLE, whose
+        // sweep is a periodic surface the conformal assembler cannot build as one tube -- which is
+        // exactly the collapsed piece Alf reported as "turn 0_ending -> turn 1 [2/2] ... not a
+        // full tube in all parts". The real revolution is the NEXT primitive, turn 1 ->
+        // turn 1_ending, and it already spends the whole layer pitch.
+        if (std::abs(n.y - s.y) > wireRadius) {
+            // A link that DOES still have height to spend (a layer whose first station is not at
+            // the link's arrival height) keeps the descending revolution. Under MKF's current
+            // layout this does not occur; it is kept so a layout that places one is still drawn.
+            appendBumpedSweep(path, n.x, s.y, azS, n.x, n.y, azE + kTwoPi, bumpsEnd,
+                              wireRadius, label, ordinal, false);
+        }
         return;
     }
     // The wrap spans EXACTLY one turn, crossing to crossing. No overshoot: stretching the first
@@ -3803,24 +4232,21 @@ void appendZDragback(ConductorPath& path, const PlanePt& s, const PlanePt& n, do
     // any copper. (Tried and reverted in between: making the whole ride RADIAL instead. It made
     // the risers radial too, which is exactly what Alf rejected, and it bulged the rings
     // outward into 13_current_sense's and 23_interleaved_llc's neighbours.)
+    // ABT #685 (Alf, 2026-08-18): the ride change is the dragback's OWN ENDING -- seg 2 -- not a
+    // bump riser. Splitting it out and labelling it a riser (tried 2026-08-17, on the reading
+    // that "risers are parallel to z") was wrong twice over: it named a piece of the dragback
+    // after something else, and the split left the chain BROKEN -- 100 junction gaps on the
+    // flyback, the largest 1.1155 mm, every one of them at (bump riser) -> (over dragback). The
+    // dragback is one polyline from the source wrap's end to the destination turn's start, and
+    // it stays one polyline.
     std::vector<gp_Pnt> direct{
         pS,
         azPointC(0, -chainRaise, n.x, s.y, azD),
-        azPointC(0, -chainRaise, n.x, n.y, azD)};
+        azPointC(0, -chainRaise, n.x, n.y, azD),
+        azPointC(0, -destRaise,  n.x, n.y, azD)};
     appendFilletedPolyline(path.prims, direct, wireRadius, label + " (dragback)", ordinal,
                            /*isLead=*/false, /*isConnection=*/true,
                            /*rounded=*/g_roundedLeadCorners || path.isRectangular);
-    const gp_Pnt rideFrom = azPointC(0, -chainRaise, n.x, n.y, azD);
-    const gp_Pnt rideTo = azPointC(0, -destRaise, n.x, n.y, azD);
-    if (rideFrom.Distance(rideTo) > 1e-12) {
-        Primitive riser;
-        riser.kind = Primitive::SEG;
-        riser.seg = {rideFrom, rideTo};
-        riser.label = label + " (bump riser)";
-        riser.turnOrdinal = ordinal;
-        riser.isConnection = true;
-        path.prims.push_back(std::move(riser));
-    }
 }
 
 std::vector<Primitive> buildZEndRun(const PlanePt& s, const PlanePt& n, double azA, double azOff,
@@ -4282,8 +4708,13 @@ void appendRectTangentialWrap(ConductorPath& path, const RectStation& s0,
 // clearances so it clears the intervening rings.
 struct ToroCross {
     gp_XY pin;    // inner crossing, build-frame horizontal (x, z) = MAS (x, y)
-    gp_XY pout;   // outer crossing
+    gp_XY pout;   // outer crossing (== pin when this station has none; see hasOuter)
     double tube;  // vertical tube length above/below the hole plane
+    // ABT #685 (Alf, 2026-08-19): the LAST station of a conductor has no outer crossing -- its
+    // connection is the output terminal. MKF now emits N inner crossings and N-1 outer ones, each
+    // between two inner stations, so such a station appears only as a wrap's DESTINATION (c1),
+    // where only pin is read.
+    bool hasOuter = true;
 };
 
 // Bottom-half BASE running depth of the wrap between two crossings — the clearance under
@@ -4297,10 +4728,21 @@ double toroWrapDepth(const ToroCross& c0, const ToroCross& c1, double /*bend*/) 
 
 void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c1,
                     double bend, double bottomExtraDepth, const std::string& label,
-                    size_t ordinal) {
+                    size_t ordinal,
+                    // Corner headings resolved by the caller's global solve (common retilt +
+                    // lead relaxation, certified against the coated envelopes). NaN only in the
+                    // degenerate no-solve case; the certified verifier remains the authority.
+                    gp_XY resolvedTop = gp_XY(std::numeric_limits<double>::quiet_NaN(), 0),
+                    gp_XY resolvedBottom = gp_XY(std::numeric_limits<double>::quiet_NaN(), 0)) {
     auto P = [](const gp_XY& h, double y) { return gp_Pnt(h.X(), y, h.Y()); };
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
-        if (a.Distance(b) < 1e-12) return;
+        // A picometre threshold is meaningless next to a 0.34 mm wire whose own sampling sag is
+        // ~7 um. Since the knee is sized by a fixed point that drives its straight to nothing when
+        // none is needed, what came out was a ~1e-11 m segment: too long to be dropped, too short
+        // to sweep, and the assembler refused the whole conductor (05_pfc, 07_cmc, 12_boost and
+        // the common-mode choke all died this way). A tenth of a micron is still four orders below
+        // the measurement floor, and anything shorter is simply not a piece of wire.
+        if (a.Distance(b) < 1e-7) return;
         Primitive pr;
         pr.kind = Primitive::SEG;
         pr.seg = {a, b};
@@ -4323,6 +4765,48 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     const gp_XYZ yHat(0, 1, 0);
     const double b = bend;
 
+    // THE FACE CROSSING IS A SPIRAL, NOT A CHORD. ABT #685 (Alf, 2026-08-19). A straight chord
+    // from an inner station to an outer crossing is, for the NEXT station, a ROTATED copy of
+    // itself -- and rotated copies of a straight converge near their tangency region. With the
+    // bore packed at exactly one coated OD (the tubes touching), that convergence is immediately
+    // an enamel overlap: measured 0.6638 mm against a 0.679 mm envelope, while the two chords'
+    // endpoints were a comfortable 0.824 mm apart. A curve whose radius advances linearly with
+    // azimuth does not have that defect -- rotating it by an angle shifts it radially by a
+    // constant, so neighbouring crossings stay the same distance apart the whole way across the
+    // face, which is how the wires actually lie on a hand-wound toroid.
+    auto faceSpiral = [&](const gp_XY& from, const gp_XY& to, double y, const char* what) {
+        const double r0 = from.Modulus(), r1 = to.Modulus();
+        const double az0 = std::atan2(-from.Y(), from.X());
+        const double az1 = az0 + std::remainder(std::atan2(-to.Y(), to.X()) - az0, kTwoPi);
+        Primitive pr;
+        pr.kind = Primitive::SPIRAL;
+        pr.spiral = {0.0, 0.0, r0, y, az0, r1, y, az1, false};
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
+    // Its tangent, so the corners at either end stay tangent to it.
+    auto faceSpiralTangent = [&](const gp_XY& from, const gp_XY& to, bool atStart) {
+        const double r0 = from.Modulus(), r1 = to.Modulus();
+        const double az0 = std::atan2(-from.Y(), from.X());
+        const double az1 = az0 + std::remainder(std::atan2(-to.Y(), to.X()) - az0, kTwoPi);
+        const double span = az1 - az0;
+        if (std::abs(span) < 1e-12) {
+            gp_XY radial = to - from;
+            if (radial.Modulus() > 1e-12) radial.Normalize();
+            return radial;
+        }
+        const double k = (r1 - r0) / span;             // dr/daz
+        const double az = atStart ? az0 : az1;
+        const double r = atStart ? r0 : r1;
+        gp_XY t(k * std::cos(az) - r * std::sin(az), -k * std::sin(az) - r * std::cos(az));
+        if (t.Modulus() > 1e-12) t.Normalize();
+        if (span < 0) t = gp_XY(-t.X(), -t.Y());       // travelling the other way round
+        return t;
+    };
+
+
+
     // Top half: turn k-1's inner leg to its outer leg.
     gp_XY dH = c0.pout - c0.pin;
     double lTop = dH.Modulus();
@@ -4336,9 +4820,42 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     double t0 = c0.tube, rh0 = t0 + b;
 
     pushSeg(P(c0.pin, 0), P(c0.pin, t0), "inner tube up");
-    pushArc(P(c0.pin + dH * b, t0), yHat.Crossed(d3), d3 * (-b), "top inner corner");
-    pushSeg(P(c0.pin + dH * b, rh0), P(c0.pout - dH * b, rh0), "top chord");
-    pushArc(P(c0.pout - dH * b, t0), yHat.Crossed(d3), yHat * b, "top outer corner");
+    // Case 1 leaves dTop == dH and the knee collapses onto the chord's far end, reproducing the
+    // old two-piece half exactly; case 2 clamps the corner and bends at the knee instead.
+    // Solve the spiral and its two tangents together: each corner is a bend radius along the
+    // tangent it meets, and the tangent depends on where the corner put the spiral's end.
+    gp_XY dTop = dH, dTopEnd = dH;
+    for (int pass = 0; pass < 8; ++pass) {
+        const gp_XY start = c0.pin + dTop * b;
+        const gp_XY finish = c0.pout - dTopEnd * b;
+        const gp_XY tStart = faceSpiralTangent(start, finish, true);
+        const gp_XY tEnd = faceSpiralTangent(start, finish, false);
+        const double shift = (tStart - dTop).Modulus() + (tEnd - dTopEnd).Modulus();
+        dTop = tStart;
+        dTopEnd = tEnd;
+        if (shift < 1e-12) break;
+    }
+    if (!std::isnan(resolvedTop.X())) {
+        dTop = resolvedTop;   // the caller solved every corner against every other (common delta)
+        // Re-solve the far-end tangent around the RESOLVED heading -- leaving it at the value
+        // computed for the unrotated corner shipped a spiral 11 um off the one the solver
+        // validated (measured: solver >= 0.6785 mm, emitted pair sampled 0.6673).
+        for (int pass = 0; pass < 8; ++pass) {
+            const gp_XY a1 = c0.pin + dTop * b, b1 = c0.pout - dTopEnd * b;
+            dTopEnd = faceSpiralTangent(a1, b1, false);
+        }
+    }
+    // No resolved heading means the caller's corner solve did not run -- which for a real
+    // toroidal winding it always does (any design with two or more stations). The spiral's own
+    // tangent stands, and the certified zero-overlap verification downstream is the authority:
+    // there is no local per-corner clearance rule any more, and no fallback.
+
+    const gp_XYZ dTop3(dTop.X(), 0, dTop.Y());
+    pushArc(P(c0.pin + dTop * b, t0), yHat.Crossed(dTop3), dTop3 * (-b), "top inner corner");
+    faceSpiral(c0.pin + dTop * b, c0.pout - dTopEnd * b, rh0, "top chord");
+    const gp_XY dTopChord = dTopEnd;
+    const gp_XYZ dTopChord3(dTopChord.X(), 0, dTopChord.Y());
+    pushArc(P(c0.pout - dTopChord * b, t0), yHat.Crossed(dTopChord3), yHat * b, "top outer corner");
 
     // Bottom half: turn k-1's outer leg to turn k's inner leg. Both corners swing PURELY
     // RADIALLY (parallel among packed neighbours — a corner swung toward the per-turn
@@ -4372,10 +4889,38 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     // ring stagger puts each ring's whole return one OD deeper than the ring inside it
     // (the radial-swing + Dubins routing this replaces was for same-depth rings and
     // clipped tightly-packed neighbours).
+    // Work the half out BEFORE emitting it: the knee steps outward from the clamped inner
+    // corner, and the chord -- and therefore the outer corner it is tangent to -- runs to
+    // wherever that knee ended up.
+    // Same as the top: corner, spiral across the face, corner. The bottom travels rim -> bore.
+    gp_XY eBotStart = eH, eBot = eH;
+    for (int pass = 0; pass < 8; ++pass) {
+        const gp_XY start = c0.pout + eBotStart * b;
+        const gp_XY finish = c1.pin - eBot * b;
+        const gp_XY tStart = faceSpiralTangent(start, finish, true);
+        const gp_XY tEnd = faceSpiralTangent(start, finish, false);
+        const double shift = (tStart - eBotStart).Modulus() + (tEnd - eBot).Modulus();
+        eBotStart = tStart;
+        eBot = tEnd;
+        if (shift < 1e-12) break;
+    }
+    if (!std::isnan(resolvedBottom.X())) {
+        eBot = resolvedBottom;
+        for (int pass = 0; pass < 8; ++pass) {   // same re-solve as the top half
+            const gp_XY a2 = c0.pout + eBotStart * b, b2 = c1.pin - eBot * b;
+            eBotStart = faceSpiralTangent(a2, b2, true);
+        }
+    }
+    // Same as the top half: no local rule, no fallback -- the caller's solve plus the certified
+    // verification own clearance.
+
+    const gp_XYZ eBot3(eBot.X(), 0, eBot.Y());
+    const gp_XYZ eBotStart3(eBotStart.X(), 0, eBotStart.Y());
     pushSeg(P(c0.pout, t0), P(c0.pout, -tb), "outer tube down");
-    pushArc(P(c0.pout + eH * b, -tb), e3.Crossed(yHat), e3 * (-b), "bottom outer corner");
-    pushSeg(P(c0.pout + eH * b, -rhb), P(c1.pin - eH * b, -rhb), "bottom chord");
-    pushArc(P(c1.pin - eH * b, -tb), e3.Crossed(yHat), yHat * (-b), "bottom inner corner");
+    pushArc(P(c0.pout + eBotStart * b, -tb), eBotStart3.Crossed(yHat), eBotStart3 * (-b),
+            "bottom outer corner");
+    faceSpiral(c0.pout + eBotStart * b, c1.pin - eBot * b, -rhb, "bottom chord");
+    pushArc(P(c1.pin - eBot * b, -tb), eBot3.Crossed(yHat), yHat * (-b), "bottom inner corner");
     pushSeg(P(c1.pin, -tb), P(c1.pin, 0), "inner tube up to crossing");
 }
 
@@ -4561,8 +5106,50 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                      const MAS::CoreBobbinProcessedDescription& bobbinPd,
                                      bool isToroidal,
                                      std::vector<RSpace> allSpaces,
+                                     // ABT #685: MKF's classification of every connection —
+                                     // MVB++ READS which transitions are returns instead of
+                                     // re-deriving them from turn coordinates.
+                                     const OpenMagnetics::ConnectionLayout& connectionLayout,
                                      const ConductorBuilder::Options& opts,
                                      std::vector<ConductorBuilder::PathPolyline>* polyOut = nullptr) {
+    // ABT #685 (Alf, 2026-08-17): WHAT a connection IS comes from MKF, not from a threshold here.
+    // isZReturn() used to answer it from turn coordinates -- a median pitch, a filar-count bound,
+    // a sign-of-advance rule -- and every one of those had a comment naming the design it had been
+    // wrong on. wind() decides it exactly, from the winding order, the layer membership and
+    // whether the run crosses intervening layers, and now publishes it.
+    //
+    // Keyed by the two turn names the transition joins. A transition MKF drew no route for (the
+    // toroidal emitter publishes none yet) falls back to the old heuristic, which is why it is
+    // still here.
+    std::map<std::pair<std::string, std::string>, OpenMagnetics::ConnectionKind> connectionKindOf;
+    for (const auto& route : connectionLayout.routes) {
+        if (route.fromTurn.empty() || route.toTurn.empty()) continue;   // a terminal
+        connectionKindOf[{route.fromTurn, route.toTurn}] = route.kind;
+    }
+    // Does MKF say this transition lays a RETURN the outer layers must ride over? Only a Z
+    // dragback and an inter-section edge run do; a U turnaround, a tangential link and a final
+    // landing reserve nothing.
+    if (std::getenv("MVB_KIND_DIAG")) {
+        std::fprintf(stderr, "[kind] layout routes=%zu keyed=%zu\n",
+                     connectionLayout.routes.size(), connectionKindOf.size());
+        for (const auto& [key, kind] : connectionKindOf) {
+            std::fprintf(stderr, "[kind]   '%s' -> '%s' = %d\n", key.first.c_str(),
+                         key.second.c_str(), int(kind));
+        }
+    }
+    auto mkfSaysReturn = [&](const std::string& fromTurn, const std::string& toTurn,
+                             bool fallback) {
+        auto found = connectionKindOf.find({fromTurn, toTurn});
+        if (found == connectionKindOf.end()) {
+            if (std::getenv("MVB_KIND_DIAG"))
+                std::fprintf(stderr, "[kind] MISS '%s' -> '%s' fallback=%d\n", fromTurn.c_str(),
+                             toTurn.c_str(), int(fallback));
+            return fallback;
+        }
+        return found->second == OpenMagnetics::ConnectionKind::Z_DRAGBACK ||
+               found->second == OpenMagnetics::ConnectionKind::EDGE_CONTINUATION;
+    };
+
     g_roundedLeadCorners = opts.roundedLeadCorners;   // ABT #685: corner style for this build
     auto turnsOpt = coil.get_turns_description();
     if (!turnsOpt || turnsOpt->empty()) {
@@ -4889,6 +5476,31 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // (the 180-degree-rotated windings interleave, and an undisplaced back face sat 77 um
     // from a displaced connection face on 02_flyback).
     std::vector<std::pair<double, double>> rectRideLevels[2];
+    // TERMINAL-LEAD FAN FOR RECT/STADIUM COLUMNS. ABT #685 (Alf, 2026-08-18: "why are the two
+    // parallel input terminals for the secondary still in the same position?"). On a ROUND column
+    // the azimuth fan gives each strand its own slot; that fan is angular and does not run here,
+    // so every parallel of a winding took the SAME crossing and the leads did not merely crowd,
+    // they COINCIDED (isolated_buck: Secondary parallels 0 and 1 both at (0,-5.7545,10.7985),
+    // centreline distance 0). A rect face is straight, so the slot is a LENGTH along it, not an
+    // angle -- the same coordinate the dragback lanes already use (slotOf below).
+    //
+    // The lead still comes in on MKF'S DRAWN ROW. TRIED AND REVERTED: running each parallel's
+    // route at its own attach height instead. It reads well -- the lead lands midway between the
+    // sibling's interleaved turns -- but the drawn row is a RESERVED CORRIDOR, the one place MKF
+    // guarantees no turn stands, and leaving it sent the lead straight through the outer layer
+    // (isolated_buck: Secondary parallel 0's turn 4 at the same row, one layer out). The row is
+    // MKF's to give; only the position ALONG the face is ours.
+    //
+    // The slot alone is NOT enough either, and that is what a first attempt got wrong. Measured on the
+    // flyback, the round fan leaves EVERY pair at exactly one copper envelope: lead-to-lead
+    // 1.1155 mm, and lead-to-the-sibling's-wrap 1.1152 mm against a 1.1154 mm envelope. It gets
+    // the second one because the lead rides ABOVE the rings. A rect turn's face straight spans the
+    // whole face at one depth, and MKF draws one terminal row per WINDING, so a lead arriving at
+    // that shared row lands ON the sibling's first turn whatever its x -- moving the collision
+    // rather than removing it. So the lead also arrives at ITS OWN turn's row (see the entrance
+    // and exit routes): parallels interleave one wire apart, which puts each lead exactly midway
+    // between the sibling's turns -- one envelope from each, the flyback's own packing.
+    std::map<size_t, double> leadSlotOf;
     if (rectFamily) {
         std::map<size_t, double> slotOf;   // conductor -> x slot
         double maxDiam = 0.0;
@@ -4970,6 +5582,54 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             ++k;
         }
         for (auto& r : rectReturns) r.xSlot = slotOf.at(r.ci);
+        // Terminal-lead slots, allocated PER FACE: conductors on opposite isolation sides never
+        // share a face, so each side packs from its own crossing outwards, one coated OD apart
+        // (insulation touching -- the same layout criterion as the dragback lanes). One-sided,
+        // because the entrance offset is measured from the crossing along the face and a turn
+        // cannot begin behind it. Entrance and exit take opposite ends (-s and +s), so a
+        // conductor's own two leads separate for free.
+        {
+            std::map<int, double> odOfFace;
+            for (size_t cv = 0; cv < conductors.size(); ++cv) {
+                const auto& ct = conductors[cv];
+                if (ct.turns.empty()) continue;
+                auto [cw2, ch2] = TurnBuilder::wireDimensions(
+                    wireMap.at(ct.winding), *ct.turns.front(), /*paintCoating=*/true);
+                const int face = windingFace.at(ct.winding);
+                odOfFace[face] = std::max(odOfFace[face], std::min(cw2, ch2));
+            }
+            // ORDER BY ROW, HIGHEST FIRST. A rising turn CLIMBS as it runs along the face
+            // (measured on isolated_buck: 64.9 um per mm), so a lead sitting above a sibling's
+            // crossing is approached by that sibling's turn as x grows, while one sitting below
+            // is left behind. Giving the highest row the smallest x puts every lead on the side
+            // its siblings' turns move AWAY from. Allocating in conductor order instead left the
+            // upper parallel 42 um short (1.0760 mm against 1.1154) purely from the 74 um the
+            // sibling's turn had climbed by the time it reached that slot.
+            std::vector<std::pair<double, size_t>> byRow;   // (row, conductor)
+            for (size_t cv = 0; cv < conductors.size(); ++cv) {
+                const auto& ct = conductors[cv];
+                if (ct.turns.empty()) continue;
+                byRow.push_back({station(ct.turns.front()).y, cv});
+            }
+            std::sort(byRow.begin(), byRow.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            // KEEP OFF THE DRAGBACK LANES. Lanes and leads are measured from the same
+            // crossing but in opposite directions -- a lead slot s puts copper at world +s, a
+            // lane slot t at world -t -- so the two can only ever meet at the crossing itself,
+            // x = 0. Where a lane already owns it, the leads start one OD out (isolated_buck:
+            // Secondary parallel 0's dragback runs the full height of the winding at x = 0, and
+            // the upper parallel's lead was placed straight down it).
+            std::map<int, bool> crossingTaken;
+            for (const auto& [cv, t] : slotOf)
+                if (std::abs(t) < 1e-12 && cv < conductors.size())
+                    crossingTaken[windingFace.at(conductors[cv].winding)] = true;
+            std::map<int, int> kOfFace;
+            for (const auto& [row, cv] : byRow) {
+                const int face = windingFace.at(conductors[cv].winding);
+                const int k = kOfFace[face]++ + (crossingTaken[face] ? 1 : 0);
+                leadSlotOf[cv] = double(k) * odOfFace.at(face);
+            }
+        }
         // Distinct destination depths, ascending, PER SIDE. Each level displaces everything
         // at or beyond it (on that side) by the level's largest laid wire OD.
         for (const auto& r : rectReturns) {
@@ -5186,7 +5846,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // construction the rule replaces.
                 const bool steepFinal = (i + 2 == nEmitP) && std::abs(b.x - a.x) > rwEmit;
                 if (!steepFinal &&
-                    isZReturn(a, b, rwEmit, bandP.medianPitch, bandP.advance, ct.parallels)) {
+                    mkfSaysReturn(ct.turns[i]->get_name(), ct.turns[i + 1]->get_name(),
+                                  isZReturn(a, b, rwEmit, bandP.medianPitch, bandP.advance,
+                                            ct.parallels))) {
                     Vert dv;
                     dv.kind = 1; dv.ci = cv; dv.trans = i; dv.entrance = false;
                     dv.r = b.x; dv.y0 = std::min(a.y, b.y); dv.y1 = std::max(a.y, b.y);
@@ -5309,6 +5971,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const Vert& K = A.kind == 2 ? A : B;
                 const Vert& O = A.kind == 2 ? B : A;
                 if (K.ci == O.ci) return 0.0;
+                // ABT #685 (Alf, 2026-08-17): a TERMINAL never yields to a layer link of its own
+                // winding. "Every terminal, output or input, has to start at x=0 and expand
+                // toward positive x, side by side the parallels" — and the two are the same
+                // winding's copper, laid one wire apart by MKF's own rows and layer pitch. Making
+                // the lead dodge a sibling parallel's link in AZIMUTH pushed Secondary 2's whole
+                // entrance bundle one outer diameter off the plane (x = 3.03 mm where its wire
+                // radius is 1.01), so it no longer lined up with Secondary 1's, and the two
+                // bundles then collided further out.
+                if (K.wname == O.wname && O.kind == 0) return 0.0;
                 const std::vector<std::array<double, 4>> otherRoute =
                     O.kind == 1 ? std::vector<std::array<double, 4>>{{O.r, O.y0, O.r, O.y1}}
                                 : O.segs;
@@ -5334,6 +6005,29 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // its row, so its entrance route measured 0.8548 mm from the exit row against a
                 // 0.8550 designed separation) — micrometre noise must not cost a fan slot, and
                 // 1 um is still fifty times below the coating pair's own margin.
+                // ABT #685 (Alf, 2026-08-17): "every terminal, output or input, has to start at
+                // x=0 and expand toward positive x, side by side the parallels."
+                //
+                // DIFFERENT WINDINGS never spread each other in x. MKF's per-edge row allocator
+                // already gives each winding its own ROW, stacked at exactly one wire OD centre
+                // to centre -- on the pushpull the entrance rows sit at -14.18, -13.03, -11.44
+                // and -9.42 mm against requirements of 1.148, 1.586 and 2.023 mm. Separating
+                // them a SECOND time, in azimuth, is redundant: it scattered the bundles
+                // (measured: +4.7, -9.5, -16.0, -22.8, -29.8 deg on one design), left no winding
+                // anchored at the plane, and it was a micrometre-scale row deficit that triggered
+                // it -- S1 and S2's rows are 3 um closer than their coated envelopes want.
+                //
+                // If MKF's rows are genuinely too close, that is an MKF layout bug and the
+                // collision gate must say so, not be worked around by moving terminals sideways.
+                // The ONLY terminals that spread each other in x are the PARALLELS OF ONE
+                // BUNDLE -- one winding, one side. Everything else is separated by MKF's
+                // per-edge rows: a different winding gets its own row, and so does the same
+                // winding's other side. Spreading those a second time in azimuth is what stopped
+                // the bundles lining up, and it was triggered by micrometre row deficits every
+                // time (Secondary 1 vs Secondary 2, 3 um; Secondary 2's own entrance vs its exit,
+                // 63 um). Where MKF's rows really are too close, the collision gate reports it --
+                // that is an MKF layout bug to fix, not one to dodge by moving terminals.
+                if (A.wname != B.wname || A.entrance != B.entrance) return 0.0;
                 if (routeDist(A.segs, B.segs) > dSep - 1e-6) return 0.0;
             } else if (A.kind != B.kind) {
                 const Vert& L = A.kind == 0 ? A : B;
@@ -5520,6 +6214,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // whose routes are disjoint get a zero intra-block step, so the old one-slot anchor
         // behaviour (Alf 2026-08-07: "they must have the same x coord") is the degenerate case
         // of the block, not a separate rule.
+        if (std::getenv("MVB_LEAD_DIAG")) {
+            std::fprintf(stderr, "[fan-verts] %zu verts\n", verts.size());
+            for (size_t k = 0; k < verts.size(); ++k)
+                std::fprintf(stderr, "   kind=%d wname='%s' entrance=%d ci=%zu r=%.4f rw=%.4f\n",
+                             verts[k].kind, verts[k].wname.c_str(), (int)verts[k].entrance,
+                             (size_t)verts[k].ci, verts[k].r * 1e3, verts[k].rw * 1e3);
+        }
         for (size_t k = 0; k < verts.size(); ++k) {
             if (azAssigned[k]) {
                 continue;
@@ -5667,6 +6368,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const Vert& A = verts[group[g - 1]];
                 const Vert& B = verts[group[g]];
                 xoff[g] = xoff[g - 1] + needDist(A, B, need(A, B));
+            }
+            if (std::getenv("MVB_LEAD_DIAG")) {
+                std::fprintf(stderr, "[fan-block] wname='%s' entrance=%d members=%zu:",
+                             verts[group[0]].wname.c_str(), (int)verts[group[0]].entrance,
+                             group.size());
+                for (size_t g = 0; g < group.size(); ++g)
+                    std::fprintf(stderr, " [ci=%zu r=%.4f rw=%.4f xoff=%.4f]",
+                                 (size_t)verts[group[g]].ci, verts[group[g]].r * 1e3,
+                                 verts[group[g]].rw * 1e3, xoff[g] * 1e3);
+                std::fprintf(stderr, "\n");
             }
             const double kNaN = std::numeric_limits<double>::quiet_NaN();
             // Member g's azimuth for an anchor azimuth c of member 0, and its inverse. NaN when
@@ -6000,6 +6711,182 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         for (const auto& c : cols) fanMaxRaise = std::max(fanMaxRaise, c.second);
     }
 
+    // TOROID: STRAIGHT BOTTOM CHORD, OR THE ROUND-Z BAND? ABT #685 (Alf, 2026-08-18): "the
+    // problem in the buck is that the connections between turns, when the angle is too much,
+    // crashes with the next turn. The solution would be to have a construction like in a round Z,
+    // like the one used in dragbacks. But use this only when the angle is so much that it might
+    // collide, calculate the angle and the possible collision, and once one turn needs it, use it
+    // for all of them."
+    //
+    // A turn's bottom half crosses the face as a STRAIGHT chord from its own outer crossing to the
+    // next turn's inner crossing. The wider the azimuthal advance, the more tangential that chord
+    // becomes -- and a chord is tangent to a circle, so two of them one slot apart are not
+    // parallel: they pivot and converge. On the buck (8 turns, so ~45 deg of advance each) both
+    // chords ran tangent to a circle of r = 2.599 mm and pinched to 0.36 mm where 0.63 was needed,
+    // though their endpoints were correctly spaced at both the bore and the rim.
+    //
+    // appendToroTransitionBand already draws the alternative and was written against this very
+    // failure ("the old straight diagonal passed within a wire OD of the destination ring's inner
+    // tubes as it cut across the face"): radial leg out, fillet, an azimuthal ARC along the core's
+    // mid-annulus, fillet, radial leg in. An arc concentric with the bore keeps its distance from
+    // every tube instead of cutting across them.
+    //
+    // The test is the collision itself, not a threshold on the angle: build each straight chord
+    // and measure it against the other turns' inner tubes AND against the other chords. Only
+    // same-ring pieces are compared -- the ring stagger already puts each ring's whole return one
+    // OD deeper than the ring inside it.
+    bool toroBandForAll = false;
+    if (isToroidal) {
+        struct TCross { gp_XY pin, pout; int ring = 0; double rw = 0.0; double rwEmit = 0.0; };
+        std::vector<std::vector<TCross>> cross(conductors.size());
+        double maxInner = 0.0, odMax = 0.0;
+        for (size_t cv = 0; cv < conductors.size(); ++cv) {
+            const auto& ct = conductors[cv];
+            if (ct.turns.empty()) continue;
+            // COPPER, not coated: the gate's envelope is the conducting one, and enamel
+            // touching on a tightly wound toroid is normal. Testing against coated radii fired on
+            // every neighbouring turn -- they sit exactly one coated OD apart by construction --
+            // and switched 05_pfc, 07_cmc and 12_boost onto bands they do not need.
+            auto [cw2, ch2] = TurnBuilder::wireDimensions(wireMap.at(ct.winding),
+                                                          *ct.turns.front(),
+                                                          /*paintCoating=*/false);
+            const double rw = 0.5 * std::min(cw2, ch2);
+            auto [ow2, oh2] = TurnBuilder::wireDimensions(wireMap.at(ct.winding),
+                                                          *ct.turns.front(),
+                                                          /*paintCoating=*/true);
+            odMax = std::max(odMax, std::min(ow2, oh2));   // ring spacing is the COATED OD
+            auto [ew2, eh2] = TurnBuilder::wireDimensions(wireMap.at(ct.winding),
+                                                          *ct.turns.front(), opts.paintCoating);
+            const double rwEmit = 0.5 * std::min(ew2, eh2);   // what the emitter bends
+            for (const MAS::Turn* t : ct.turns) {
+                const auto& c = t->get_coordinates();
+                auto add = t->get_additional_coordinates();
+                if (c.size() < 2 || !(add && !add->empty() && (*add)[0].size() >= 2)) {
+                    cross[cv].clear();
+                    break;   // no outer crossing: the emitter refuses later, with its own message
+                }
+                TCross tc;
+                tc.pin = gp_XY(c[0], c[1]);
+                tc.pout = gp_XY((*add)[0][0], (*add)[0][1]);
+                tc.rw = rw;
+                tc.rwEmit = rwEmit;
+                cross[cv].push_back(tc);
+                maxInner = std::max(maxInner, tc.pin.Modulus());
+            }
+        }
+        if (odMax > 1e-12) {
+            for (auto& v : cross)
+                for (auto& tc : v)
+                    tc.ring = std::max(0, static_cast<int>(
+                                              std::llround((maxInner - tc.pin.Modulus()) / odMax)));
+        }
+        // Distance from a point to a segment, and between two segments, in the face plane.
+        auto segPt = [](const gp_XY& a, const gp_XY& b, const gp_XY& p) {
+            gp_XY ab = b - a;
+            const double L2 = ab.SquareModulus();
+            if (L2 < 1e-18) return (p - a).Modulus();
+            double t = ((p - a).Dot(ab)) / L2;
+            t = std::clamp(t, 0.0, 1.0);
+            return (p - (a + ab * t)).Modulus();
+        };
+        auto segSeg = [&](const gp_XY& a0, const gp_XY& a1, const gp_XY& b0, const gp_XY& b1) {
+            return std::min({segPt(a0, a1, b0), segPt(a0, a1, b1),
+                             segPt(b0, b1, a0), segPt(b0, b1, a1)});
+        };
+        std::string why;
+        for (size_t cv = 0; cv < conductors.size() && !toroBandForAll; ++cv) {
+            for (size_t i = 0; i + 1 < cross[cv].size() && !toroBandForAll; ++i) {
+                const TCross& A0 = cross[cv][i];
+                const TCross& A1 = cross[cv][i + 1];
+                if (A0.ring != A1.ring) continue;   // a ring change already takes the band
+                for (size_t cw = 0; cw < conductors.size() && !toroBandForAll; ++cw) {
+                    for (size_t j = 0; j < cross[cw].size(); ++j) {
+                        const TCross& B = cross[cw][j];
+                        if (B.ring != A0.ring) continue;
+                        // The chord vs the other turns' INNER TUBES (Alf's SOLID263 into SOLID176).
+                        if (!(cw == cv && (j == i || j == i + 1))) {
+                            const double d = segPt(A0.pout, A1.pin, B.pin);
+                            if (d < A0.rw + B.rw) {
+                                why = "its bottom chord passes " + std::to_string(d * 1e3) +
+                                      " mm from another turn's inner tube (needs " +
+                                      std::to_string((A0.rw + B.rw) * 1e3) + " mm)";
+                                toroBandForAll = true;
+                                break;
+                            }
+                        }
+                        // ...and against the other CHORDS, which pivot rather than translate.
+                        if (j + 1 >= cross[cw].size()) continue;
+                        const TCross& B1 = cross[cw][j + 1];
+                        if (B1.ring != B.ring) continue;
+                        if (cw == cv && j == i) continue;
+                        if (cw == cv && (j + 1 == i || j == i + 1)) continue;   // consecutive
+                        const double d = segSeg(A0.pout, A1.pin, B.pout, B1.pin);
+                        if (d < A0.rw + B.rw) {
+                            why = "two bottom chords pinch to " + std::to_string(d * 1e3) +
+                                  " mm (needs " + std::to_string((A0.rw + B.rw) * 1e3) + " mm)";
+                            toroBandForAll = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // THE BAND MUST BE AVAILABLE TO EVERY TURN, or it is available to none. Alf's rule is
+        // all-or-nothing, so a design where one transition cannot follow the mid-annulus (its
+        // crossings leave no room for the radial legs and fillets) must keep its straight chords
+        // and report whatever its real problem is. Switching regardless turned the current
+        // transformer's honest "no clear terminal-lead route" refusal into an obscure
+        // ring-transition failure with no STEP at all.
+        if (toroBandForAll) {
+            for (size_t cv = 0; cv < conductors.size() && toroBandForAll; ++cv) {
+                if (cross[cv].empty()) continue;
+                double maxIn = 0.0, minOut = std::numeric_limits<double>::max();
+                for (const auto& tc : cross[cv]) {
+                    maxIn = std::max(maxIn, tc.pin.Modulus());
+                    minOut = std::min(minOut, tc.pout.Modulus());
+                }
+                const double rMid = 0.5 * (maxIn + minOut);
+                const double b = kRoundCornerBendFactor * cross[cv].front().rwEmit;
+                if (rMid - b <= b) { toroBandForAll = false; break; }
+                const double rt1 = std::sqrt(std::max(0.0, (rMid + b) * (rMid + b) - b * b));
+                const double rt2 = std::sqrt(std::max(0.0, (rMid - b) * (rMid - b) - b * b));
+                const double d1 = std::asin(std::min(1.0, b / (rMid + b)));
+                const double d2 = std::asin(std::min(1.0, b / (rMid - b)));
+                for (size_t i = 0; i + 1 < cross[cv].size(); ++i) {
+                    const double rOut0 = cross[cv][i].pout.Modulus();
+                    const double rIn1 = cross[cv][i + 1].pin.Modulus();
+                    const double az0 = std::atan2(cross[cv][i].pout.Y(), cross[cv][i].pout.X());
+                    const double az1 = std::atan2(cross[cv][i + 1].pin.Y(), cross[cv][i + 1].pin.X());
+                    const double dAz = std::remainder(az1 - az0, kTwoPi);
+                    if (rOut0 - b <= rt1 || rIn1 + b >= rt2 || std::abs(dAz) <= d1 + d2) {
+                        if (std::getenv("MVB_TORO_DIAG"))
+                            std::cerr << "[toro] the round-Z band is NOT available to every turn ("
+                                      << conductors[cv].winding << " parallel "
+                                      << conductors[cv].parallel << " transition " << i
+                                      << "), keeping the straight chords\n";
+                        toroBandForAll = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (toroBandForAll && std::getenv("MVB_TORO_DIAG"))
+            std::cerr << "[toro] every turn takes the round-Z band: " << why << "\n";
+    }
+
+    // WHERE THE NEIGHBOURING CORNER ACTUALLY IS. ABT #685 (Alf, 2026-08-19): the clearance test
+    // used to hold each inner corner off its neighbours' STATIONS, as though their tubes carried
+    // straight up through the corner's height band. They do not -- every tube stops at the core's
+    // face, and the only copper up there is the neighbouring CORNERS, which have swung away along
+    // their own chords. Measured on the buck: SOLID272's corner occupies y 2.000..2.356 while its
+    // two neighbours' tubes end at 2.000 and 0.000, so it was being held back by nothing.
+    //
+    // Every corner's position depends on every other's, so they are solved TOGETHER and across
+    // ALL conductors -- an inner corner's nearest neighbour is nearly always another parallel's.
+    // Start each on its own chord, sweep it minimally off only if its TANGENT POINT is inside
+    // another's, and repeat until nothing moves. Corners in different halves, or on different
+    // rings, never meet and are not compared.
+
     for (size_t ci = 0; ci < conductors.size(); ++ci) {
         const auto& ct = conductors[ci];
         const MAS::Wire& wire = wireMap.at(ct.winding);
@@ -6099,6 +6986,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
                 auto add = t->get_additional_coordinates();
                 if (!(add && !add->empty() && (*add)[0].size() >= 2)) {
+                    // The conductor's LAST station legitimately has none (see ToroCross). Any
+                    // OTHER turn missing one is still missing data, and still refused: the outer
+                    // crossing is MKF's to place, never ours to invent.
+                    if (t == turns.back()) {
+                        gp_XY only(c[0], c[1]);
+                        double layerOffsetLast =
+                            std::max(0.0, (wwRadialHeight - only.Modulus()) - wireRadius);
+                        return {only, only, halfD + layerOffsetLast, /*hasOuter=*/false};
+                    }
                     throw std::runtime_error(
                         "ConductorBuilder: toroidal turn '" + t->get_name() +
                         "' has no additionalCoordinates (outer XY-plane crossing); "
@@ -6120,7 +7016,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (const MAS::Turn* t : turns) {
                 ToroCross rc = toroCrossRaw(t);
                 maxInnerRadial = std::max(maxInnerRadial, rc.pin.Modulus());
-                minRawOuter = std::min(minRawOuter, rc.pout.Modulus());
+                if (rc.hasOuter) {
+                    minRawOuter = std::min(minRawOuter, rc.pout.Modulus());
+                }
             }
             auto ringIndexOfInner = [&](const gp_XY& pin) -> int {
                 return std::max(0, static_cast<int>(
@@ -6137,6 +7035,25 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // caught loudly by the collision gate and the verification battery.
             auto toroCross = [&](const MAS::Turn* t) -> ToroCross { return toroCrossRaw(t); };
             (void)minRawOuter;
+            // ONE BAND DEPTH PER PARALLEL. A ring change is a one-off, but once EVERY turn
+            // takes the band the strands would otherwise all run the same lane and collide there
+            // instead (measured: parallels 0 and 1 central arcs 0.5095 mm apart against a 0.63 mm
+            // envelope). They cannot fan RADIALLY: the band has to clear the inner tubes by a
+            // fillet and reach the outer crossings by a radial leg, which on the buck leaves a
+            // window of only about 0.7 mm between r = 3.82 and 4.52 -- three parallels need twice
+            // a coated OD, 1.36 mm, and the band construction refuses (it did, at r = 3.34 mm).
+            // So they nest in DEPTH, one coated OD apart below the core, exactly as the rings
+            // already do and exactly as wires crossing under a real toroid stack.
+            int toroParIndex = 0;
+            {
+                int seen = 0;
+                for (const auto& other : conductors)
+                    if (other.winding == ct.winding) {
+                        if (other.parallel == ct.parallel) toroParIndex = seen;
+                        ++seen;
+                    }
+            }
+            const double toroBandRadius = 0.5 * (maxInnerRadial + minRawOuter);
 
             ToroCross first = toroCross(turns.front());
             ToroCross last = toroCross(turns.back());
@@ -6214,12 +7131,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // crossing — the lead's radial run clears both and reaches past the outer
             // diameter.
             double windingTop = 0.0, windingBot = 0.0, maxOuterR = 0.0;
+            // ABT #685 (Alf, 2026-08-19): the chords sit a BEND radius past the tube, exactly as
+            // the comment above says (rh0 = tube + bend) -- but this used wireRadius, which is
+            // bend / 1.05. The missing 5% of a wire radius (17.0 um here) came straight out of
+            // the lead radial's vertical clearance over the chords: measured 0.6620 mm against
+            // the 0.679 mm coated envelope, the exact difference.
+            const double chordReach = kRoundCornerBendFactor * wireRadius;
             for (size_t i = 0; i + 1 < turns.size(); ++i) {
                 ToroCross c0 = toroCross(turns[i]), c1 = toroCross(turns[i + 1]);
-                windingTop = std::max(windingTop, c0.tube + wireRadius);
+                windingTop = std::max(windingTop, c0.tube + chordReach);
                 windingBot = std::max(windingBot,
                                       toroWrapDepth(c0, c1, wireRadius) + wrapDepthOds(i) * od +
-                                          wireRadius);
+                                          chordReach);
             }
             for (const MAS::Turn* t : turns)
                 maxOuterR = std::max(maxOuterR, toroCross(t).pout.Modulus());
@@ -6480,6 +7403,720 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
             };
 
+            // The bore's packing pitch: the closest pair of inner stations across every
+            // conductor. It gates the corner solve (a single-station toroid has no wraps and
+            // nothing to solve) and nothing else -- the solve itself works from per-pair coated
+            // envelopes, never from this aggregate.
+            double toroInnerPitch = 0.0;
+            {
+                std::vector<gp_XY> stations;
+                for (const auto& other : conductors) {
+                    for (const MAS::Turn* t : other.turns) {
+                        const auto& c = t->get_coordinates();
+                        if (c.size() >= 2) stations.push_back(gp_XY(c[0], c[1]));
+                    }
+                }
+                double closest = std::numeric_limits<double>::max();
+                for (size_t a = 0; a + 1 < stations.size(); ++a) {
+                    for (size_t bb = a + 1; bb < stations.size(); ++bb) {
+                        const double d = (stations[a] - stations[bb]).Modulus();
+                        if (d > 1e-9) closest = std::min(closest, d);
+                    }
+                }
+                if (closest < std::numeric_limits<double>::max()) toroInnerPitch = closest;
+            }
+
+            // COMMON-DELTA CORNER SOLVE. ABT #685 (Alf, 2026-08-19). Three per-corner solves
+            // in a row optimised a wrong reconstruction of the arcs and reported success the
+            // geometry contradicted; the fix came from measuring the EMITTED arcs (validated
+            // against the gate's own polyPolyDistance to 0.1 um) and asking what rotation family
+            // clears them. The answer is a symmetry: rotating EVERY corner of one half by the
+            // same delta keeps all face crossings congruent rotated copies -- the property that
+            // made the spiral fix work -- and a +4 deg retilt (mirrored for the top half) lifts
+            // every adjacent corner pair from 0.6736 mm to exactly the 0.679 mm coated envelope,
+            // which saturates there because the stations themselves are 0.679 apart: touching,
+            // which is allowed; interpenetration is not. A full-ring DP over per-corner angles
+            // found no better minimum than the uniform delta, so the extra freedom buys nothing.
+            //
+            // The scan measures TRUE arcs -- the exact parameterisation pushArc emits:
+            //   top:    p(phi) = C - b*d*cos(phi) + yHat*b*sin(phi),   C = station + d*b
+            //   bottom: p(phi) = C + b*d*sin(phi) - yHat*b*cos(phi),   C = station - d*b
+            // Corners are compared within one half and one ring (rings are depth-staggered apart
+            // by construction, and within a ring the stagger is a shared offset that cancels).
+            // The station whole-arc rule (u.d <= sqrt(D^2 - E^2)) is enforced during the scan so
+            // the retilt cannot re-enter a lead corridor. No delta clearing everything is a loud
+            // refusal, not a fallback.
+            std::map<std::tuple<std::string, int64_t, size_t, bool>, gp_XY> toroResolvedCorners;
+            if (isToroidal && toroInnerPitch > 0.0) {
+                struct SolveCorner {
+                    gp_XY station, want;
+                    gp_XY pout;        // the rim crossing its face spiral runs to/from
+                    bool top = false;
+                    int ring = 0;
+                    double bend = 0, coatedRw = 0;
+                    std::string winding;
+                    int64_t parallel = 0;
+                    size_t transition = 0;
+                };
+                std::vector<SolveCorner> corners;
+                auto spiralTangent = [](const gp_XY& from, const gp_XY& to, bool atStart) {
+                    const double r0 = from.Modulus(), r1 = to.Modulus();
+                    const double az0 = std::atan2(-from.Y(), from.X());
+                    const double az1 = az0 + std::remainder(std::atan2(-to.Y(), to.X()) - az0, kTwoPi);
+                    const double span = az1 - az0;
+                    if (std::abs(span) < 1e-12) {
+                        gp_XY radial = to - from;
+                        if (radial.Modulus() > 1e-12) radial.Normalize();
+                        return radial;
+                    }
+                    const double k = (r1 - r0) / span;
+                    const double az = atStart ? az0 : az1;
+                    const double r = atStart ? r0 : r1;
+                    gp_XY t(k * std::cos(az) - r * std::sin(az), -k * std::sin(az) - r * std::cos(az));
+                    if (t.Modulus() > 1e-12) t.Normalize();
+                    if (span < 0) t = gp_XY(-t.X(), -t.Y());
+                    return t;
+                };
+                double maxInnerR = 0.0, odMax = 0.0;
+                for (const auto& ct2 : conductors) {
+                    for (const MAS::Turn* t : ct2.turns) {
+                        const auto& c = t->get_coordinates();
+                        if (c.size() >= 2)
+                            maxInnerR = std::max(maxInnerR, std::hypot(c[0], c[1]));
+                    }
+                    if (ct2.turns.empty()) continue;
+                    auto [cw, ch] = TurnBuilder::wireDimensions(wireMap.at(ct2.winding),
+                                                                *ct2.turns.front(), true);
+                    odMax = std::max(odMax, std::min(cw, ch));
+                }
+                for (const auto& ct2 : conductors) {
+                    if (ct2.turns.size() < 2) continue;
+                    auto [ew, eh] = TurnBuilder::wireDimensions(wireMap.at(ct2.winding),
+                                                                *ct2.turns.front(), opts.paintCoating);
+                    auto [cw, ch] = TurnBuilder::wireDimensions(wireMap.at(ct2.winding),
+                                                                *ct2.turns.front(), true);
+                    const double rw = 0.5 * std::min(ew, eh);
+                    const double bend = kRoundCornerBendFactor * rw;
+                    const double coatedRw = 0.5 * std::min(cw, ch);
+                    for (size_t i = 0; i + 1 < ct2.turns.size(); ++i) {
+                        const auto& ca = ct2.turns[i]->get_coordinates();
+                        const auto& cb = ct2.turns[i + 1]->get_coordinates();
+                        auto add = ct2.turns[i]->get_additional_coordinates();
+                        if (ca.size() < 2 || cb.size() < 2) continue;
+                        if (!(add && !add->empty() && (*add)[0].size() >= 2)) continue;
+                        const gp_XY pin(ca[0], ca[1]), nextPin(cb[0], cb[1]);
+                        const gp_XY pout((*add)[0][0], (*add)[0][1]);
+                        gp_XY dTop = pout - pin, dTopEnd = dTop;
+                        gp_XY eStart = nextPin - pout, eEnd = eStart;
+                        if (dTop.Modulus() < 1e-12 || eStart.Modulus() < 1e-12) continue;
+                        dTop.Normalize(); dTopEnd = dTop;
+                        eStart.Normalize(); eEnd = eStart;
+                        for (int pass = 0; pass < 8; ++pass) {   // same fixed point as emission
+                            const gp_XY a1 = pin + dTop * bend, b1 = pout - dTopEnd * bend;
+                            dTop = spiralTangent(a1, b1, true);
+                            dTopEnd = spiralTangent(a1, b1, false);
+                            const gp_XY a2 = pout + eStart * bend, b2 = nextPin - eEnd * bend;
+                            eStart = spiralTangent(a2, b2, true);
+                            eEnd = spiralTangent(a2, b2, false);
+                        }
+                        auto ringOf = [&](const gp_XY& q) {
+                            return odMax > 1e-12
+                                       ? std::max(0, int(std::llround((maxInnerR - q.Modulus()) / odMax)))
+                                       : 0;
+                        };
+                        corners.push_back({pin, dTop, pout, true, ringOf(pin), bend, coatedRw,
+                                           ct2.winding, ct2.parallel, i});
+                        corners.push_back({nextPin, eEnd, pout, false, ringOf(nextPin), bend,
+                                           coatedRw, ct2.winding, ct2.parallel, i});
+                    }
+                }
+                auto rotated = [](const gp_XY& d, double rad) {
+                    return gp_XY(d.X() * std::cos(rad) - d.Y() * std::sin(rad),
+                                 d.X() * std::sin(rad) + d.Y() * std::cos(rad));
+                };
+                // TRUE arc sample, in relative depth (0 = this half's tube end).
+                constexpr int kN = 32;
+                auto sampleArc = [&](const SolveCorner& k, const gp_XY& d,
+                                     std::array<std::array<double, 3>, kN + 1>& out) {
+                    for (int q = 0; q <= kN; ++q) {
+                        const double f = 0.5 * kPi * q / kN;
+                        if (k.top) {
+                            out[q] = {k.station.X() + k.bend * d.X() * (1.0 - std::cos(f)),
+                                      k.station.Y() + k.bend * d.Y() * (1.0 - std::cos(f)),
+                                      k.bend * std::sin(f)};
+                        }
+                        else {
+                            out[q] = {k.station.X() - k.bend * d.X() * (1.0 - std::sin(f)),
+                                      k.station.Y() - k.bend * d.Y() * (1.0 - std::sin(f)),
+                                      -k.bend * std::cos(f)};
+                        }
+                    }
+                };
+                // THE SPIRAL A CORNER DRAGS WITH IT. Rotating a corner moves its face
+                // crossing's inner end, so the spiral is part of the corner's footprint: leaving
+                // it out let the lead-pinched corners rotate 15 deg and their spirals then
+                // pinched the neighbours' by 34 um (measured, chord-vs-chord 0.6449 against
+                // 0.679). The far-end tangent re-solves per candidate exactly as emission does.
+                constexpr int kSp = 24;
+                auto impliedSpiral = [&](const SolveCorner& k, const gp_XY& d,
+                                         std::array<std::array<double, 3>, kSp + 1>& out) {
+                    gp_XY nearEnd, farDir;
+                    if (k.top) {
+                        nearEnd = gp_XY(k.station.X() + d.X() * k.bend,
+                                        k.station.Y() + d.Y() * k.bend);
+                        farDir = d;
+                        for (int pass = 0; pass < 8; ++pass) {
+                            farDir = spiralTangent(nearEnd,
+                                                   gp_XY(k.pout.X() - farDir.X() * k.bend,
+                                                         k.pout.Y() - farDir.Y() * k.bend),
+                                                   false);
+                        }
+                    }
+                    else {
+                        nearEnd = gp_XY(k.station.X() - d.X() * k.bend,
+                                        k.station.Y() - d.Y() * k.bend);
+                        farDir = d;
+                        for (int pass = 0; pass < 8; ++pass) {
+                            farDir = spiralTangent(gp_XY(k.pout.X() + farDir.X() * k.bend,
+                                                         k.pout.Y() + farDir.Y() * k.bend),
+                                                   nearEnd, true);
+                        }
+                    }
+                    const gp_XY far = k.top ? gp_XY(k.pout.X() - farDir.X() * k.bend,
+                                                    k.pout.Y() - farDir.Y() * k.bend)
+                                            : gp_XY(k.pout.X() + farDir.X() * k.bend,
+                                                    k.pout.Y() + farDir.Y() * k.bend);
+                    const double r0 = nearEnd.Modulus(), r1 = far.Modulus();
+                    const double az0 = std::atan2(-nearEnd.Y(), nearEnd.X());
+                    const double az1 =
+                        az0 + std::remainder(std::atan2(-far.Y(), far.X()) - az0, kTwoPi);
+                    const double yRel = k.top ? k.bend : -k.bend;   // the chord plane
+                    for (int q = 0; q <= kSp; ++q) {
+                        const double t = double(q) / kSp;
+                        const double az = az0 + (az1 - az0) * t, r = r0 + (r1 - r0) * t;
+                        out[q] = {r * std::cos(az), -r * std::sin(az), yRel};
+                    }
+                };
+                auto footPairMin = [&](const SolveCorner& A, const gp_XY& dA, const SolveCorner& B,
+                                       const gp_XY& dB) {
+                    // full footprint: corner arc + implied spiral, each against each
+                    std::array<std::array<double, 3>, kN + 1> aArc, bArc;
+                    std::array<std::array<double, 3>, kSp + 1> aSp, bSp;
+                    sampleArc(A, dA, aArc);
+                    sampleArc(B, dB, bArc);
+                    impliedSpiral(A, dA, aSp);
+                    impliedSpiral(B, dB, bSp);
+                    double best = std::numeric_limits<double>::max();
+                    auto acc = [&](const auto& U, const auto& V) {
+                        for (const auto& u : U)
+                            for (const auto& v : V) {
+                                const double dx = u[0] - v[0], dz = u[1] - v[1], dy = u[2] - v[2];
+                                best = std::min(best, std::sqrt(dx * dx + dz * dz + dy * dy));
+                            }
+                    };
+                    acc(aArc, bArc);
+                    acc(aArc, bSp);
+                    acc(aSp, bArc);
+                    acc(aSp, bSp);
+                    return best;
+                };
+                // The same footprint as ANALYTIC primitives, so the certified engine can rule
+                // on candidate headings with the exact curves the emission will produce (relative
+                // depths: 0 = this half's tube end, +/-bend = the chord plane).
+                auto makeFootprint = [&](const SolveCorner& k, const gp_XY& d, Primitive& arcPr,
+                                         Primitive& spPr) {
+                    const gp_XYZ d3(d.X(), 0, d.Y());
+                    const gp_XYZ yHat(0, 1, 0);
+                    arcPr = Primitive{};
+                    arcPr.kind = Primitive::ARC3;
+                    arcPr.arc.sweep = 0.5 * kPi;
+                    gp_XY nearEnd, farDir = d;
+                    if (k.top) {
+                        arcPr.arc.c = gp_Pnt(k.station.X() + d.X() * k.bend, 0.0,
+                                             k.station.Y() + d.Y() * k.bend);
+                        arcPr.arc.axis = yHat.Crossed(d3);
+                        arcPr.arc.v0 = d3 * (-k.bend);
+                        nearEnd = gp_XY(k.station.X() + d.X() * k.bend,
+                                        k.station.Y() + d.Y() * k.bend);
+                        for (int pass = 0; pass < 8; ++pass) {
+                            farDir = spiralTangent(nearEnd,
+                                                   gp_XY(k.pout.X() - farDir.X() * k.bend,
+                                                         k.pout.Y() - farDir.Y() * k.bend),
+                                                   false);
+                        }
+                    }
+                    else {
+                        arcPr.arc.c = gp_Pnt(k.station.X() - d.X() * k.bend, 0.0,
+                                             k.station.Y() - d.Y() * k.bend);
+                        arcPr.arc.axis = d3.Crossed(yHat);
+                        arcPr.arc.v0 = yHat * (-k.bend);
+                        nearEnd = gp_XY(k.station.X() - d.X() * k.bend,
+                                        k.station.Y() - d.Y() * k.bend);
+                        for (int pass = 0; pass < 8; ++pass) {
+                            farDir = spiralTangent(gp_XY(k.pout.X() + farDir.X() * k.bend,
+                                                         k.pout.Y() + farDir.Y() * k.bend),
+                                                   nearEnd, true);
+                        }
+                    }
+                    const gp_XY far = k.top ? gp_XY(k.pout.X() - farDir.X() * k.bend,
+                                                    k.pout.Y() - farDir.Y() * k.bend)
+                                            : gp_XY(k.pout.X() + farDir.X() * k.bend,
+                                                    k.pout.Y() + farDir.Y() * k.bend);
+                    const double yRel = k.top ? k.bend : -k.bend;
+                    spPr = Primitive{};
+                    spPr.kind = Primitive::SPIRAL;
+                    const double az0 = std::atan2(-nearEnd.Y(), nearEnd.X());
+                    const double az1 =
+                        az0 + std::remainder(std::atan2(-far.Y(), far.X()) - az0, kTwoPi);
+                    spPr.spiral = {0.0,  0.0,  nearEnd.Modulus(), yRel, az0,
+                                   far.Modulus(), yRel, az1, false};
+                };
+                // CERTIFIED footprint clearance: true curves at or beyond E, or a proven
+                // violation. The sampled figure is only a fast path in the direction it is
+                // rigorous in (points on curves are achievable distances; chord-minus-sag is a
+                // certain lower bound).
+                auto footprintClears = [&](const SolveCorner& A, const gp_XY& dA,
+                                           const SolveCorner& B, const gp_XY& dB, double E) {
+                    Primitive aArc, aSp, bArc, bSp;
+                    makeFootprint(A, dA, aArc, aSp);
+                    makeFootprint(B, dB, bArc, bSp);
+                    for (const Primitive* u : {&aArc, &aSp}) {
+                        for (const Primitive* v : {&bArc, &bSp}) {
+                            if (!cert::provePairClears(*u, *v, E).clears) return false;
+                        }
+                    }
+                    return true;
+                };
+                // Acceptance for one half at one delta: every same-ring pair of TRUE arcs at or
+                // beyond the pair's coated envelope (less this sampler's own sag), and every
+                // corner still passing the station whole-arc rule.
+                // ONLY THE LEADS STAND IN A CORNER'S HEIGHT BAND (Alf, 2026-08-19: "the
+                // terminal will be at a different Z coordinate"). A top corner lives above the
+                // core, where the neighbouring TUBES have already ended -- the only vertical
+                // copper up there is an EXIT lead ascending from a conductor's last station.
+                // Mirrored below: only ENTRANCE leads descend through the bottom corners' band.
+                // Testing against every station re-imposed exactly the phantom constraint that
+                // blocked SOLID272 earlier, and here it rejected every retilt ("station rule at
+                // (-1.354, 2.290)" -- a station whose tube ends at the core face).
+                std::vector<std::pair<gp_XY, double>> exitVerticals, entranceVerticals;
+                for (const auto& ct2 : conductors) {
+                    if (ct2.turns.empty()) continue;
+                    auto [cw, ch] = TurnBuilder::wireDimensions(wireMap.at(ct2.winding),
+                                                                *ct2.turns.front(), true);
+                    const double crw = 0.5 * std::min(cw, ch);
+                    const auto& cf = ct2.turns.front()->get_coordinates();
+                    const auto& cl = ct2.turns.back()->get_coordinates();
+                    if (cf.size() >= 2)
+                        entranceVerticals.push_back({gp_XY(cf[0], cf[1]), crw});
+                    if (cl.size() >= 2)
+                        exitVerticals.push_back({gp_XY(cl[0], cl[1]), crw});
+                }
+                if (std::getenv("MVB_TORO_ARC_DIAG")) {
+                    // Full-precision packing audit: how MKF's own station spacing compares with
+                    // the coated envelope our wire dimensions give. A sub-nanometre difference
+                    // here is the exact ceiling on what any corner geometry can achieve.
+                    double worstDeficit = -1.0, tightest = std::numeric_limits<double>::max();
+                    for (size_t a2 = 0; a2 < corners.size(); ++a2)
+                        for (size_t b2 = a2 + 1; b2 < corners.size(); ++b2) {
+                            const double D =
+                                (corners[a2].station - corners[b2].station).Modulus();
+                            if (D < 1e-9 || D > 1e-3) continue;
+                            const double E2 = corners[a2].coatedRw + corners[b2].coatedRw;
+                            tightest = std::min(tightest, D);
+                            worstDeficit = std::max(worstDeficit, E2 - D);
+                        }
+                    std::cerr.precision(15);
+                    std::cerr << "[pack] tightest station spacing " << tightest
+                              << " m, worst (envelope - spacing) " << worstDeficit * 1e9
+                              << " nm, envelope " << 2.0 * corners.front().coatedRw << " m"
+                              << std::endl;
+                }
+                // Same-wire consecutive transitions are one continuous conductor and lie
+                // against each other by construction -- the gate exempts them (|ordinal
+                // diff| <= 1) and so does every check here.
+                auto sameWireAdjacent = [&](const SolveCorner& a2, const SolveCorner& b2) {
+                    return a2.winding == b2.winding && a2.parallel == b2.parallel &&
+                           (a2.transition > b2.transition ? a2.transition - b2.transition
+                                                          : b2.transition - a2.transition) <= 1;
+                };
+                // Stage-1 headings per corner, filled per half below and consumed by stage 2.
+                std::map<size_t, gp_XY> stage1Dir;
+                for (bool top : {true, false}) {
+                    // STAGE 1: ONE ABSOLUTE TILT FOR THE HALF. The family that reaches the coated
+                    // envelope EXACTLY is equal tilt relative to each corner's own radial: the
+                    // corners (and the spirals they drag) become exactly congruent rotated copies,
+                    // whose minimum mutual distance equals the station spacing -- which MKF packs
+                    // at the envelope to within attometres. A common delta on top of the
+                    // per-corner spiral tangents (the previous family) left the tilts unequal by
+                    // up to 2.5 deg and its optimum 78 nm short, which made the whole interior
+                    // ring uniformly infeasible and rigid. The tilt is chosen as the smallest
+                    // move from the natural (median-tangent) tilt that CERTIFIES; scan resolution
+                    // only affects how quickly it is found, never the acceptance, which is the
+                    // certified engine's.
+                    struct Frame {
+                        gp_XY radial, tangent;
+                    };
+                    std::map<size_t, Frame> frames;
+                    std::vector<double> tilts;
+                    std::vector<size_t> half;
+                    for (size_t idx = 0; idx < corners.size(); ++idx) {
+                        const auto& k = corners[idx];
+                        if (k.top != top) continue;
+                        gp_XY r = k.station;
+                        if (r.Modulus() < 1e-12) continue;
+                        r.Normalize();
+                        const gp_XY t(-r.Y(), r.X());
+                        frames[idx] = {r, t};
+                        half.push_back(idx);
+                        tilts.push_back(std::atan2(k.want.Dot(t), k.want.Dot(r)));
+                    }
+                    if (half.empty()) continue;
+                    std::vector<double> sortedTilts = tilts;
+                    std::sort(sortedTilts.begin(), sortedTilts.end());
+                    const double tilt0 = sortedTilts[sortedTilts.size() / 2];
+                    auto dirAt = [&](size_t idx, double tilt) {
+                        const Frame& f = frames[idx];
+                        return gp_XY(f.radial.X() * std::cos(tilt) + f.tangent.X() * std::sin(tilt),
+                                     f.radial.Y() * std::cos(tilt) + f.tangent.Y() * std::sin(tilt));
+                    };
+                    auto pairIndices = [&]() {
+                        std::vector<std::pair<size_t, size_t>> out;
+                        for (size_t a2 = 0; a2 < half.size(); ++a2)
+                            for (size_t b2 = a2 + 1; b2 < half.size(); ++b2) {
+                                const auto& A = corners[half[a2]];
+                                const auto& B = corners[half[b2]];
+                                if (A.ring != B.ring) continue;
+                                if (sameWireAdjacent(A, B)) continue;
+                                const double E2 = A.coatedRw + B.coatedRw;
+                                if ((A.station - B.station).Modulus() >
+                                    2.0 * E2 + A.bend + B.bend)
+                                    continue;
+                                out.push_back({half[a2], half[b2]});
+                            }
+                        return out;
+                    }();
+                    auto sampledMinAt = [&](double tilt) {
+                        double worst = std::numeric_limits<double>::max();
+                        for (const auto& [ia, ib] : pairIndices) {
+                            const double E2 = corners[ia].coatedRw + corners[ib].coatedRw;
+                            worst = std::min(worst, footPairMin(corners[ia], dirAt(ia, tilt),
+                                                                corners[ib], dirAt(ib, tilt)) -
+                                                        E2);
+                        }
+                        return worst;
+                    };
+                    auto certifiedMinAt = [&](double tilt) {
+                        double worst = std::numeric_limits<double>::max();
+                        for (const auto& [ia, ib] : pairIndices) {
+                            const double E2 = corners[ia].coatedRw + corners[ib].coatedRw;
+                            Primitive aArc, aSp, bArc, bSp;
+                            makeFootprint(corners[ia], dirAt(ia, tilt), aArc, aSp);
+                            makeFootprint(corners[ib], dirAt(ib, tilt), bArc, bSp);
+                            for (const Primitive* u : {&aArc, &aSp})
+                                for (const Primitive* v : {&bArc, &bSp})
+                                    worst = std::min(worst,
+                                                     cert::boundedMinDist(
+                                                         *u, *v, 0.25 * kCertEpsilon, 20000)
+                                                             .lb -
+                                                         E2);
+                        }
+                        return worst;
+                    };
+                    const double before = sampledMinAt(tilt0);
+                    double chosenTilt = tilt0;
+                    bool found = false;
+                    for (int n = 0; n <= 60 && !found; ++n) {   // 0.25 deg steps to +/-15
+                        for (double sign : {1.0, -1.0}) {
+                            const double tilt = tilt0 + sign * n * 0.25 * kPi / 180.0;
+                            const double sampled = sampledMinAt(tilt);
+                            if (sampled < -kCertEpsilon) continue;   // achieved: truly short
+                            if (certifiedMinAt(tilt) >= -kCertEpsilon) {
+                                chosenTilt = tilt;
+                                found = true;
+                                break;
+                            }
+                            // certified says short, sampled says maybe: golden-polish this step
+                            const double stepRad = 0.25 * kPi / 180.0;
+                            double lo = tilt - stepRad, hi = tilt + stepRad;
+                            const double gr = 0.5 * (std::sqrt(5.0) - 1.0);
+                            double x1 = hi - gr * (hi - lo), x2 = lo + gr * (hi - lo);
+                            double f1 = certifiedMinAt(x1), f2 = certifiedMinAt(x2);
+                            for (int it = 0; it < 40; ++it) {
+                                if (f1 < f2) {
+                                    lo = x1;
+                                    x1 = x2;
+                                    f1 = f2;
+                                    x2 = lo + gr * (hi - lo);
+                                    f2 = certifiedMinAt(x2);
+                                }
+                                else {
+                                    hi = x2;
+                                    x2 = x1;
+                                    f2 = f1;
+                                    x1 = hi - gr * (hi - lo);
+                                    f1 = certifiedMinAt(x1);
+                                }
+                            }
+                            if (std::max(f1, f2) >= -kCertEpsilon) {
+                                chosenTilt = f1 >= f2 ? x1 : x2;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (n == 0 && found) break;
+                    }
+                    if (!found) {
+                        std::ostringstream m;
+                        m << "ConductorBuilder: no common absolute corner tilt within 15 deg of "
+                             "the natural tangents certifies the "
+                          << (top ? "top" : "bottom")
+                          << " inner corners of this toroid at their coated envelopes (natural "
+                             "tilt gives a certified worst pair "
+                          << before << " m short). Wires may touch at their coated envelopes, "
+                             "never interpenetrate.";
+                        throw std::runtime_error(m.str());
+                    }
+                    if (std::getenv("MVB_TORO_ARC_DIAG")) {
+                        std::cerr.precision(12);
+                        std::cerr << "[tilt] " << (top ? "top" : "bottom") << " half: natural "
+                                  << tilt0 * 180.0 / kPi << " deg (sampled slack " << before * 1e9
+                                  << " nm) -> tilt " << chosenTilt * 180.0 / kPi
+                                  << " deg, certified slack " << certifiedMinAt(chosenTilt) * 1e9
+                                  << " nm" << std::endl;
+                    }
+                    for (size_t idx : half) stage1Dir[idx] = dirAt(idx, chosenTilt);
+                    // STAGE 2: DIRECTED TWIST PROPAGATION. A corner pinched by a terminal lead
+                    // must leave the common tilt by up to ~15 deg, and at exact touch no
+                    // neighbour tolerates that relative twist -- the deviation has to decay
+                    // corner by corner into the interior along the pairwise-feasible curve.
+                    // Emergent versions of this wave (grid pushes, coordinate ascent, pairwise
+                    // nudges) all either circulated or stalled; this one is deterministic: the
+                    // lead-pinched corners move first (minimal certified heading for their
+                    // leads), then a wavefront expands outward, each corner solved ONCE for the
+                    // heading nearest its stage-1 tilt that certifies against leads and against
+                    // ALREADY-MOVED corners only -- the un-moved side joins the wave next. Every
+                    // acceptance is the certified engine's; the final verification judges the
+                    // whole configuration.
+                    const auto& verticals2 = top ? exitVerticals : entranceVerticals;
+                    std::vector<size_t> mine;
+                    std::map<size_t, gp_XY> dirNow;
+                    for (size_t idx = 0; idx < corners.size(); ++idx) {
+                        if (corners[idx].top != top) continue;
+                        mine.push_back(idx);
+                        dirNow[idx] = stage1Dir.count(idx) ? stage1Dir[idx] : corners[idx].want;
+                    }
+                    auto leadOk = [&](const SolveCorner& k, const gp_XY& d) {
+                        const gp_XY adv = top ? d : gp_XY(-d.X(), -d.Y());
+                        for (const auto& [stn, crw] : verticals2) {
+                            const gp_XY u = stn - k.station;
+                            const double D = u.Modulus();
+                            const double E = k.coatedRw + crw;
+                            if (D < 1e-9 || D > E + k.bend + 1e-9) continue;
+                            if (u.Dot(adv) > std::sqrt(std::max(0.0, D * D - E * E)) + 1e-9) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    };
+                    auto reachable = [&](size_t a2, size_t b2) {
+                        const auto& A = corners[a2];
+                        const auto& B = corners[b2];
+                        if (A.ring != B.ring) return false;
+                        if (sameWireAdjacent(A, B)) return false;
+                        const double E2 = A.coatedRw + B.coatedRw;
+                        return (A.station - B.station).Modulus() <= 2.0 * E2 + A.bend + B.bend;
+                    };
+                    // Certified slack of corner idx at heading d against a SUBSET of corners.
+                    auto slackAgainst = [&](size_t idx, const gp_XY& d,
+                                            const std::set<size_t>& against) {
+                        const auto& k = corners[idx];
+                        double slack = std::numeric_limits<double>::max();
+                        Primitive myArc, mySp;
+                        makeFootprint(k, d, myArc, mySp);
+                        for (size_t j2 : against) {
+                            if (j2 == idx || !reachable(idx, j2)) continue;
+                            const auto& other = corners[j2];
+                            const double E2 = k.coatedRw + other.coatedRw;
+                            Primitive oArc, oSp;
+                            makeFootprint(other, dirNow[j2], oArc, oSp);
+                            for (const Primitive* u : {&myArc, &mySp})
+                                for (const Primitive* v : {&oArc, &oSp})
+                                    slack = std::min(
+                                        slack, cert::boundedMinDist(*u, *v, 0.25 * kCertEpsilon,
+                                                                    20000)
+                                                       .lb -
+                                                   E2);
+                        }
+                        return slack;
+                    };
+                    // Heading nearest `base` that satisfies leads and certifies against
+                    // `against`; 0.1 deg outward scan with golden landing at window edges.
+                    auto nearestFeasible = [&](size_t idx, const gp_XY& base,
+                                               const std::set<size_t>& against, gp_XY* out) {
+                        const auto& k = corners[idx];
+                        for (int n = 0; n <= 400; ++n) {
+                            for (double sign : {1.0, -1.0}) {
+                                const double rot = sign * n * 0.1 * kPi / 180.0;
+                                const gp_XY cand = rotated(base, rot);
+                                if (!leadOk(k, cand)) continue;
+                                double slack = slackAgainst(idx, cand, against);
+                                double rotUse = rot;
+                                if (slack < -kCertEpsilon) {
+                                    const double stepRad = 0.1 * kPi / 180.0;
+                                    double lo = rot - stepRad, hi = rot + stepRad;
+                                    const double gr = 0.5 * (std::sqrt(5.0) - 1.0);
+                                    auto evalAt = [&](double r2) {
+                                        const gp_XY c2 = rotated(base, r2);
+                                        return leadOk(k, c2)
+                                                   ? slackAgainst(idx, c2, against)
+                                                   : -std::numeric_limits<double>::max();
+                                    };
+                                    double x1 = hi - gr * (hi - lo), x2 = lo + gr * (hi - lo);
+                                    double f1 = evalAt(x1), f2 = evalAt(x2);
+                                    for (int it = 0; it < 40; ++it) {
+                                        if (f1 < f2) {
+                                            lo = x1;
+                                            x1 = x2;
+                                            f1 = f2;
+                                            x2 = lo + gr * (hi - lo);
+                                            f2 = evalAt(x2);
+                                        }
+                                        else {
+                                            hi = x2;
+                                            x2 = x1;
+                                            f2 = f1;
+                                            x1 = hi - gr * (hi - lo);
+                                            f1 = evalAt(x1);
+                                        }
+                                    }
+                                    if (std::max(f1, f2) < -kCertEpsilon) continue;
+                                    rotUse = f1 >= f2 ? x1 : x2;
+                                }
+                                *out = rotated(base, rotUse);
+                                if (!leadOk(k, *out)) continue;
+                                return true;
+                            }
+                            if (n == 0) {
+                                // rot 0 tried once; fall through to wider rotations
+                            }
+                        }
+                        return false;
+                    };
+                    std::set<size_t> moved;
+                    std::vector<size_t> front;
+                    for (size_t idx : mine) {
+                        const auto& k = corners[idx];
+                        if (leadOk(k, dirNow[idx])) continue;
+                        gp_XY d;
+                        if (!nearestFeasible(idx, dirNow[idx], {}, &d)) {
+                            std::ostringstream m;
+                            m << "ConductorBuilder: the " << (top ? "top" : "bottom")
+                              << " inner corner at (" << k.station.X() << ", " << k.station.Y()
+                              << ") has no heading satisfying the terminal lead verticals at "
+                                 "all.";
+                            throw std::runtime_error(m.str());
+                        }
+                        dirNow[idx] = d;
+                        moved.insert(idx);
+                        front.push_back(idx);
+                        if (std::getenv("MVB_TORO_ARC_DIAG")) {
+                            std::cerr << "[wave] " << (top ? "top" : "bottom") << " lead corner ("
+                                      << k.station.X() * 1e3 << ", " << k.station.Y() * 1e3
+                                      << ") seeds the twist" << std::endl;
+                        }
+                    }
+                    while (!front.empty()) {
+                        std::vector<size_t> next;
+                        for (size_t idx : front) {
+                            for (size_t j2 : mine) {
+                                if (moved.count(j2) || !reachable(idx, j2)) continue;
+                                // does the wavefront actually disturb it?
+                                if (slackAgainst(j2, dirNow[j2], moved) >= -kCertEpsilon &&
+                                    leadOk(corners[j2], dirNow[j2]))
+                                    continue;
+                                gp_XY d;
+                                if (!nearestFeasible(j2, stage1Dir.count(j2) ? stage1Dir[j2]
+                                                                             : corners[j2].want,
+                                                     moved, &d)) {
+                                    std::ostringstream m;
+                                    m << "ConductorBuilder: the twist from the terminal leads "
+                                         "cannot decay through the "
+                                      << (top ? "top" : "bottom") << " inner corner at ("
+                                      << corners[j2].station.X() << ", "
+                                      << corners[j2].station.Y()
+                                      << "): no heading certifies against the already-settled "
+                                         "corners. Wires may touch at their coated envelopes, "
+                                         "never interpenetrate.";
+                                    throw std::runtime_error(m.str());
+                                }
+                                dirNow[j2] = d;
+                                moved.insert(j2);
+                                next.push_back(j2);
+                                if (std::getenv("MVB_TORO_ARC_DIAG")) {
+                                    std::cerr << "[wave] -> (" << corners[j2].station.X() * 1e3
+                                              << ", " << corners[j2].station.Y() * 1e3
+                                              << ") joins the wave" << std::endl;
+                                }
+                            }
+                        }
+                        front = std::move(next);
+                    }
+                    // FINAL VERIFICATION -- every corner, certified against the WHOLE settled
+                    // configuration and its leads. This is the judge; nothing above may relax it.
+                    std::set<size_t> everyone(mine.begin(), mine.end());
+                    for (size_t idx : mine) {
+                        const auto& k = corners[idx];
+                        if (leadOk(k, dirNow[idx]) &&
+                            slackAgainst(idx, dirNow[idx], everyone) >= -kCertEpsilon)
+                            continue;
+                        if (std::getenv("MVB_TORO_ARC_DIAG")) {
+                            std::cerr.precision(12);
+                            std::cerr << "[stuck] corner at (" << k.station.X() * 1e3 << ", "
+                                      << k.station.Y() * 1e3 << ") leadOk="
+                                      << leadOk(k, dirNow[idx]) << " certSlack="
+                                      << slackAgainst(idx, dirNow[idx], everyone) * 1e9 << " nm; "
+                                      << "per-neighbour sampled slacks:" << std::endl;
+                            for (size_t j2 : mine) {
+                                if (j2 == idx) continue;
+                                const auto& other = corners[j2];
+                                if (other.ring != k.ring) continue;
+                                if (sameWireAdjacent(k, other)) continue;
+                                const double E2 = k.coatedRw + other.coatedRw;
+                                if ((other.station - k.station).Modulus() >
+                                    2.0 * E2 + k.bend + other.bend)
+                                    continue;
+                                std::cerr << "    vs (" << other.station.X() * 1e3 << ", "
+                                          << other.station.Y() * 1e3 << "): "
+                                          << (footPairMin(k, dirNow[idx], other, dirNow[j2]) - E2) *
+                                                 1e9
+                                          << " nm" << std::endl;
+                            }
+                        }
+                        std::ostringstream m;
+                        m << "ConductorBuilder: the " << (top ? "top" : "bottom")
+                          << " inner corner at (" << k.station.X() << ", " << k.station.Y()
+                          << ") cannot satisfy both the terminal lead verticals and its "
+                             "neighbouring corner arcs after relaxation: the coated envelopes "
+                             "interpenetrate. Wires may touch at their coated envelopes, never "
+                             "interpenetrate.";
+                        throw std::runtime_error(m.str());
+                    }
+                    for (size_t idx : mine) {
+                        const auto& k = corners[idx];
+                        toroResolvedCorners[{k.winding, k.parallel, k.transition, k.top}] =
+                            dirNow[idx];
+                    }
+                }
+            }
+
+            auto toroCornerDir = [&](size_t transition, bool top) {
+                auto found = toroResolvedCorners.find(
+                    std::make_tuple(ct.winding, ct.parallel, transition, top));
+                return found == toroResolvedCorners.end()
+                           ? gp_XY(std::numeric_limits<double>::quiet_NaN(), 0)
+                           : found->second;
+            };
+
             // WRAPS FIRST, leads after: the lead router validates candidates against the
             // emitted primitives, so the winding must exist before its terminals are dressed.
             // A ring change is the Z-connection transition (dragback over the top); everything
@@ -6506,11 +8143,30 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // radius.
                 const double toroBend = kRoundCornerBendFactor * wireRadius;
                 if (r0 != r1)
+                    // Same per-parallel nesting as below: once every turn is on a band, a ring
+                    // change that ignored the strand index shared its lane with the others'
+                    // (parallel 0's ring-transition leg against parallel 1's central arc, both
+                    // at y = -3.035 mm).
+                    appendToroTransitionBand(
+                        path, c0, c1, toroBend,
+                        (std::max(0, std::max(r0, r1) - 1) +
+                         (toroBandForAll ? toroParIndex : 0)) * od,
+                        toroBandRadius, wlabel, i);
+                else if (toroBandForAll)
+                    // Same ring, but the straight chords collide somewhere in this design, so
+                    // EVERY turn takes the band (Alf: "once one turn needs it, use it for all of
+                    // them"). It keeps this ring's own stagger depth, so rings still nest, and it
+                    // runs on THIS PARALLEL'S OWN mid-annulus circle: a ring change is a one-off,
+                    // but once every turn takes the band the strands would otherwise share one
+                    // circle and collide there instead (measured: parallels 0 and 1 central arcs
+                    // 0.5095 mm apart against a 0.63 mm envelope). Concentric circles one OD apart
+                    // never converge, which is the whole point of using an arc over a chord.
                     appendToroTransitionBand(path, c0, c1, toroBend,
-                                             std::max(0, std::max(r0, r1) - 1) * od,
-                                             0.5 * (maxInnerRadial + minRawOuter), wlabel, i);
+                                             (wrapDepthOds(i) + toroParIndex) * od,
+                                             toroBandRadius, wlabel, i);
                 else
-                    appendToroWrap(path, c0, c1, toroBend, wrapDepthOds(i) * od, wlabel, i);
+                    appendToroWrap(path, c0, c1, toroBend, wrapDepthOds(i) * od, wlabel, i,
+                                   toroCornerDir(i, true), toroCornerDir(i, false));
             }
 
             const size_t wrapPrimCount = path.prims.size();
@@ -6578,7 +8234,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
                                  size_t ordinal, bool stationAtFront, double liftRaise = 0.0,
                                  double azLead = kPlaneAz,
-                                 const std::function<double(double)>& raiseAt = {}) {
+                                 const std::function<double(double)>& raiseAt = {},
+                                 // Rect/stadium columns: this lead's slot along the connection
+                                 // face. The face is straight, so a slot is a rigid translation of
+                                 // the whole route -- the run stays exactly parallel to Z, it just
+                                 // runs at its own x. Zero on round columns, where the fan's
+                                 // azimuth already carries the slot.
+                                 double xShift = 0.0) {
             // Absorb intermediate waypoints closer than the wire radius to their
             // neighbour: a jog shorter than the wire's own radius lies entirely inside
             // the pipe body of the adjacent edge (and inside MKF's drawn rectangle,
@@ -6675,6 +8337,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 leadPts[tip] = gp_Pnt(leadPts[nb].X(), kept[tip].y,
                                       -(leadTipRadius + zoff));
             }
+            if (xShift != 0.0)
+                for (auto& q : leadPts) q.SetX(q.X() + xShift);
             // The lead lies in its fan slot's axial plane and runs straight out radially, like
             // the dragback.
             if (!rectWire) {
@@ -6759,7 +8423,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 return false;   // ABT #685: the final radius-step transition is a steep landing
             }
             const PitchBand band = bandAt(bandsE, a.x, wireRadius, medianPitch, zOrderAdvance);
-            return isZReturn(a, b, wireRadius, band.medianPitch, band.advance, ct.parallels);
+            return mkfSaysReturn(turns[i]->get_name(), turns[i + 1]->get_name(),
+                                 isZReturn(a, b, wireRadius, band.medianPitch, band.advance,
+                                           ct.parallels));
         };
         if (effectivelyRound) {
             for (size_t i = 0; i + 1 < nEmit; ++i) {
@@ -6788,7 +8454,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (turnRadius < ld.radius - wireRadius) continue;
                 // Raise by the dragback wire's own COATED diameter: that is what has to be
                 // cleared, and different windings use different wire.
-                out.push_back({ld.az, ld.diam});
+                out.push_back({ld.az, ld.radius, ld.diam});
             }
             return out;
         };
@@ -7019,9 +8685,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // The lift must clear the tallest column along the whole path.
                 const double entrRaise =
                     tallestBumpColumn(bumpsForTurn(1e30)).first;
+                // The entrance turn begins at x = -slot, so its lead meets it there.
                 pushPlaneSegs(wp, "entrance lead", 0, /*stationAtFront=*/false, entrRaise,
                               azEntrance,
-                              [&](double r) { return tallestBumpColumn(bumpsForTurn(r)).first; });
+                              [&](double r) { return tallestBumpColumn(bumpsForTurn(r)).first; },
+                              rectFamily && leadSlotOf.count(ci) ? -leadSlotOf.at(ci) : 0.0);
             }
             if (entranceCorner)
                 rectLeadCornerPrim(*entranceCorner, entranceCornerRide, first.y,
@@ -7159,9 +8827,25 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     // quarter wedge (emitted with the lead) turns into the terminal run.
                     const double kNaN = std::numeric_limits<double>::quiet_NaN();
                     const bool rw = path.isRectangular;
+                    // The turn begins at x = -begX and ends at x = +endX on the connection
+                    // face, so the lead slot enters here: the ENTRANCE turn starts a slot behind
+                    // the crossing, the EXIT turn ends a slot ahead of it, and the lead route is
+                    // translated to meet it. A dragback's own descent slot still wins on the last
+                    // transition -- the exit then attaches at that slot, which the lane allocator
+                    // has already separated per conductor.
+                    const double leadSlot = leadSlotOf.count(ci) ? leadSlotOf.at(ci) : 0.0;
+                    // ENTRANCE ONLY. The exit needs no slot: each parallel's LAST turn is at
+                    // its own height, so the exit leads already leave on distinct rows (measured
+                    // 1.15 mm apart on isolated_buck) -- it is the ENTRANCE that MKF gives every
+                    // parallel of a winding the same row. Slotting the exit as well also moves
+                    // endX, which changes the arc length the last turn distributes its pitch
+                    // over: the two parallels' final turns then climbed at different rates and
+                    // converged to 1.0777 mm against a 1.1154 mm envelope.
                     const double stopX = nextRet ? nextRet->xSlot
                                        : (rw && i + 2 == nEmit && !ret ? rs1.cornerR : kNaN);
-                    const double startX = (rw && i == 0 && !ret) ? rs0.cornerR : kNaN;
+                    const double startX = (i == 0 && !ret)
+                                              ? (rw ? rs0.cornerR : 0.0) + leadSlot
+                                              : kNaN;
                     if (ret) {
                         // SINGLE-TURN LAYER (Alf, 26_psps: "layers 12 13 14 not drawn"): a
                         // return draws the CHAIN only, on the assumption the preceding rising
@@ -7749,27 +9433,31 @@ std::vector<NamedShape> ConductorBuilder::buildAll(
     nlohmann::json cj;
     to_json(cj, coil);
     OpenMagnetics::Coil omCoil(cj, /*windInConstructor=*/false);
+    auto layout = omCoil.get_connection_layout();
     auto spaces = omCoil.get_connection_reserved_spaces();
-    return buildAllImpl<MAS::Coil, MAS::Wire>(coil, bobbin, isToroidal, std::move(spaces), opts);
+    return buildAllImpl<MAS::Coil, MAS::Wire>(coil, bobbin, isToroidal, std::move(spaces), layout,
+                                              opts);
 }
 
 std::vector<NamedShape> ConductorBuilder::buildAll(
     const OpenMagnetics::Coil& coil, const MAS::CoreBobbinProcessedDescription& bobbin,
     bool isToroidal, const Options& opts) {
     OpenMagnetics::Coil coilCopy = coil;
+    auto layout = coilCopy.get_connection_layout();
     auto spaces = coilCopy.get_connection_reserved_spaces();
     return buildAllImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, bobbin, isToroidal,
-                                                                  std::move(spaces), opts);
+                                                                  std::move(spaces), layout, opts);
 }
 
 std::vector<ConductorBuilder::PathPolyline> ConductorBuilder::buildAllPaths(
     const OpenMagnetics::Coil& coil, const MAS::CoreBobbinProcessedDescription& bobbin,
     bool isToroidal, const Options& opts) {
     OpenMagnetics::Coil coilCopy = coil;
+    auto layout = coilCopy.get_connection_layout();
     auto spaces = coilCopy.get_connection_reserved_spaces();
     std::vector<PathPolyline> out;
     buildAllImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, bobbin, isToroidal,
-                                                           std::move(spaces), opts, &out);
+                                                           std::move(spaces), layout, opts, &out);
     return out;
 }
 

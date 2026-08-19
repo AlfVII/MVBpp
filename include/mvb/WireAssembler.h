@@ -167,7 +167,11 @@ TopoDS_Face wireProfile(const gp_Pnt& center, const gp_Dir& normal, double radiu
 TopoDS_Wire wireProfileWireSplit(const gp_Pnt& center, const gp_Dir& normal, double radius, int segments);
 TopoDS_Wire rectProfileWire(const gp_Pnt& center, const gp_Dir& tangent, const gp_Dir& axialAxis,
                             double width, double height);
-TopoDS_Edge primEdge(const Primitive& pr, double wireRadius);
+// Growth (overA/overB, in arc length) is folded into the pcurve for spirals that support it --
+// see primEdgeGrowsAnalytically. Everything else ignores it and is grown by the caller.
+TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA = 0.0,
+                     double overB = 0.0);
+bool primEdgeGrowsAnalytically(const Primitive& pr);
 
 // Post-checks on assembled copper.
 bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius);

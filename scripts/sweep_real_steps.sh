@@ -29,6 +29,11 @@ mkdir -p "$OUT"
 run_one() {
     local src="$1" name="$2" out="$3"
     local dir="$out/$name"
+    # Start from an EMPTY directory. A design that used to build clean and now refuses (or the
+    # reverse) would otherwise keep the previous run's artefact beside the current one, and the
+    # pair gives no hint which is which except its timestamp -- 14_dab sat with a stale clean
+    # .step next to a current .DIAGNOSTIC.step for a day.
+    rm -rf "$dir"
     mkdir -p "$dir"
     local log="$dir/build.log"
     local step="$dir/$name.step"
@@ -47,7 +52,9 @@ run_one() {
         [ -z "$reason" ] && reason=$(tail -2 "$log" | tr -d '\n' | cut -c1-400)
         # Export it anyway so the fault is visible, clearly marked as not FEM-grade.
         local diag="$dir/$name.DIAGNOSTIC.step"
-        ( ulimit -v 16000000; MVB_LEAD_NO_VALIDATE=1 timeout 3600 \
+        # MVB_MITRE_KEEP too: a refused mitre must still reach disk to be looked at, exactly like
+        # a refused collision (Alf: "always produce step and 2D SVG together", even when it fails).
+        ( ulimit -v 16000000; MVB_LEAD_NO_VALIDATE=1 MVB_MITRE_KEEP=1 timeout 3600 \
               "$GEN" --real --fem --segments 0 -o "$diag" "$src" ) >> "$log" 2>&1
         if [ -s "$diag" ]; then status=REFUSED_DIAG; else status=FAIL; fi
     fi
