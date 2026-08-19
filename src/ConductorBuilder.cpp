@@ -193,7 +193,8 @@ inline double maxSecondDerivative(const Primitive& pr) {
 }
 
 inline double segSegDistance(const gp_Pnt& p1, const gp_Pnt& q1, const gp_Pnt& p2,
-                             const gp_Pnt& q2) {
+                             const gp_Pnt& q2, double* sOut = nullptr,
+                             double* tOut = nullptr) {
     // standard closed-form segment-segment minimum distance
     const gp_XYZ d1 = q1.XYZ() - p1.XYZ(), d2 = q2.XYZ() - p2.XYZ(), r = p1.XYZ() - p2.XYZ();
     const double a = d1.Dot(d1), e = d2.Dot(d2), f = d2.Dot(r);
@@ -224,6 +225,8 @@ inline double segSegDistance(const gp_Pnt& p1, const gp_Pnt& q1, const gp_Pnt& p
         }
     }
     const gp_Pnt c1(p1.XYZ() + d1 * sN), c2(p2.XYZ() + d2 * tN);
+    if (sOut) *sOut = sN;
+    if (tOut) *tOut = tN;
     return c1.Distance(c2);
 }
 
@@ -272,8 +275,26 @@ inline Verdict provePairClears(const Primitive& A, const Primitive& B, double th
             }
         }
         if (sagA <= kCertEpsilon && sagB <= kCertEpsilon) {
-            // Bounds are exact to machine precision and neither side resolves: the minimum sits
-            // within kCertEpsilon of the threshold. That is touching, which is allowed.
+            // Both chords are exact to machine precision, so the CHORD closest pair is (within
+            // the sags) an ACHIEVED pair of the true curves -- it can certify a violation. The
+            // old `continue` here reasoned "neither side resolves, so the minimum sits within
+            // epsilon of the threshold", which is FALSE when the violating point is INTERIOR
+            // to a chord: a SEG never splits (sag identically zero), so its parameter interval
+            // stays whole, the on-curve candidates above only ever test tA in {0, 1/2, 1}, and
+            // the pair dies here unwitnessed. Measured on the boost: the turn-8 ride passed
+            // 1.05 um inside its own dragback lane's coated envelope (the ride's off-plane
+            // cos(phi) raise is first-order; the curvature term Dc^2 sin^2(phi)/2r is the
+            // deficit) and the gate certified it clear for as long as the lane's midpoint
+            // happened to sit outside the deep zone.
+            double sN = 0.0, tN = 0.0;
+            const double chord = segSegDistance(a0, a1, b0, b1, &sN, &tN);
+            if (chord + sagA + sagB < threshold - kCertEpsilon) {
+                v.clears = false;
+                v.violationUB = chord + sagA + sagB;
+                v.tA = bx.a0 + sN * hA;
+                v.tB = bx.b0 + tN * hB;
+                return v;
+            }
             continue;
         }
         if (sagA >= sagB) {
@@ -284,6 +305,13 @@ inline Verdict provePairClears(const Primitive& A, const Primitive& B, double th
             work.push_back({bx.a0, bx.a1, bx.b0, bm});
             work.push_back({bx.a0, bx.a1, bm, bx.b1});
         }
+    }
+    if (!work.empty()) {
+        // The guard tripped with boxes unresolved: this pair CANNOT be certified. Saying
+        // "clear" here would be a silent fallback; refuse loudly instead.
+        throw std::runtime_error(
+            "cert::provePairClears: box budget exhausted before the pair resolved -- cannot "
+            "certify; the geometry is degenerate or the bounds are too loose");
     }
     v.clears = true;
     return v;
@@ -659,6 +687,17 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                     }
                     if (ci == cj && shareEndpoint(pa, pb)) continue;
                     double d = polyPolyDistance(polys[ci][i], polys[cj][j]);
+                    if (std::getenv("MVB_PAIR_TRACE") &&
+                        pa.label.find("turn 6_ending' -> 'Primary parallel 0 turn 7' (dragback) seg 1") != std::string::npos &&
+                        pb.label.find("turn 8' -> 'Primary parallel 0 turn 8_ending' (over dragback)") != std::string::npos) {
+                        std::fprintf(stderr,
+                            "[pair-trace] i=%zu j=%zu ordA=%zu ordB=%zu d=%.9f sagA+B=%.9f env=%.9f "
+                            "vouched=%d\n", i, j, pa.turnOrdinal, pb.turnOrdinal, d,
+                            samplingSag(A.wireRadius) + samplingSag(B.wireRadius),
+                            A.wireRadius + B.wireRadius,
+                            int(d - samplingSag(A.wireRadius) - samplingSag(B.wireRadius) >=
+                                A.wireRadius + B.wireRadius - 1e-12));
+                    }
                     {   // THE ENAMEL RULE, CERTIFIED (ABT #685, Alf: "0 nanometers of
                         // overlapping"). The sampled distance d is only a pre-filter: when it
                         // cannot vouch for the pair within the documented sampling bound, the
@@ -3680,57 +3719,63 @@ std::pair<double, double> tallestBumpColumn(const std::vector<WrapBump>& bumps,
     // wire of each other are the same level -- that is what makes a winding's K parallels, which
     // all return at one layer boundary, count once. Within a level take the DEEPEST wire, since
     // the ride has to clear the thickest thing at that level.
-    std::vector<std::pair<double, double>> levels;   // (radius, height)
+    struct Level {
+        double radius, height, maxOffPlane;
+    };
+    std::vector<Level> levels;
     for (const auto& bmp : bumps) {
+        const double offPlane = std::abs(std::remainder(bmp.azimuth - kPlaneAz, kTwoPi));
         bool found = false;
         for (auto& lv : levels) {
-            if (std::abs(bmp.radius - lv.first) <= 0.5 * bmp.distance) {
-                lv.second = std::max(lv.second, bmp.distance);
+            if (std::abs(bmp.radius - lv.radius) <= 0.5 * bmp.distance) {
+                lv.height = std::max(lv.height, bmp.distance);
+                lv.maxOffPlane = std::max(lv.maxOffPlane, offPlane);
                 found = true;
                 break;
             }
         }
-        if (!found) levels.push_back({bmp.radius, bmp.distance});
+        if (!found) levels.push_back({bmp.radius, bmp.distance, offPlane});
     }
-    // ...and SUM the levels: the global bump grows by one wire at every dragback it passes and
-    // never decreases. bumpsForTurn() has already selected the lanes at or inside this turn.
+    // ...and SUM the levels: the global bump grows by one step at every dragback level it
+    // passes and never decreases. bumpsForTurn() has already selected the lanes at or inside
+    // this turn.
+    //
+    // EACH LEVEL'S STEP IS THE EXACT CIRCLE-REACH, NOT d/cos(phi) (ABT #685, 2026-08-19). The
+    // binding pair per level is the ride at the lane's own radius: the lane's centre sits at
+    // r*u(phi) - c_lane*z, the ride is the same circle translated c_lane + step, so the lane
+    // lies inside the ride's circle by  r - sqrt(r^2 + step^2 - 2 r step cos(phi)),  and
+    // touching at the coated envelope d needs
+    //     step = r cos(phi) - sqrt((r - d)^2 - r^2 sin^2(phi)).
+    // d/cos(phi) is that formula's first-order Taylor: it drops the curvature term
+    // step^2 sin^2(phi)/2r, which on the boost's 7.91-degree lanes is 1.07 um per level --
+    // the turn-8 ride sat 1.05 um inside its own dragback lane's coated envelope, hidden
+    // until the certified engine's interior-witness fix exposed it. The stack stays rigid:
+    // the schedule is still one shared per-level sum, computed identically from the same
+    // lists by every structure. Riders further out over-clear (their translation is the sum
+    // of every step between), which is the safe direction.
+    // A lane the sqrt cannot reach (r sin(phi) approaching r - d) is a lane a -z translation
+    // cannot clear at all -- refuse it by name, exactly as the old cos(phi) < 0.2 guard did.
     double raise = 0.0;
     for (const auto& lv : levels) {
-        raise += lv.second;
+        const double sinPhi = std::sin(lv.maxOffPlane);
+        const double inner = lv.radius - lv.height;
+        const double disc = inner * inner - lv.radius * lv.radius * sinPhi * sinPhi;
+        if (disc <= 0.0) {
+            throw std::runtime_error(
+                "ConductorBuilder: a dragback lane at radius " + std::to_string(lv.radius) +
+                " sits " + std::to_string(lv.maxOffPlane * 180.0 / kPi) +
+                " degrees off the connection plane, where no -z translation can lift a ride "
+                "clear of it. Fix the fan slot or the winding data.");
+        }
+        raise += lv.radius * std::cos(lv.maxOffPlane) - std::sqrt(disc);
     }
     if (cosTheta > 1e-6) {
         raise /= cosTheta;
     }
-    // SECOND COSINE: THE LANE'S ANGLE OFF THE CONNECTION PLANE. ABT #685 (Alf, 2026-08-18):
-    // "for the bump you have to use the angle from the farther away parallel of the dragback to
-    // the plane YZ."
-    //
-    // `raise` above is a RADIAL pile thickness, but the ride delivers it as a rigid translation
-    // along -Z (the approved bump model). A translation T raises the wire radially by T only ON
-    // the plane; at a lane sitting phi off it, the radial gain is just T*cos(phi). Dragbacks do
-    // not sit on the plane -- the fan gives each parallel its own slot -- so the wire passed
-    // UNDER the very lane it was supposed to clear: measured on the flyback, a lane 24.59 deg off
-    // the plane got 1.7596*cos(24.59) = 1.600 mm of radial rise where it needed 1.693, and the
-    // gate found the ride 0.124 mm inside the dragback's copper (0.9919 against 1.1154).
-    // The FARTHEST parallel sets it: one displacement covers the whole raised half, so it must
-    // satisfy the worst lane, and over-clearing the nearer ones is the safe direction.
-    double maxOffPlane = 0.0;
-    for (const auto& bmp : bumps)
-        maxOffPlane = std::max(maxOffPlane,
-                               std::abs(std::remainder(bmp.azimuth - kPlaneAz, kTwoPi)));
-    const double cosOff = std::cos(maxOffPlane);
-    if (cosOff < 0.2) {
-        // A rigid -Z translation cannot lift a wire away from a lane approaching 90 deg off the
-        // plane -- there the displacement is purely tangential and buys no radial clearance at
-        // all. Never emit an "almost enough" ride: say which lane made it impossible.
-        throw std::runtime_error(
-            "ConductorBuilder: a dragback lane sits " +
-            std::to_string(maxOffPlane * 180.0 / kPi) +
-            " degrees off the connection plane, where the ride's -Z displacement buys almost no "
-            "radial clearance (cos = " + std::to_string(cosOff) +
-            "); the wire cannot be lifted over it. Fix the fan slot or the winding data.");
-    }
-    raise /= cosOff;
+    // (The former SECOND COSINE -- one global division by cos(max off-plane angle), ABT #685,
+    // Alf 2026-08-18 -- is subsumed: the exact per-level step above carries each level's own
+    // off-plane angle, including the curvature term the global first-order cosine dropped,
+    // and the per-level discriminant guard replaces the old cos < 0.2 refusal.)
     // The azimuth reported is the deepest single column, which is where the raised region is
     // centred; only the HEIGHT is the accumulated global bump.
     std::vector<std::pair<double, double>> cols;
@@ -4206,6 +4251,28 @@ struct PendingZ {
     std::string label;
 };
 
+// Absorb NEGLIGIBLE KINKS from a drawn lead route -- never a corner (ABT #685). A waypoint
+// within `absorbTol` of the running kept point or of the route's endpoint lies inside the pipe
+// body of the adjacent edge; sub-tolerance spine edges also crash OCCT's pipe-shell corner
+// rounding. ONE function shared by the terminal-lead emitter (pushPlaneSegs) and the fan's
+// route model (routeVert): the fan must reserve exactly what the emitter draws -- modelling the
+// pre-absorption route while emitting the absorbed diagonal skewed the model 170 um at the
+// crossing of Secondary 2's ring band on the pushpull, and the copper collision the fan should
+// have dodged surfaced only at the gate.
+std::vector<PlanePt> absorbLeadWaypoints(const std::vector<PlanePt>& wp, double absorbTol) {
+    std::vector<PlanePt> kept;
+    kept.push_back(wp.front());
+    for (size_t i = 1; i + 1 < wp.size(); ++i) {
+        if (std::hypot(wp[i].x - kept.back().x, wp[i].y - kept.back().y) < absorbTol ||
+            std::hypot(wp[i].x - wp.back().x, wp[i].y - wp.back().y) < absorbTol) {
+            continue;
+        }
+        kept.push_back(wp[i]);
+    }
+    kept.push_back(wp.back());
+    return kept;
+}
+
 // PHYSICAL Z DRAGBACK (round columns). When a layer finishes, the wire must get back to the
 // start of the next layer. A real winder does not detour around the whole coil: the wire keeps
 // wrapping to the far side, steps out by one wire OD onto the layer it just finished, runs
@@ -4553,6 +4620,13 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                 " has no path length to distribute its pitch over");
         }
         const double dy = s1.y - s0.y;
+        if (std::getenv("MVB_RECT_DIAG")) {
+            std::fprintf(stderr,
+                "[rect-wrap] '%s' y=[%.9f,%.9f] dy=%.9f L=%.9f slope=%.9f "
+                "(segX=%.6f segZ=%.6f q=%.6f rides=%.6f/%.6f endCut=%.6f begX=%.6f)\n",
+                label.c_str(), s0.y, s1.y, dy, L, dy / L, s0.segX, s0.segZ, q, ride0,
+                rideBack0, endCut, begX);
+        }
         double arc = 0.0;
         auto yAt = [&](double at) { return s0.y + dy * at / L; };
         auto riseSeg = [&](double ax, double az2, double bx, double bz2, double len,
@@ -5920,8 +5994,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             const std::string whoV =
                 ct.winding + " parallel " + std::to_string(ct.parallel);
             auto [egrp, xgrp] = splitTerminalGroups(tRects, whoV);
-            auto routeVert = [&](const std::vector<PlanePt>& wpv, bool entrance,
+            auto routeVert = [&](std::vector<PlanePt> wpv, bool entrance,
                                  const PlanePt& attach, double attachAdvance = 0.0) {
+                // Model EXACTLY what the emitter draws: same kink absorption, same tolerance
+                // (the emitter's wire radius -- rwEmit is "what the emitter bends").
+                wpv = absorbLeadWaypoints(wpv, rwEmit);
                 Vert v;
                 v.kind = 0; v.ci = cv; v.trans = 0; v.entrance = entrance;
                 v.rw = rwCoat; v.rwBare = rwBare;
@@ -5998,7 +6075,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // (r, y) plane — the link is a level radial segment there.
                 const Vert& K = A.kind == 2 ? A : B;
                 const Vert& O = A.kind == 2 ? B : A;
-                if (K.ci == O.ci) return 0.0;
+                // Same conductor: the EXIT lead legitimately joins the link's end -- zero angle.
+                // The ENTRANCE lead does not join anything mid-winding: anchored at the plane
+                // (Alf's centred terminals) it ran straight through its own winding's link
+                // (S1 p0, 13.3 um) -- it must dodge like any other crossing route.
+                if (K.ci == O.ci && (O.kind != 0 || !O.entrance)) return 0.0;
                 // ABT #685 (Alf, 2026-08-17): a TERMINAL never yields to a layer link of its own
                 // winding. "Every terminal, output or input, has to start at x=0 and expand
                 // toward positive x, side by side the parallels" — and the two are the same
@@ -6055,7 +6136,29 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // time (Secondary 1 vs Secondary 2, 3 um; Secondary 2's own entrance vs its exit,
                 // 63 um). Where MKF's rows really are too close, the collision gate reports it --
                 // that is an MKF layout bug to fix, not one to dodge by moving terminals.
-                if (A.wname != B.wname || A.entrance != B.entrance) return 0.0;
+                // ABT #685 (Alf, 2026-08-19: "do the 3 of them"): different windings (and a
+                // winding's two sides) are separated by MKF's rows, NOT by azimuth -- that rule
+                // stands. But the fan may place things that EAT a row margin (the pitch-true
+                // dip did: P2's and S1's entrance leads, rows 1.586 apart for a 1.5855 envelope,
+                // were emitted 1.4955 apart after their slot dips and met 27 um deep). When the
+                // MEASURED routes -- dips included -- fall short of the envelope, the pair buys
+                // exactly the azimuth that restores the 3D envelope, sqrt(env^2 - d_route^2) of
+                // X, and no more. A healthy row still costs zero, so bundles stay anchored at
+                // the plane; a genuine MKF row deficit surfaces as a small measured spread AND
+                // is still the collision gate's to report.
+                if (A.wname != B.wname || A.entrance != B.entrance) {
+                    const double dRoute = routeDist(A.segs, B.segs);
+                    if (dRoute > dSep - 1e-6) return 0.0;
+                    const double dxNeed =
+                        std::sqrt(std::max(0.0, dSep * dSep - dRoute * dRoute));
+                    const double rrX = std::max(std::min(A.r, B.r), dSep);
+                    // No chord term here: the stub chords are pinned to the plane, so a
+                    // chord-vs-chord row deficit cannot be bought back with azimuth at all --
+                    // the collision gate reports it as the MKF row bug it is. (A full-chord
+                    // term tried first scattered Secondary 1 to 38..73 deg over a 3 um
+                    // deficit.)
+                    return std::asin(std::min(1.0, dxNeed / rrX));
+                }
                 if (routeDist(A.segs, B.segs) > dSep - 1e-6) return 0.0;
             } else if (A.kind != B.kind) {
                 const Vert& L = A.kind == 0 ? A : B;
@@ -6130,6 +6233,53 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (A.kind == 0 || B.kind == 0)
                 return std::abs(xAt(A, cA) - xAt(B, cB)) + 1e-12 >= needDist(A, B, nd);
             return std::abs(cA - cB) + 1e-12 >= nd;
+        };
+        // EXACT ROUTE-vs-ROW HARD FLOOR (ABT #685, 2026-08-19). The drift-forbid intervals
+        // below are SOFT (a block may take a hard-feasible position through them) and are
+        // DROPPED outright when a band covers the whole reach -- which is exactly what a
+        // large-pitch wrap produces (pushpull Secondary 2, 13 mm/rev: ~110-degree bands). Both
+        // escapes left the fan blind while the drawn route ran 80 um inside Secondary 2's
+        // turn-0 copper. This check is the exact counterpart, evaluated per candidate azimuth:
+        // where the route CROSSES a row's radius, the route point and the row's helix point
+        // at that azimuth share (r, azimuth) and differ only in y -- so |dy| against the BARE
+        // envelope is the gate's own copper criterion, applied before anything is emitted. It
+        // is a HARD floor at the gate's threshold: the layout criterion (coated, stricter)
+        // stays with the soft model, so packing freedom is unchanged wherever the gate would
+        // not throw.
+        auto leadRowsClear = [&](const Vert& L, double c) {
+            if (L.kind != 0) return true;
+            for (const auto& R : rows) {
+                // CROSS-WINDING rows only: a winding's own parallels are the K-filar family
+                // the bundle machinery lays out (side-by-side slots, pitch-true attaches,
+                // terminal chords) -- this coarse row model called gate-passing sibling
+                // geometry infeasible (flyback/single_switch refused to pack). Across
+                // windings the model's crossing-point argument is exact and it is the
+                // coverage the dropped drift bands lost.
+                if (conductors[R.ci].winding == L.wname) continue;
+                if (R.r + R.rw < L.r - L.rw - 1e-12) continue;
+                if (std::abs(R.adv) < 1e-12) continue;
+                const double clr = L.rwBare + R.rw;
+                const double a = std::clamp(c, R.cLo, R.cHi);
+                const double yWrap = R.y + R.adv * a / kTwoPi;
+                // Beyond the copper's end crossing the obstacle is the crossing point itself.
+                const double arc = R.r * std::abs(c - a);
+                for (const auto& sg : L.segs) {
+                    const double rLo = std::min(sg[0], sg[2]), rHi = std::max(sg[0], sg[2]);
+                    if (rHi - rLo > 1e-12 && R.r >= rLo - 1e-12 && R.r <= rHi + 1e-12) {
+                        // run (or absorbed diagonal) crossing the row's radius
+                        const double t = (R.r - sg[0]) / (sg[2] - sg[0]);
+                        const double yProbe = sg[1] + (sg[3] - sg[1]) * t;
+                        if (std::hypot(yProbe - yWrap, arc) + 1e-12 < clr) return false;
+                    } else if (rHi - rLo <= 1e-12 && std::abs(sg[0] - R.r) <= clr) {
+                        // vertical stub within reach of the row's radius
+                        const double yLo = std::min(sg[1], sg[3]), yHi = std::max(sg[1], sg[3]);
+                        const double dy = std::max({yLo - yWrap, yWrap - yHi, 0.0});
+                        if (std::hypot(std::hypot(dy, sg[0] - R.r), arc) + 1e-12 < clr)
+                            return false;
+                    }
+                }
+            }
+            return true;
         };
         // CENTRE-OUT symmetric packing (Alf, 2026-08-05): every vertical takes the FEASIBLE
         // azimuth CLOSEST TO THE STATION PLANE (0 deg), so the fan hugs the plane and only
@@ -6412,14 +6562,20 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // the X the block asks for is beyond that member's radius: the block simply does not
             // fit there and the candidate is rejected — never clamped onto the rim, which would
             // silently deliver a slot the caller then believes is clear.
+            // ABT #685 (Alf, 2026-08-19): the block expands toward POSITIVE x from its
+            // anchor -- "the terminals start in x=0, but their center in x=0": member 0's
+            // centreline on the plane, siblings side by side at +x. (The old floor put the
+            // whole block on +x with member 0 furthest out and the LAST member's edge grazing
+            // x = 0; anchoring at the plane with the old minus sign would have sent the
+            // siblings across to -x instead.)
             auto azMember = [&](size_t g, double c) {
                 const double x0 = -verts[group[0]].r * std::sin(c);
-                const double s = (x0 - xoff[g]) / verts[group[g]].r;
+                const double s = (x0 + xoff[g]) / verts[group[g]].r;
                 return std::abs(s) > 1.0 ? kNaN : -std::asin(s);
             };
             auto anchorFor = [&](size_t g, double t) {
                 const double xg = -verts[group[g]].r * std::sin(t);
-                const double s = (xg + xoff[g]) / verts[group[0]].r;
+                const double s = (xg - xoff[g]) / verts[group[0]].r;
                 return std::abs(s) > 1.0 ? kNaN : -std::asin(s);
             };
             const double blockSpan = group.empty() ? 0.0 : (azMember(group.size() - 1, 0.0) -
@@ -6428,6 +6584,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 for (size_t g = 0; g < group.size(); ++g) {
                     const double cg = azMember(g, c);
                     if (std::isnan(cg)) return false;
+                    if (!leadRowsClear(verts[group[g]], cg)) return false;
                     for (size_t j = 0; j < verts.size(); ++j)
                         if (azAssigned[j] && !clears(verts[j], az[j], verts[group[g]], cg))
                             return false;
@@ -6454,13 +6611,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // Member azimuths decrease monotonically as the anchor c decreases, so the feasible
             // set is c <= min over members of "the anchor that puts THIS member exactly on its
             // own floor".
-            double cMax = 0.0;
-            for (size_t g = 0; g < group.size(); ++g) {
-                const double azRadius = std::asin(std::min(
-                    1.0, verts[group[g]].rw / std::max(verts[group[g]].r, verts[group[g]].rw)));
-                const double cg = anchorFor(g, -azRadius);
-                if (!std::isnan(cg)) cMax = std::min(cMax, cg);
-            }
+            // ABT #685 (Alf, 2026-08-19): the terminal's CENTRE sits on the plane, not its
+            // extreme -- "make the terminals start in x=0, but their center in x=0, not their
+            // extreme". The old floor held every member one wire RADIUS of azimuth off the
+            // plane (centreline at x = +rw, so the wire's edge grazed x = 0); anchoring the
+            // first member AT the plane centres the whole terminal complex on it -- and a lead
+            // at zero plane offset has ZERO pitch-true dip, so MKF's rows separate different
+            // windings' leads exactly as drawn. A return standing on the Y axis is no longer
+            // clear of the block by construction; need() carries that pair, as it always
+            // enforced the full clearance on top of the floor anyway.
+            const double cMax = 0.0;
             auto consider = [&](double c, bool withSoft) {
                 if (std::isnan(c) || c > cMax + 1e-12) return;
                 if (!blockHardOk(c) || (withSoft && !blockSoftOk(c))) return;
@@ -6662,6 +6822,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             for (size_t j = 0; j + 1 < verts.size() && !dipViolated; ++j) {
                 if (verts[j].kind == 2) continue;
+                if (!leadRowsClear(verts[j], az[j])) {
+                    dipViolated = true;
+                    break;
+                }
                 for (size_t k = j + 1; k < verts.size(); ++k) {
                     if (verts[k].kind == 2) continue;
                     if (!clears(verts[j], az[j], verts[k], az[k])) {
@@ -8276,7 +8440,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // OCCT's pipe-shell corner rounding. Endpoints (the exact stations/border)
             // are always kept.
             std::vector<PlanePt> kept;
-            kept.push_back(wp.front());
             // Absorption bound: the RADIUS inside which a jog truly disappears into the wire
             // body. For round wire that is wireRadius; for RECT/PLANAR wire wireRadius is the
             // half-DIAGONAL (1.09 mm on 09_planar's flat trace), and absorbing an L-corner
@@ -8315,15 +8478,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // the route into a diagonal. "Terminals should always be parallel to X axis": an
             // axis-parallel run plus a vertical is the shape, and a short vertical stays a
             // vertical.
-            for (size_t i = 1; i + 1 < wp.size(); ++i) {
-                if (std::hypot(wp[i].x - kept.back().x, wp[i].y - kept.back().y) <
-                        absorbTol ||
-                    std::hypot(wp[i].x - wp.back().x, wp[i].y - wp.back().y) < absorbTol) {
-                    continue;
-                }
-                kept.push_back(wp[i]);
-            }
-            kept.push_back(wp.back());
+            kept = absorbLeadWaypoints(wp, absorbTol);
 
             // ROUND wire gets rounded corners (the toroidal treatment); RECT wire keeps the
             // mitred butt its own machinery expects.
@@ -8727,6 +8882,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // ABT #685: height the last wrap actually ends at (see below); NaN when it is not
         // stretched, in which case the station height is already correct.
         double exitAttachY = std::numeric_limits<double>::quiet_NaN();
+        // ABT #685 (A2): pitch-true landing heights, keyed by the landing turn's index -- set
+        // where the dragback is emitted, consumed by the landing wrap's start (see below).
+        std::map<size_t, double> landingAttach;
         for (size_t i = 0; i + 1 < nEmit; ++i) {
             PlanePt s = station(turns[i]);
             PlanePt nxt = station(turns[i + 1]);
@@ -8742,9 +8900,35 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (effectivelyRound) {
                 auto zit = zDragbackAzimuth.find(i);
                 if (zit != zDragbackAzimuth.end()) {
+                    // ABT #685 (A2, Alf 2026-08-19: "do your proposal"): the dragback delivers
+                    // the wire PITCH-TRUE at its fan slot, exactly as the entrance and exit
+                    // leads attach (entranceAttachY / exitAttachY, and the same argument: MKF's
+                    // station is the turn's height AT THE CONNECTION PLANE). The slot sits
+                    // `rem` off the plane, where the ideal K-filar band helix is band*rem/2pi
+                    // higher. Landing at the bare station height instead made the landing wrap
+                    // climb its whole grid advance over the fan-shortened span -- a steeper
+                    // helix than its siblings' -- and the certified gate exhibited sibling
+                    // landing wraps 244 nm inside the coated envelope at the plane, where the
+                    // stations only fund the band slope's margin (flyback, parallels 0/1:
+                    // 0.801254 vs 0.785831 mm/rad on a spacing compensated for 0.743087).
+                    // With the pitch-true landing the wrap IS the band helix and the parallels
+                    // lie a full lane apart at every azimuth. The band comes from the landing
+                    // layer's own grid (the next station up); a landing with no same-layer
+                    // successor keeps the station height -- there is no band to be true to.
+                    //
                     // NB: no push_back here -- every return in the window, this one included, is
                     // already in laidDragbacks from the pre-scan.
-                    appendZDragback(path, s, nxt, wireRadius, zit->second, label, i,
+                    PlanePt nDest = nxt;
+                    if (i + 2 < nEmit) {
+                        const PlanePt after = station(turns[i + 2]);
+                        if (std::abs(after.x - nxt.x) <= wireRadius) {
+                            const double rem =
+                                std::remainder(zit->second - kPlaneAz, kTwoPi);
+                            nDest.y = nxt.y + (after.y - nxt.y) * rem / kTwoPi;
+                            landingAttach[i + 1] = nDest.y;
+                        }
+                    }
+                    appendZDragback(path, s, nDest, wireRadius, zit->second, label, i,
                                     bumpsForTurn(s.x), bumpsForTurn(nxt.x));
                     continue;
                 }
@@ -8773,6 +8957,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 PlanePt sWrap = s;
                 if (i == 0 && !std::isnan(entranceAttachY)) {
                     sWrap.y = entranceAttachY;   // pitch-true start at the slot azimuth
+                }
+                if (auto lit = landingAttach.find(i); lit != landingAttach.end()) {
+                    sWrap.y = lit->second;   // pitch-true landing (see the dragback branch)
                 }
                 appendRoundWrap(path, sWrap, nxt, wireRadius, label, i, bumpsForTurn(s.x),
                                 crossAz[i], crossAz[i + 1], bumpsForTurn(nxt.x), ct.parallels,
