@@ -8892,6 +8892,28 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // axis-parallel run plus a vertical is the shape, and a short vertical stays a
             // vertical.
             kept = absorbLeadWaypoints(wp, absorbTol);
+            // ABT #839 (RECT COLUMNS): the run must HOLD ITS RESERVED ROW. The absorption above
+            // deletes the sub-radius row->attach corner and turns the WHOLE run into one shallow
+            // diagonal -- and on a rect column there is no azimuth fan to fund that rise:
+            // 17_cllc's entrance ran 17.9 um above its row (25 um absorbed stub + 5.9 um
+            // pitch-true attach, interpolated) exactly where it crossed its own conductor's
+            // dragback face run, which MKF lays ONE coated OD above the row with sub-um margin.
+            // Round columns keep the diagonal -- the fan models it and buys the clearance in
+            // azimuth, and holding the row there re-fights 11_pushpull's sibling-stub geometry
+            // (see the reverted experiment above). Here the climb is confined instead: an elbow
+            // waypoint two absorb-tolerances out from the attach keeps the run on its row and
+            // gives the climb a spine leg long enough for the assembler's corner machinery.
+            if (rectFamily && !rectWire && kept.size() == 2) {
+                const size_t attIdx = stationAtFront ? 0 : 1;
+                const PlanePt& att = kept[attIdx];
+                const PlanePt& farEnd = kept[1 - attIdx];
+                const double dir = farEnd.x > att.x ? 1.0 : -1.0;
+                if (std::abs(att.y - farEnd.y) > 1e-12 &&
+                    std::abs(farEnd.x - att.x) > 3.0 * absorbTol) {
+                    kept.insert(kept.begin() + (stationAtFront ? 1 : 1),
+                                PlanePt{att.x + dir * 2.0 * absorbTol, farEnd.y});
+                }
+            }
 
             // ROUND wire gets rounded corners (the toroidal treatment); RECT wire keeps the
             // mitred butt its own machinery expects.
