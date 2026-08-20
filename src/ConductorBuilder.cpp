@@ -735,14 +735,37 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                                             B.name.c_str(), pb.label.c_str(), verdict.tB,
                                             qb.X()*1e3, qb.Y()*1e3, qb.Z()*1e3);
                                         auto spDump = [](const char* tag, const Primitive& pr) {
-                                            if (pr.kind != Primitive::SPIRAL) return;
-                                            std::fprintf(stderr,
-                                                "[enamel-prim] %s SPIRAL az=[%.12f,%.12f] "
-                                                "r=[%.12f,%.12f] y=[%.12f,%.12f] c=[%.12f,%.12f]\n",
-                                                tag, pr.spiral.az0, pr.spiral.az1,
-                                                pr.spiral.r0*1e3, pr.spiral.r1*1e3,
-                                                pr.spiral.y0*1e3, pr.spiral.y1*1e3,
-                                                pr.spiral.cx*1e3, pr.spiral.cz*1e3);
+                                            if (pr.kind == Primitive::SPIRAL) {
+                                                std::fprintf(stderr,
+                                                    "[enamel-prim] %s SPIRAL az=[%.12f,%.12f] "
+                                                    "r=[%.12f,%.12f] y=[%.12f,%.12f] c=[%.12f,%.12f]\n",
+                                                    tag, pr.spiral.az0, pr.spiral.az1,
+                                                    pr.spiral.r0*1e3, pr.spiral.r1*1e3,
+                                                    pr.spiral.y0*1e3, pr.spiral.y1*1e3,
+                                                    pr.spiral.cx*1e3, pr.spiral.cz*1e3);
+                                            }
+                                            // ABT #839: the sub-nm floor lives on ARC3 stubs and
+                                            // SEG leads -- the pair is only measurable with their
+                                            // parameters printed too.
+                                            else if (pr.kind == Primitive::ARC3) {
+                                                std::fprintf(stderr,
+                                                    "[enamel-prim] %s ARC3 c=(%.9f,%.9f,%.9f) "
+                                                    "axis=(%.9f,%.9f,%.9f) v0=(%.9f,%.9f,%.9f) "
+                                                    "sweep=%.12f\n",
+                                                    tag, pr.arc.c.X()*1e3, pr.arc.c.Y()*1e3,
+                                                    pr.arc.c.Z()*1e3, pr.arc.axis.X(),
+                                                    pr.arc.axis.Y(), pr.arc.axis.Z(),
+                                                    pr.arc.v0.X()*1e3, pr.arc.v0.Y()*1e3,
+                                                    pr.arc.v0.Z()*1e3, pr.arc.sweep);
+                                            }
+                                            else if (pr.kind == Primitive::SEG) {
+                                                std::fprintf(stderr,
+                                                    "[enamel-prim] %s SEG (%.9f,%.9f,%.9f)->"
+                                                    "(%.9f,%.9f,%.9f)\n",
+                                                    tag, pr.seg.a.X()*1e3, pr.seg.a.Y()*1e3,
+                                                    pr.seg.a.Z()*1e3, pr.seg.b.X()*1e3,
+                                                    pr.seg.b.Y()*1e3, pr.seg.b.Z()*1e3);
+                                            }
                                         };
                                         spDump("A", pa);
                                         spDump("B", pb);
