@@ -6385,7 +6385,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // is a HARD floor at the gate's threshold: the layout criterion (coated, stricter)
         // stays with the soft model, so packing freedom is unchanged wherever the gate would
         // not throw.
-        auto leadRowsClear = [&](const Vert& L, double c) {
+        // `why`, when given, receives the blocking row and the two numbers that decide it
+        // (delivered vs required), so a block that ends up off the plane can say WHAT held it
+        // there instead of leaving the reader to reverse-engineer the packing.
+        auto leadRowsClear = [&](const Vert& L, double c, std::string* why = nullptr) {
             if (L.kind != 0) return true;
             for (const auto& R : rows) {
                 // CROSS-WINDING rows only: a winding's own parallels are the K-filar family
@@ -6408,13 +6411,36 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         // run (or absorbed diagonal) crossing the row's radius
                         const double t = (R.r - sg[0]) / (sg[2] - sg[0]);
                         const double yProbe = sg[1] + (sg[3] - sg[1]) * t;
-                        if (std::hypot(yProbe - yWrap, arc) + 1e-12 < clr) return false;
+                        const double got = std::hypot(yProbe - yWrap, arc);
+                        if (got + 1e-12 < clr) {
+                            if (why != nullptr) {
+                                std::ostringstream w;
+                                w << "run crosses " << conductors[R.ci].winding << " row (ci="
+                                  << R.ci << ") at r=" << R.r * 1e3 << " mm: " << got * 1e3
+                                  << " mm delivered vs " << clr * 1e3 << " mm bare envelope"
+                                  << " (route y=" << yProbe * 1e3 << ", row y=" << yWrap * 1e3
+                                  << " mm)";
+                                *why = w.str();
+                            }
+                            return false;
+                        }
                     } else if (rHi - rLo <= 1e-12 && std::abs(sg[0] - R.r) <= clr) {
                         // vertical stub within reach of the row's radius
                         const double yLo = std::min(sg[1], sg[3]), yHi = std::max(sg[1], sg[3]);
                         const double dy = std::max({yLo - yWrap, yWrap - yHi, 0.0});
-                        if (std::hypot(std::hypot(dy, sg[0] - R.r), arc) + 1e-12 < clr)
+                        const double got = std::hypot(std::hypot(dy, sg[0] - R.r), arc);
+                        if (got + 1e-12 < clr) {
+                            if (why != nullptr) {
+                                std::ostringstream w;
+                                w << "vertical stub near " << conductors[R.ci].winding << " row (ci="
+                                  << R.ci << ") at r=" << R.r * 1e3 << " mm: " << got * 1e3
+                                  << " mm delivered vs " << clr * 1e3 << " mm bare envelope"
+                                  << " (stub y=[" << yLo * 1e3 << "," << yHi * 1e3 << "], row y="
+                                  << yWrap * 1e3 << " mm)";
+                                *why = w.str();
+                            }
                             return false;
+                        }
                     }
                 }
             }
@@ -6824,6 +6850,58 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     "out clear of the window's other verticals. Fix the winding data or the "
                     "MKF blocking -- the leads are never moved into each other.");
             }
+            // ABT #685 (Alf): "why are Primary parallels not starting with the first parallel
+            // centre in x=0?" -- a block that does NOT land on the plane owes an explanation, so
+            // the plane candidate is re-evaluated in explain mode and the binding constraint
+            // named. Diagnosis only; nothing here changes the chosen anchor.
+            if (std::getenv("MVB_LEAD_DIAG") && best < cMax - 1e-9) {
+                std::fprintf(stderr,
+                             "[fan-offplane] wname='%s' entrance=%d anchored %.4f deg off the "
+                             "plane (nearest member x=%.4f mm). At the plane:\n",
+                             verts[group[0]].wname.c_str(), (int)verts[group[0]].entrance,
+                             -best * 180 / kPi,
+                             std::abs(xAt(verts[group[group.size() - 1]],
+                                          azMember(group.size() - 1, best))) * 1e3);
+                for (size_t g = 0; g < group.size(); ++g) {
+                    const double cg = azMember(g, cMax);
+                    if (std::isnan(cg)) {
+                        std::fprintf(stderr, "   member ci=%zu: does not fit on its radius\n",
+                                     (size_t)verts[group[g]].ci);
+                        continue;
+                    }
+                    std::string why;
+                    if (!leadRowsClear(verts[group[g]], cg, &why))
+                        std::fprintf(stderr, "   member ci=%zu: %s\n",
+                                     (size_t)verts[group[g]].ci, why.c_str());
+                    for (size_t j = 0; j < verts.size(); ++j) {
+                        if (!azAssigned[j] || clears(verts[j], az[j], verts[group[g]], cg))
+                            continue;
+                        std::fprintf(stderr,
+                                     "   member ci=%zu: vertical ci=%zu (kind=%d) only %.4f mm "
+                                     "away in x, needs %.4f mm\n",
+                                     (size_t)verts[group[g]].ci, (size_t)verts[j].ci,
+                                     verts[j].kind,
+                                     std::abs(xAt(verts[j], az[j]) - xAt(verts[group[g]], cg)) * 1e3,
+                                     needDist(verts[j], verts[group[g]],
+                                              need(verts[j], verts[group[g]])) * 1e3);
+                        // The requirement comes from how close the two DRAWN routes run in the
+                        // (r, y) plane; print that distance and both polylines, so a spread this
+                        // large can be traced to the rows that caused it.
+                        std::fprintf(stderr, "      routeDist=%.4f mm  A(ci=%zu entrance=%d):",
+                                     routeDist(verts[j].segs, verts[group[g]].segs) * 1e3,
+                                     (size_t)verts[j].ci, (int)verts[j].entrance);
+                        for (const auto& sg : verts[j].segs)
+                            std::fprintf(stderr, " (%.4f,%.4f)->(%.4f,%.4f)", sg[0] * 1e3,
+                                         sg[1] * 1e3, sg[2] * 1e3, sg[3] * 1e3);
+                        std::fprintf(stderr, "\n      B(ci=%zu entrance=%d):",
+                                     (size_t)verts[group[g]].ci, (int)verts[group[g]].entrance);
+                        for (const auto& sg : verts[group[g]].segs)
+                            std::fprintf(stderr, " (%.4f,%.4f)->(%.4f,%.4f)", sg[0] * 1e3,
+                                         sg[1] * 1e3, sg[2] * 1e3, sg[3] * 1e3);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
             for (size_t g = 0; g < group.size(); ++g) {
                 az[group[g]] = azMember(g, best);
                 azAssigned[group[g]] = 1;
@@ -6955,6 +7033,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // entrance: the helix is LOWER before the plane; exit: the stretch continues
                 // PAST the station. seg[1] is the attach endpoint's y (segs[0] starts at it).
                 seg[1] += v.entrance ? -dip : dip;
+                if (std::getenv("MVB_LEAD_DIAG"))
+                    std::fprintf(stderr,
+                                 "[dip] pass=%d ci=%zu entrance=%d slot=%.4f deg advance=%.4f mm "
+                                 "dip=%.4f mm attach y %.4f -> %.4f mm\n",
+                                 dipPass, (size_t)v.ci, (int)v.entrance, az[k] * 180 / kPi,
+                                 v.attachAdvance * 1e3, dip * 1e3, v.attachSegIdeal[1] * 1e3,
+                                 seg[1] * 1e3);
                 v.segs.front() = seg;
                 v.y0 = std::min(v.y0, seg[1]);
                 v.y1 = std::max(v.y1, seg[1]);
