@@ -6453,8 +6453,20 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // off-plane would slide out from under it. Dragbacks are placed FIRST (they live
         // inside the winding, under every bump); the leads pack around them, ordered by height
         // so close-height pairs meet their real clearance and far pairs share angles freely.
-        std::stable_sort(verts.begin(), verts.end(), [](const Vert& a, const Vert& b) {
+        // ABT #685 experiment (14_dab, Alf's "the first parallel's centre in x=0"): place the
+        // STEEPEST-attaching bundle first. A lead's dip grows with its plane offset in
+        // proportion to the wrap advance it attaches to, so displacing a bundle that hangs off a
+        // -39 mm/rev final landing costs 109 um per degree while displacing one on a 3.7 mm/rev
+        // band costs 10. Whoever is cheapest to move should be the one that moves. OFF by
+        // default: this reorders the whole corpus's packing, and the current order is tuned
+        // (11_pushpull's stub rule, below).
+        const bool steepestFirst = std::getenv("MVB_FAN_STEEPEST_FIRST") != nullptr;
+        std::stable_sort(verts.begin(), verts.end(), [steepestFirst](const Vert& a, const Vert& b) {
             if (a.kind != b.kind) return a.kind > b.kind;
+            if (a.kind == 0 && steepestFirst) {
+                const double sa = std::abs(a.attachAdvance), sb = std::abs(b.attachAdvance);
+                if (std::abs(sa - sb) > 1e-9) return sa > sb;
+            }
             if (a.kind == 0) {
                 // SHORTEST routes place first: a straight/short lead is feasible anywhere
                 // near the plane, while a long stub must dodge the wrap tails that the
