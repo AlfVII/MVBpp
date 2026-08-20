@@ -6812,6 +6812,20 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // where the ride-over halves change regime. The fan-vs-core-opening guard and the
         // bump-boundary guard both throw far earlier for any real design.
         const double kFanReach = kPi / 4.0;
+        // ABT #839 (Alf, 14_dab, with a picture of the terminals): every crossing that a LEAD
+        // carries rides with that lead's own slot -- the wrap it feeds starts there. The rule was
+        // already stated for a lead's OWN attach row (see attachRow below) and is no different
+        // one conductor over: a SIBLING parallel's attach row is carried by the SIBLING's lead,
+        // so it has no fixed azimuth either, and a forbidden band computed for it at phase zero
+        // describes copper that is not there. On 14_dab that fiction is what pushed the Primary
+        // exit bundle 23.57 deg off the plane: p3's lead was forbidden by p0/p1/p2's station-13
+        // rows placed at the plane, while the emitter draws each of them one lane away in x,
+        // beside p3, exactly as the parallels are meant to come out ("side by side the
+        // parallels", each group on its own row). Their real separation is not lost -- it is
+        // enforced where it is exact, by need()/clears() in X between the leads themselves.
+        std::set<std::pair<size_t, size_t>> rowRidesWithLead;
+        for (const auto& v : verts)
+            if (v.kind == 0) rowRidesWithLead.insert({v.ci, v.attachStation});
         std::vector<std::vector<AzInterval>> forbid(verts.size());
         for (size_t k = 0; k < verts.size(); ++k) {
             const Vert& L = verts[k];
@@ -6835,6 +6849,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const bool attachRow = R.ci == L.cis[0] &&
                                        std::abs(R.y - L.attachY) < 0.5 * (L.rwBare + R.rw);
                 if (attachRow) continue;
+                if (rowRidesWithLead.count({R.ci, R.station})) continue;   // see above
                 // Forbidden windows come from BOTH parts of the drawn route: the RUN row
                 // (the radial run crosses the ring band at that height) and each VERTICAL
                 // STUB (the stub occupies its whole y-interval at its own radius -- a
