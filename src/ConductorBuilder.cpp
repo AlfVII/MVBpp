@@ -3967,6 +3967,141 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
               " (over dragback)", -c);
 }
 
+// ---------------------------------------------------------------------------------------
+// THE TERMINAL STUB, EXACT (ABT #839).
+//
+// The stub is the piece of the turn that hands the wire to its terminal lead. It has to be a
+// CIRCULAR arc (a short steep SPIRAL pipe-sweeps into geometry OCC's booleans cannot cut --
+// measured, see pushStub), and every circle deviates from the helix it replaces. The question
+// is only WHICH circle, and there is exactly one right answer:
+//
+//   Sibling parallels' stubs are congruent copies translated axially by the station pitch s.
+//   For two congruent circles in parallel planes of unit normal n translated by v = s*yhat, the
+//   minimum distance is EXACTLY s*|n_y| (the in-plane part of v is realisable as a chord --
+//   s*sin(alpha) against a diameter of ~2r here -- so the minimum sits at |v . n|). MKF funds
+//   s = od*sqrt(1 + tan^2 alpha) = od / cos(alpha) (helical_stacking_pitch), so the stub clears
+//   exactly when |n_y| >= cos(alpha).
+//
+//   Tangency at the wrap junction forces n perpendicular to T. Writing n = cos(t) N + sin(t) B
+//   in the wrap's own Frenet frame gives n_y = sin(t) * B_y, and for a helix
+//   B = (k sin a, r, k cos a)/c, so B_y = r/c = cos(alpha) EXACTLY -- the very cosine the pitch
+//   funds. Hence n_y = sin(t) cos(alpha) <= cos(alpha), with equality only at t = pi/2, i.e.
+//   n = B.
+//
+// => AMONG ALL CIRCLES TANGENT TO THE WRAP AT THE JUNCTION, THE OSCULATING ONE IS THE UNIQUE ONE
+//    THAT CLEARS ITS SIBLING, AND IT CLEARS EXACTLY. Every other tilt is strictly worse; the
+//    construction this replaces (the circle through BOTH helix endpoints, tangent at the wrap
+//    side) is tilted off the osculating plane and lost s*(cos alpha - n_y) -- 0.26 nm on 06_llc,
+//    5.4 nm on 14_dab's Secondary, which is exactly what the certified gate reported.
+//    It is also Alf's own rule made exact ("same curvature as the turn it is connected to"): the
+//    osculating circle is BY DEFINITION the circle of equal tangent and equal curvature.
+//
+// The mixed pairs (a stub against a SIBLING'S WRAP) come out exact too, by the phase lag. The
+// closest point of the upper sibling to ours at arc length sigma sits at sigma + Delta and the
+// lower sibling's at sigma - Delta, with Delta = s*sin(alpha) (from the exact minimisation,
+// u* = -k s / c^2). The osculating circle leaves the helix ONLY by the torsion cubic,
+// -(kappa tau / 6) sigma^3 B; on a descending landing wrap that is +B, toward the upper sibling
+// -- whose partner at sigma + Delta lies on ITS OWN stub, a congruent circle, hence exactly od
+// -- while it moves AWAY from the lower sibling, the only one still presenting a raw helix.
+//
+// THE PRICE, and it is unavoidable: a circle has zero torsion, so it cannot both lie in the
+// osculating plane and pass through the far helix endpoint. The terminal end therefore CONFORMS
+// -- it lands where the arc truly crosses the terminal's own azimuth half-plane. That keeps the
+// lead's reserved AZIMUTH exact (the fan's slot is untouched) and, since B has no radial
+// component (B = (r*yhat - k*that)/c), the move is essentially axial: 0.6 nm on 06_llc, ~58 nm
+// on 14_dab. The lead must attach THERE, which is why `terminal` comes back with the arc and one
+// function serves both emitters -- a lead that attached to the old helix point would leave a gap
+// exactly that size, and this file's rule is that pieces meet by construction.
+struct RoundStub {
+    bool valid = false;
+    gp_XYZ centre;      // circle centre, in the UN-RAISED frame (column axis through the origin)
+    gp_XYZ axis;        // unit rotation axis, oriented along the piece's travel sense
+    gp_XYZ v0;          // centre -> the piece's START point
+    double sweep = 0.0;
+    PlanePt terminal;   // where the arc meets the terminal azimuth plane: (radius, height)
+};
+
+// Derives the stub from EXACTLY the parameters appendRoundWrap draws the wrap with, so the
+// emitter and the lead cannot describe different geometry. Returns an invalid stub wherever the
+// wrap does not take the stub path (no room, or a radius step, which is a layer link).
+RoundStub roundWrapStub(const PlanePt& s, const PlanePt& n, double wireRadius, double azS,
+                        double azE, double endYOverride, bool terminalAtStart,
+                        bool siblingIsTranslate) {
+    RoundStub out;
+    if (std::getenv("MVB_NO_OSCULATING_STUB")) return out;   // bisect switch
+    // THE PREMISE, CHECKED (ABT #839). Everything above holds because the sibling's stub is this
+    // one TRANSLATED AXIALLY -- that is what makes s*|n_y| the distance and cos(alpha) the thing
+    // MKF's pitch funds. It is true exactly when the siblings share one fan slot (the packer gives
+    // a bundle whose routes are disjoint a zero intra-block step, so all its members take the same
+    // azimuth). Where they DON'T -- each parallel on its own slot -- the siblings are related by a
+    // SCREW, not a translation, and the theorem says nothing: measured on 06_llc's entrance
+    // (slots 0.855 mm apart in x) the osculating arc came out 43 nm deep where the arc through
+    // both helix endpoints was clear.
+    //
+    // That is not a flaw in the construction, it is a different exact object. Against a rotated
+    // sibling the thing that is exactly od away at EVERY azimuth is the ideal K-filar HELIX
+    // FAMILY itself, so the best circle is the one that stays closest to the helix -- and that is
+    // the interpolating arc through both endpoints (max deviation ~0.096 kappa|tau| L^3 at
+    // mid-span) rather than the osculating one (~0.167 kappa|tau| L^3, all of it at the far end).
+    // So each case keeps the arc that is exact for it.
+    if (!siblingIsTranslate) return out;
+    if (std::abs(n.x - s.x) > wireRadius) return out;        // radius step: a link, not a wrap
+    const double yEnd = std::isnan(endYOverride) ? n.y : endYOverride;
+    const double stubAz = 2.0 * std::asin(std::min(1.0, wireRadius / std::max(s.x, 1e-9)));
+    const double sweepSpan = (azE + kTwoPi) - azS;
+    if (stubAz <= 0.0 || !(sweepSpan > 4.0 * stubAz)) return out;   // mirrors roomForStubs
+    const double rPrime = (n.x - s.x) / sweepSpan;
+    const double yPrime = (yEnd - s.y) / sweepSpan;
+    const double azT = terminalAtStart ? azS : azE + kTwoPi;
+    const double azW = terminalAtStart ? azS + stubAz : azE + kTwoPi - stubAz;
+    const double rW = s.x + rPrime * (azW - azS);
+    const double yW = s.y + yPrime * (azW - azS);
+    // The EXACT Frenet frame of the emitted curve P(a) = (r(a) cos a, y(a), -r(a) sin a). r and
+    // y are linear in a, so both derivatives are analytic: the frame is exact, and it degrades
+    // correctly to a cone (r0 != r1) and to a plain circle (yPrime = 0, where it reproduces the
+    // horizontal special case above exactly -- centre on the axis, axis +Y, radius r).
+    const double ca = std::cos(azW), sa = std::sin(azW);
+    const gp_XYZ d1(rPrime * ca - rW * sa, yPrime, -rPrime * sa - rW * ca);
+    const gp_XYZ d2(-2.0 * rPrime * sa - rW * ca, 0.0, -2.0 * rPrime * ca + rW * sa);
+    const gp_XYZ cross = d1.Crossed(d2);
+    const double d1n = d1.Modulus(), crossN = cross.Modulus();
+    if (d1n < 1e-15 || crossN < 1e-30) return out;   // straight: no osculating circle
+    const gp_XYZ B = cross / crossN;                 // binormal; B.Y() == cos(pitch angle)
+    const gp_XYZ T = d1 / d1n;
+    const gp_XYZ N = B.Crossed(T);                   // principal normal, toward the centre
+    const double rho = (d1n * d1n * d1n) / crossN;   // 1 / curvature
+    const gp_XYZ PW(rW * ca, yW, -rW * sa);
+    const gp_XYZ C = PW + N * rho;
+    const gp_XYZ u = (PW - C) / rho;                 // unit, centre -> the junction
+    const gp_XYZ v = B.Crossed(u);                   // unit, a quarter turn ahead about +B
+    // Where the circle crosses the terminal's own azimuth half-plane. That plane holds the column
+    // axis and the terminal radial, so its normal is the azimuthal unit and it passes through the
+    // origin of this frame; the crossing keeps the lead's slot azimuth exact.
+    const gp_XYZ azUnit(-std::sin(azT), 0.0, -std::cos(azT));
+    const double p = C.Dot(azUnit);
+    const double cosCoef = rho * u.Dot(azUnit), sinCoef = rho * v.Dot(azUnit);
+    const double amp = std::hypot(cosCoef, sinCoef);
+    if (amp < 1e-15 || std::abs(p) > amp) return out;   // the arc never reaches the plane
+    const double phase = std::atan2(sinCoef, cosCoef);
+    const double half = std::acos(std::clamp(-p / amp, -1.0, 1.0));
+    // Two roots half a turn apart; the stub spans a couple of degrees, so take the nearer.
+    double theta = std::remainder(phase + half, kTwoPi);
+    const double other = std::remainder(phase - half, kTwoPi);
+    if (std::abs(other) < std::abs(theta)) theta = other;
+    if (std::abs(theta) < 1e-12 || std::abs(theta) > kPi / 2.0) return out;
+    const gp_XYZ PT = C + (u * std::cos(theta) + v * std::sin(theta)) * rho;
+    const gp_XYZ radialUnit(std::cos(azT), 0.0, -std::sin(azT));
+    out.terminal = PlanePt{PT.Dot(radialUnit), PT.Y()};
+    // Travel runs terminal -> wrap on an entrance stub and wrap -> terminal on an exit one.
+    const double travel = terminalAtStart ? -theta : theta;
+    out.centre = C;
+    out.axis = travel >= 0.0 ? B : (B * -1.0);
+    out.sweep = std::abs(travel);
+    out.v0 = (terminalAtStart ? PT : PW) - C;
+    out.valid = true;
+    return out;
+}
+
 // azS / azE are the CROSSING azimuths at the wrap's two stations: kPlaneAz normally, a fan
 // slot when the crossing belongs to a dragback or terminal lead spread off the plane.
 void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
@@ -3975,7 +4110,8 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
                      double azE = kPlaneAz, const std::vector<WrapBump>& bumpsEnd = {},
                      int64_t parallels = 1, bool stubAtStart = false, bool stubAtEnd = false,
                      double endYOverride = std::numeric_limits<double>::quiet_NaN(),
-                     bool steepFinal = false) {
+                     bool steepFinal = false, bool translateSiblingAtStart = false,
+                     bool translateSiblingAtEnd = false) {
     // U (SERPENTINE) LAYER LINK -- Alf, 2026-08-07, 14_dab; descent form Alf, 2026-08-08 (ABT
     // #608 final form). Layers wound in U (this one bottom to top, the next top to bottom)
     // connect DIFFERENTLY from a dragback, and differently from a cone: the wire leaves the
@@ -4163,6 +4299,24 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
             stub.arc.sweep = az1 - az0;
             path.prims.push_back(std::move(stub));
             return;
+        }
+        // ABT #839: THE OSCULATING ARC -- the unique tangent circle that clears its sibling
+        // exactly (see roundWrapStub). Same inputs the wrap itself was drawn from, so the
+        // terminal-lead emitter can ask the same function where this arc ends.
+        {
+            const RoundStub osc = roundWrapStub(s, n, wireRadius, azS, azE, endYOverride,
+                                                terminalAtStart,
+                                                terminalAtStart ? translateSiblingAtStart
+                                                                : translateSiblingAtEnd);
+            if (osc.valid) {
+                stub.kind = Primitive::ARC3;
+                stub.arc.c = gp_Pnt(osc.centre.X(), osc.centre.Y(), osc.centre.Z() - raise);
+                stub.arc.axis = osc.axis;
+                stub.arc.v0 = osc.v0;
+                stub.arc.sweep = osc.sweep;
+                path.prims.push_back(std::move(stub));
+                return;
+            }
         }
         // Wrap-side end and tangent (the joint that must stay exactly tangent), terminal end.
         const double azW = terminalAtStart ? az1 : az0;
@@ -9157,6 +9311,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                              crossAz.back() * 180 / kPi);
             }
         }
+        // ABT #839: DOES THIS CONDUCTOR'S SIBLING SIT AT THIS STUB'S OWN AZIMUTH? That is the
+        // premise of the osculating stub (see roundWrapStub): siblings sharing a fan slot are
+        // pure axial translates of each other, siblings on their own slots are screw-related.
+        // The fan already decided it -- a bundle whose routes are disjoint gets a zero intra-block
+        // step and every member takes one azimuth -- so it is simply read back here.
+        auto siblingSharesSlot = [&](const std::map<size_t, double>& slots, double az) {
+            for (size_t cj = 0; cj < conductors.size(); ++cj) {
+                if (cj == ci || conductors[cj].winding != ct.winding) continue;
+                auto it = slots.find(cj);
+                if (it != slots.end() && std::abs(it->second - az) < 1e-12) return true;
+            }
+            return false;
+        };
+        const bool translateSiblingIn = siblingSharesSlot(leadAzIn, azEntrance);
+        const bool translateSiblingOut = siblingSharesSlot(leadAzOut, azExit);
         // ABT #685 ENTRANCE ATTACH (Alf, 2026-08-15): the mirror of exitAttachY. MKF's station is
         // the height at the CONNECTION PLANE, but the first wrap STARTS at its fan slot, delta
         // degrees before the plane — the helix is genuinely one pitch-per-degree LOWER there.
@@ -9175,6 +9344,42 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 entranceAttachY = t0.y - (t1.y - t0.y) * (kPlaneAz - azEntrance) / kTwoPi;
             }
         }
+        // ABT #685 (A2): pitch-true landing heights, keyed by the landing turn's index -- set
+        // where the dragback is emitted, consumed by the landing wrap's start and by the stub
+        // terminal below (declared here so both the loop and the lead emitters see one map).
+        std::map<size_t, double> landingAttach;
+        // ABT #685: the pitch-true end height the wrap of transition `i` is drawn to, NaN when it
+        // is not stretched. Hoisted out of the emission loop because the ENTRANCE lead is emitted
+        // before that loop runs and must be able to ask for transition 0's -- the stub's shape,
+        // and so the point the lead attaches at, depends on it. ONE definition, so the lead and
+        // the wrap cannot be drawn from different pitches.
+        auto wrapEndYOverride = [&](size_t i) {
+            double endY = std::numeric_limits<double>::quiet_NaN();
+            if (i + 2 > nEmit || i + 1 >= nEmit) return endY;
+            const PlanePt sw = station(turns[i]), nw = station(turns[i + 1]);
+            if (std::abs(crossAz[i + 1] - crossAz[i]) <= 1e-9) return endY;
+            if (std::abs(nw.x - sw.x) > wireRadius) return endY;
+            if (i + 2 == nEmit || zDragbackAzimuth.count(i + 1)) {
+                endY = nw.y + (nw.y - sw.y) * (crossAz[i + 1] - crossAz[i]) / kTwoPi;
+            }
+            return endY;
+        };
+        // ABT #839: where transition `i`'s terminal stub -- the osculating arc -- actually ends.
+        // The lead attaches THERE, not at the helix station the arc had to leave behind.
+        auto stubTerminalOf = [&](size_t i, bool terminalAtStart,
+                                  bool siblingIsTranslate) -> std::optional<PlanePt> {
+            if (!effectivelyRound || i + 1 >= nEmit) return std::nullopt;
+            if (zDragbackAzimuth.count(i)) return std::nullopt;   // a dragback draws no stub
+            PlanePt sw = station(turns[i]);
+            if (i == 0 && !std::isnan(entranceAttachY)) sw.y = entranceAttachY;
+            if (auto lit = landingAttach.find(i); lit != landingAttach.end())
+                sw.y = lit->second;   // pitch-true landing (see the dragback branch)
+            const RoundStub st = roundWrapStub(sw, station(turns[i + 1]), wireRadius, crossAz[i],
+                                               crossAz[i + 1], wrapEndYOverride(i),
+                                               terminalAtStart, siblingIsTranslate);
+            if (!st.valid) return std::nullopt;
+            return st.terminal;
+        };
 
         // Entrance: MKF's drawn route, walked from the border TO the first station, then
         // extended straight out so the terminal sticks clear of the coil. Emitted at the
@@ -9326,6 +9531,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 } else if (!std::isnan(entranceAttachY)) {
                     firstAttach.y = entranceAttachY;
                 }
+                // ABT #839: the tangent corner anchors on the osculating stub's true end, the
+                // same point the round-wire lead attaches at -- the wrap emitter draws one stub
+                // whatever the wire section is.
+                if (auto term = stubTerminalOf(0, /*terminalAtStart=*/true,
+                                               translateSiblingIn)) {
+                    firstAttach.x = term->x;
+                    firstAttach.y = term->y;
+                }
                 rectLeadCorner(firstAttach, azEntrance, /*isExit=*/false, sIn, "entrance lead");
             } else {
                 // The MKF-DRAWN entrance route, for EVERY column shape (Alf, 2026-08-07:
@@ -9364,6 +9577,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 } else if (!std::isnan(entranceAttachY)) {
                     fLead.y = entranceAttachY;
                 }
+                // ABT #839: ...and then onto the osculating stub's true end, so the lead starts
+                // exactly where the turn's copper stops. Radius as well as height: the arc's
+                // crossing of this slot's azimuth plane is the whole attach point.
+                if (auto term = stubTerminalOf(0, /*terminalAtStart=*/true,
+                                               translateSiblingIn)) {
+                    fLead.x = term->x;
+                    fLead.y = term->y;
+                }
                 wp = terminalWaypoints(entranceGroup, fLead, path.name + " entrance");
             }
             if (!wp.empty()) {
@@ -9395,7 +9616,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         double exitAttachY = std::numeric_limits<double>::quiet_NaN();
         // ABT #685 (A2): pitch-true landing heights, keyed by the landing turn's index -- set
         // where the dragback is emitted, consumed by the landing wrap's start (see below).
-        std::map<size_t, double> landingAttach;
         // ABT #685/#831 (rect): where each rising rect wrap ACTUALLY ended (pitch-true, one
         // endCut share short of the station when a descent slot cut its path) -- consumed by
         // the following return's chain start and the exit lead corner.
@@ -9473,14 +9693,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // station. exitAttachY carries that height to the exit lead, whose vertical then
                 // starts there — the lead's OWN row is untouched, only the point it leaves the
                 // turn at.
-                double endY = std::numeric_limits<double>::quiet_NaN();
                 // Not for a STEEP final landing (ABT #685): its station IS the landing point — the
                 // revolution's whole purpose is to arrive exactly there, on the exit row, and
                 // extrapolating one pitch-share past it sloped the exit run 0.3 mm off its row
                 // into the next winding's entrance stub (14_dab, 0.61 mm vs 0.8 needed).
-                if (i + 2 == nEmit && std::abs(crossAz[i + 1] - crossAz[i]) > 1e-9 &&
-                    !(std::abs(nxt.x - s.x) > wireRadius)) {
-                    endY = nxt.y + (nxt.y - s.y) * (crossAz[i + 1] - crossAz[i]) / kTwoPi;
+                const double endY = wrapEndYOverride(i);
+                if (!std::isnan(endY) && i + 2 == nEmit) {
                     exitAttachY = endY;
                 }
                 // ABT #685 (A5, 2026-08-20): the SAME pitch-true stretch for a wrap feeding a
@@ -9492,11 +9710,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // (advance - spacing) margin over the sibling's next wrap: certified 20.5 and
                 // 21.4 um. The wrap now ends where the band helix truly is at the slot; the
                 // dragback's source starts there (see the dragback branch).
-                else if (zDragbackAzimuth.count(i + 1) &&
-                         std::abs(crossAz[i + 1] - crossAz[i]) > 1e-9 &&
-                         !(std::abs(nxt.x - s.x) > wireRadius)) {
-                    endY = nxt.y + (nxt.y - s.y) * (crossAz[i + 1] - crossAz[i]) / kTwoPi;
-                }
                 PlanePt sWrap = s;
                 if (i == 0 && !std::isnan(entranceAttachY)) {
                     sWrap.y = entranceAttachY;   // pitch-true start at the slot azimuth
@@ -9508,7 +9721,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                 crossAz[i], crossAz[i + 1], bumpsForTurn(nxt.x), ct.parallels,
                                 /*stubAtStart=*/i == 0, /*stubAtEnd=*/i + 2 == nEmit, endY,
                                 /*steepFinal=*/i + 2 == nEmit &&
-                                    std::abs(nxt.x - s.x) > wireRadius);
+                                    std::abs(nxt.x - s.x) > wireRadius,
+                                translateSiblingIn, translateSiblingOut);
             } else if (rectFamily) {
                 {
                     const RectStation rs0 = rectStation(s, rectHalfW, rectHalfD, minBend, path.name);
@@ -9699,6 +9913,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 } else if (!std::isnan(exitAttachY)) {
                     lastAttach.y = exitAttachY;   // the stretched wrap's true end height
                 }
+                // ABT #839: ...and onto the osculating stub's true end (see the entrance).
+                if (nEmit > 1) {
+                    if (auto term = stubTerminalOf(nEmit - 2, /*terminalAtStart=*/false,
+                                                   translateSiblingOut)) {
+                        lastAttach.x = term->x;
+                        lastAttach.y = term->y;
+                    }
+                }
                 rectLeadCorner(lastAttach, azExit, /*isExit=*/true, sOut, "exit lead");
             } else if (!exitGroup.empty()) {
                 // The MKF-DRAWN exit route, every column shape (Alf, 2026-08-07 -- see
@@ -9739,8 +9961,19 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
                 // Start the lead where the wrap actually ended (ABT #685). Only the ATTACH point
                 // moves; every other waypoint, including the row the lead runs out on, is MKF's.
-                if (!std::isnan(exitAttachY)) {
-                    wp.front().y = exitAttachY;
+                // ABT #839: the attach is the osculating stub's TRUE end where there is one --
+                // radius and height both, so the lead starts exactly where the copper stops.
+                double attachX = wp.front().x, attachY = exitAttachY;
+                if (nEmit > 1) {
+                    if (auto term = stubTerminalOf(nEmit - 2, /*terminalAtStart=*/false,
+                                                   translateSiblingOut)) {
+                        attachX = term->x;
+                        attachY = term->y;
+                    }
+                }
+                if (!std::isnan(attachY)) {
+                    wp.front().x = attachX;
+                    wp.front().y = attachY;
                     // ABT #685: moving the attach must not SLANT the run. The route was shaped
                     // against MKF's drawn station; once the attach follows the wrap's true end,
                     // any row offset it opens up is taken by a vertical at the attach radius,
