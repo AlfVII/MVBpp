@@ -4098,32 +4098,87 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
     // exceeds the interleaved corridor slack outright (pushpull: 136 um into the sibling's ring
     // copper). The lead now mitres straight-against-arc; the assembler's junction machinery owns
     // that seam, and the gate holds it to the same zero-tolerance as every other joint.
-    auto pushStub = [&](double az0, double az1, double raise) {
+    // The stub is emitted as an ARC3 in the TILTED PLANE spanned by the wrap-side helix
+    // tangent and the terminal endpoint -- an exact circle through both endpoints, tangent to
+    // the wrap where they join (ABT #685, 2026-08-20). A short steep SPIRAL piece here sweeps
+    // as a pipe that defeats OCC's booleans outright: on 14_dab's steep exit (2.49 deg span,
+    // dy/ds -0.302) the mitre knife AND a half-space both cut NOTHING from it while reporting
+    // success, and Common() against it returned garbage -- the untrimmed wedge shipped 0.148
+    // mm3 inside the exit lead. An ARC3 revolve-sweeps instead of pipe-sweeping and cuts
+    // cleanly. The terminal-side tangent deviates from the true helix by O(slope * span) --
+    // under a degree here -- at the mitred lead corner, which absorbs it; the centreline
+    // endpoints are exact, and the certified gate proves the emitted arc itself.
+    auto pushStub = [&](double az0, double az1, double raise, bool terminalAtStart) {
         const double y0s = heightAtAz(az0), y1s = heightAtAz(az1);
+        if (std::getenv("MVB_LEAD_DIAG")) {
+            std::fprintf(stderr,
+                "[stub] '%s' az=[%.4f,%.4f] deg y=[%.6f,%.6f] r=[%.6f,%.6f] raise=%.6f\n",
+                label.c_str(), az0 * 180 / kPi, az1 * 180 / kPi, y0s, y1s, radiusAtAz(az0),
+                radiusAtAz(az1), raise);
+        }
         const double r0s = radiusAtAz(az0), r1s = radiusAtAz(az1);
         Primitive stub;
+        stub.label = label + " (terminal stub)";
+        stub.turnOrdinal = ordinal;
+        stub.isConnection = false;
         if (std::abs(r1s - r0s) < 1e-12 && std::abs(y1s - y0s) < 1e-12) {
-            // Zero-pitch, constant radius: a plain circular arc -- the spiral machinery
-            // degenerates on it (same rule as appendBumpedSweep's pushPiece).
+            // Zero-pitch, constant radius: the plane is the horizontal one, exactly as before.
             stub.kind = Primitive::ARC3;
             stub.arc.c = gp_Pnt(0, y0s, -raise);
             stub.arc.axis = gp_XYZ(0, 1, 0);
             stub.arc.v0 = azPointC(0, -raise, r0s, y0s, az0).XYZ() - stub.arc.c.XYZ();
             stub.arc.sweep = az1 - az0;
-        } else {
-            stub.kind = Primitive::SPIRAL;
-            stub.spiral = {0, -raise, r0s, y0s, az0, r1s, y1s, az1};
+            path.prims.push_back(std::move(stub));
+            return;
         }
-        stub.label = label + " (terminal stub)";
-        stub.turnOrdinal = ordinal;
-        stub.isConnection = false;
+        // Wrap-side end and tangent (the joint that must stay exactly tangent), terminal end.
+        const double azW = terminalAtStart ? az1 : az0;
+        const double azT = terminalAtStart ? az0 : az1;
+        const gp_Pnt PW = azPointC(0, -raise, radiusAtAz(azW), heightAtAz(azW), azW);
+        const gp_Pnt PT = azPointC(0, -raise, radiusAtAz(azT), heightAtAz(azT), azT);
+        const double azWn = azW + (terminalAtStart ? -1e-6 : 1e-6);   // toward the wrap
+        const gp_Pnt PWn = azPointC(0, -raise, radiusAtAz(azWn), heightAtAz(azWn), azWn);
+        gp_Vec tW(PWn, PW);   // helix tangent at the wrap side, pointing toward the terminal
+        gp_Vec d(PW, PT);
+        if (tW.Magnitude() < 1e-15 || d.Magnitude() < 1e-12) return;
+        tW.Normalize();
+        gp_Vec axis = tW.Crossed(d);
+        if (axis.Magnitude() < 1e-15) {
+            // Degenerate (endpoints along the tangent): a straight piece is the exact curve.
+            stub.kind = Primitive::SEG;
+            stub.seg = terminalAtStart ? Seg{PT, PW} : Seg{PW, PT};
+            path.prims.push_back(std::move(stub));
+            return;
+        }
+        axis.Normalize();
+        gp_Vec nIn = axis.Crossed(tW);   // in-plane normal at PW, toward the centre side
+        const double rho = d.SquareMagnitude() / (2.0 * d.Dot(nIn));
+        const gp_Pnt C(PW.XYZ() + nIn.XYZ() * rho);
+        gp_Vec vW(C, PW), vT(C, PT);
+        double sweep = vW.AngleWithRef(vT, axis);
+        gp_XYZ axisXYZ = axis.XYZ();
+        if (sweep < 0) {
+            sweep = -sweep;
+            axisXYZ = axisXYZ * -1.0;
+        }
+        stub.kind = Primitive::ARC3;
+        stub.arc.c = C;
+        if (terminalAtStart) {
+            // Travel runs terminal -> wrap: start at PT, sweep the opposite handedness.
+            stub.arc.axis = axisXYZ * -1.0;
+            stub.arc.v0 = vT.XYZ();
+        } else {
+            stub.arc.axis = axisXYZ;
+            stub.arc.v0 = vW.XYZ();
+        }
+        stub.arc.sweep = sweep;
         path.prims.push_back(std::move(stub));
     };
     if (azFrom > azS) {
         if (std::getenv("MVB_RAISE_DIAG"))
             std::fprintf(stderr, "[raise] stub-start '%s' raise=%.9f (bumps=%zu)\n",
                          label.c_str(), tallestBumpColumn(bumps).first, bumps.size());
-        pushStub(azS, azFrom, tallestBumpColumn(bumps).first);
+        pushStub(azS, azFrom, tallestBumpColumn(bumps).first, /*terminalAtStart=*/true);
     }
     appendBumpedSweep(path, radiusAtAz(azFrom), heightAtAz(azFrom), azFrom, radiusAtAz(azTo),
                       heightAtAz(azTo), azTo, bumps, wireRadius, label, ordinal,
@@ -4132,7 +4187,7 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         if (std::getenv("MVB_RAISE_DIAG"))
             std::fprintf(stderr, "[raise] stub-end '%s' raise=%.9f (bumpsEnd=%zu)\n",
                          label.c_str(), tallestBumpColumn(bumpsEnd).first, bumpsEnd.size());
-        pushStub(azTo, azE + kTwoPi, tallestBumpColumn(bumpsEnd).first);
+        pushStub(azTo, azE + kTwoPi, tallestBumpColumn(bumpsEnd).first, /*terminalAtStart=*/false);
     }
 }
 
@@ -9348,6 +9403,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 wp.push_back({leadTipRadius, last.y});
             }
             if (!wp.empty()) {
+                if (std::getenv("MVB_LEAD_DIAG")) {
+                    std::fprintf(stderr,
+                        "[exit-attach] %s azExit=%.4f deg exitAttachY=%.6f wpFront=(%.6f,%.6f) last=(%.6f,%.6f)\n",
+                        path.name.c_str(), azExit * 180 / kPi, exitAttachY, wp.front().x,
+                        wp.front().y, last.x, last.y);
+                }
                 // Start the lead where the wrap actually ended (ABT #685). Only the ATTACH point
                 // moves; every other waypoint, including the row the lead runs out on, is MKF's.
                 if (!std::isnan(exitAttachY)) {

@@ -652,6 +652,16 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         double sgn = pr.arc.sweep < 0 ? -1.0 : 1.0;
         double ddA = (overA / radius) * sgn, ddB = (overB / radius) * sgn;
         double total = pr.arc.sweep + ddA + ddB;
+        if (std::getenv("MVB_GROW_DIAG") && (overA > 0 || overB > 0)) {
+            gp_XYZ vs = rotateXYZ(pr.arc.v0, pr.arc.axis, -ddA);
+            gp_XYZ ve = rotateXYZ(pr.arc.v0, pr.arc.axis, -ddA + total);
+            std::fprintf(stderr,
+                "[grow-arc] '%s' overA=%.4f overB=%.4f grownStart=(%.4f,%.4f,%.4f) grownEnd=(%.4f,%.4f,%.4f)\n",
+                pr.label.c_str(), overA * 1e3, overB * 1e3,
+                (pr.arc.c.X() + vs.X()) * 1e3, (pr.arc.c.Y() + vs.Y()) * 1e3,
+                (pr.arc.c.Z() + vs.Z()) * 1e3, (pr.arc.c.X() + ve.X()) * 1e3,
+                (pr.arc.c.Y() + ve.Y()) * 1e3, (pr.arc.c.Z() + ve.Z()) * 1e3);
+        }
         if (std::abs(total) > 1.9 * kPi) return {};  // a near-full revolve would self-close: caller retries
         gp_XYZ v0e = rotateXYZ(pr.arc.v0, pr.arc.axis, -ddA);
         gp_Pnt start(pr.arc.c.XYZ() + v0e);
@@ -882,9 +892,42 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
     gp_Pnt corner(P.XYZ() - u * uNeg - v * vHalf);
     TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Ax2(corner, gp_Dir(w), gp_Dir(u)),
                                            uNeg + uPos, 2.0 * vHalf, depth).Shape();
+    // ZERO REMOVAL = FAILED CUT (ABT #685, 2026-08-20). A mitred end always carries growth
+    // (overS/overE >= mitreGrow > 0), so its knife must always remove material; OCC's Cut on
+    // one steep spiral pipe (14_dab's steep-exit stub) returned the solid unchanged while
+    // reporting Done+valid -- removed -9e-12 mm3 with the overhang tip verified inside the
+    // box -- and the untrimmed wedge shipped overlapping the exit lead by 0.148 mm3. When the
+    // local box removes nothing and the piece has no neighbouring pass to protect (the only
+    // reason the knife is local), retry once with a half-space-scale knife; a cut that still
+    // removes nothing is refused loudly.
+    const bool canRetryHalfSpace = neighbourStep <= 0.0;
+    TopoDS_Shape bigBox;
+    if (canRetryHalfSpace) {
+        const double big = 20.0 * (r + grow);
+        gp_Pnt bigCorner(P.XYZ() - u * big - v * big);
+        bigBox = BRepPrimAPI_MakeBox(gp_Ax2(bigCorner, gp_Dir(w), gp_Dir(u)),
+                                     2.0 * big, 2.0 * big, big).Shape();
+    }
     try {
+        // AN INVALID INPUT CANNOT BE CUT: OCC's booleans return an invalid argument unchanged
+        // while reporting Done (measured, 14_dab's steep-exit stub: a 2.5-degree steep spiral
+        // pipe whose sweep comes out invalid -- the local knife AND a half-space both "removed"
+        // -9e-12 mm3). Repair the piece first; if it will not repair, the refusal below names it.
+        TopoDS_Shape solidIn = solid;
+        if (!BRepCheck_Analyzer(solidIn).IsValid()) {
+            if (std::getenv("MVB_MITRE_DIAG"))
+                std::cerr << "[trim-input-invalid] " << what << " -- repairing before the cut"
+                          << std::endl;
+            try {
+                ShapeFix_Shape fixIn(solidIn);
+                fixIn.Perform();
+                if (!fixIn.Shape().IsNull() && BRepCheck_Analyzer(fixIn.Shape()).IsValid())
+                    solidIn = fixIn.Shape();
+            } catch (const Standard_Failure&) {
+            }
+        }
         GProp_GProps gpBefore, gpAfter;
-        BRepGProp::VolumeProperties(solid, gpBefore);
+        BRepGProp::VolumeProperties(solidIn, gpBefore);
         // CUT IN THE MILLIMETRE FRAME. ABT #685 (Alf, 2026-08-18): rawGrownSolid already sweeps
         // spiral/blend pipes at x1000 because OCC mis-frames sub-millimetre profiles in metres --
         // the boolean has exactly the same problem one step later. Measured on the push-pull's
@@ -895,7 +938,8 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
         gp_Trsf up, down;
         up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
         down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
-        const TopoDS_Shape solidMm = BRepBuilderAPI_Transform(solid, up, Standard_True).Shape();
+        const TopoDS_Shape solidMm =
+            BRepBuilderAPI_Transform(solidIn, up, Standard_True).Shape();
         const TopoDS_Shape boxMm = BRepBuilderAPI_Transform(box, up, Standard_True).Shape();
         BRepAlgoAPI_Cut cut(solidMm, boxMm);
         if (cut.IsDone() && !cut.Shape().IsNull()) {
@@ -949,7 +993,76 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
                                   solid);
             }
             BRepGProp::VolumeProperties(trimmed, gpAfter);
-            const double removed = gpBefore.Mass() - gpAfter.Mass();
+            double removed = gpBefore.Mass() - gpAfter.Mass();
+            if (removed < 1e-15 && canRetryHalfSpace && !bigBox.IsNull()) {
+                // The local knife cut nothing off a grown end: retry with the half-space knife.
+                const TopoDS_Shape bigMm =
+                    BRepBuilderAPI_Transform(bigBox, up, Standard_True).Shape();
+                BRepAlgoAPI_Cut cut2(solidMm, bigMm);
+                if (cut2.IsDone() && !cut2.Shape().IsNull()) {
+                    TopoDS_Shape trimmed2 =
+                        BRepBuilderAPI_Transform(cut2.Shape(), down, Standard_True).Shape();
+                    if (!BRepCheck_Analyzer(trimmed2).IsValid()) {
+                        try {
+                            ShapeFix_Shape fix2(trimmed2);
+                            fix2.Perform();
+                            if (!fix2.Shape().IsNull() &&
+                                BRepCheck_Analyzer(fix2.Shape()).IsValid())
+                                trimmed2 = fix2.Shape();
+                        } catch (const Standard_Failure&) {
+                        }
+                    }
+                    if (BRepCheck_Analyzer(trimmed2).IsValid()) {
+                        GProp_GProps g2;
+                        BRepGProp::VolumeProperties(trimmed2, g2);
+                        const double removed2 = gpBefore.Mass() - g2.Mass();
+                        if (removed2 > 1e-15) {
+                            if (std::getenv("MVB_MITRE_DIAG"))
+                                std::cerr << "[trim-retry] " << what
+                                          << " half-space knife removed "
+                                          << removed2 * 1e9 << " mm3 after the local box "
+                                          << "removed nothing" << std::endl;
+                            trimmed = trimmed2;
+                            gpAfter = g2;
+                            removed = removed2;
+                        }
+                    }
+                }
+            }
+            if (removed < 1e-15) {
+                // Zero removal is LEGITIMATE when the grown end only reaches the mitre plane
+                // without crossing it (a large endpoint mismatch shifts J toward the other
+                // piece). It is a FAILED CUT when the knife's own Common with the piece shows
+                // material that should have gone (measured: OCC cut a steep spiral pipe with
+                // "success" while Common reported 0.09 mm3 inside the knife). Ask the Common.
+                double shouldRemove = 0.0;
+                try {
+                    const TopoDS_Shape probeMm = canRetryHalfSpace && !bigBox.IsNull()
+                        ? BRepBuilderAPI_Transform(bigBox, up, Standard_True).Shape()
+                        : boxMm;
+                    BRepAlgoAPI_Common inKnife(solidMm, probeMm);
+                    if (inKnife.IsDone() && !inKnife.Shape().IsNull() &&
+                        BRepCheck_Analyzer(inKnife.Shape()).IsValid()) {
+                        GProp_GProps gc;
+                        BRepGProp::VolumeProperties(inKnife.Shape(), gc);
+                        shouldRemove = gc.Mass();   // mm^3
+                    }
+                } catch (const Standard_Failure&) {
+                }
+                if (shouldRemove > 1e-6) {
+                    return refuseTrim(
+                        "ConductorBuilder: the mitre knife at " + what + " removed NOTHING while " +
+                            std::to_string(shouldRemove) +
+                            " mm^3 of the piece stands inside it (the cut reported success but "
+                            "left the overhang; half-space retry " +
+                            (canRetryHalfSpace ? "also removed nothing" : "unavailable") + "); " +
+                            diagnosis,
+                        solid);
+                }
+                if (std::getenv("MVB_MITRE_DIAG"))
+                    std::cerr << "[trim-zero-ok] " << what
+                              << " grown end reaches but does not cross the plane" << std::endl;
+            }
             // stub bound: the overhang is at most a full-radius tube of length grow+2r, doubled
             // for the tilted-ellipse wedge. More than that = the knife ate distant material.
             const double stubMax = 2.0 * kPi * r * r * (grow + 2.0 * r);
@@ -1097,8 +1210,15 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             GProp_GProps gcp;
             BRepGProp::VolumeProperties(common.Shape(), gcp);
             if (gcp.Mass() > 1e-6) {
-                overlappingJoints.push_back(joint + " overlaps by " +
-                                            std::to_string(gcp.Mass()) + " mm^3");
+                Bnd_Box cb;
+                BRepBndLib::Add(common.Shape(), cb);
+                double cx0, cy0, cz0, cx1, cy1, cz1;
+                cb.Get(cx0, cy0, cz0, cx1, cy1, cz1);
+                std::ostringstream where;
+                where << joint << " overlaps by " << gcp.Mass() << " mm^3, common bbox mm ["
+                      << cx0 << "," << cy0 << "," << cz0 << "]..[" << cx1 << "," << cy1 << ","
+                      << cz1 << "]";
+                overlappingJoints.push_back(where.str());
             }
         } catch (const Standard_Failure&) {
             // The boolean itself failing is a different defect; the invalid-cut paths
