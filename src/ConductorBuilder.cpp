@@ -7235,6 +7235,24 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     if (!leadRowsClear(verts[group[g]], cg, &why))
                         std::fprintf(stderr, "   member ci=%zu: %s\n",
                                      (size_t)verts[group[g]].ci, why.c_str());
+                    // ABT #839: NAME THE SOFT CONSTRAINTS TOO. This diagnostic exists to say what
+                    // held a block off the plane, and it reported only the HARD ones -- so on the
+                    // one design where the answer mattered (Alf, 14_dab: "why are Primary parallel
+                    // 3 / exit lead seg 1 not near x=0?" -- the block sits 23.6 deg out with every
+                    // hard constraint satisfied AT the plane) it printed a header and nothing
+                    // else. A block is pushed off the plane by a drift window far more often than
+                    // by a hard conflict, so the windows are the thing to print.
+                    for (const auto& iv : forbid[group[g]])
+                        if (cg > iv.lo + 1e-12 && cg < iv.hi - 1e-12)
+                            std::fprintf(stderr,
+                                         "   member ci=%zu: SOFT drift window [%.4f,%.4f] deg "
+                                         "covers the plane\n",
+                                         (size_t)verts[group[g]].ci, iv.lo * 180 / kPi,
+                                         iv.hi * 180 / kPi);
+                    std::string ownWhy;
+                    if (!leadOwnRowsSoft(verts[group[g]], cg, &ownWhy))
+                        std::fprintf(stderr, "   member ci=%zu: SOFT own-rows: %s\n",
+                                     (size_t)verts[group[g]].ci, ownWhy.c_str());
                     for (size_t j = 0; j < verts.size(); ++j) {
                         if (!azAssigned[j] || clears(verts[j], az[j], verts[group[g]], cg))
                             continue;
