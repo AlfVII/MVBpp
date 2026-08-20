@@ -1197,16 +1197,24 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // face-coincidence noise and orders below any real un-bisected corner.
     TopoDS_Shape prevBuilt;
     std::vector<std::string> overlappingJoints;
+    // ABT #685: a silent check is worth nothing -- "no overlap reported" must not be able to mean
+    // "the boolean never answered". Count the joints that got a real verdict against the ones that
+    // did not, so a clean corpus can be told apart from a blind one (MVB_MITRE_DIAG prints both).
+    size_t abutChecked = 0, abutNoVerdict = 0;
     auto checkMitredAbutment = [&](const TopoDS_Shape& a, const TopoDS_Shape& b,
                                    const std::string& joint) {
-        if (a.IsNull() || b.IsNull()) return;
+        if (a.IsNull() || b.IsNull()) { ++abutNoVerdict; return; }
         try {
             gp_Trsf up;
             up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
             BRepAlgoAPI_Common common(
                 BRepBuilderAPI_Transform(a, up, Standard_True).Shape(),
                 BRepBuilderAPI_Transform(b, up, Standard_True).Shape());
-            if (!common.IsDone() || common.Shape().IsNull()) return;   // no verdict, no claim
+            if (!common.IsDone() || common.Shape().IsNull()) {   // no verdict, no claim
+                ++abutNoVerdict;
+                return;
+            }
+            ++abutChecked;
             GProp_GProps gcp;
             BRepGProp::VolumeProperties(common.Shape(), gcp);
             if (gcp.Mass() > 1e-6) {
@@ -1223,6 +1231,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         } catch (const Standard_Failure&) {
             // The boolean itself failing is a different defect; the invalid-cut paths
             // already throw where the trim happens.
+            ++abutNoVerdict;
         }
     };
     for (size_t i = 0; i < n; ++i) {
@@ -1589,13 +1598,26 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                       << " y=[" << y0 << "," << y1 << "]\n";
         }
     }
+    if (abutNoVerdict > 0 || diag) {
+        std::cerr << "[abut] mitred joints with a boolean verdict: " << abutChecked
+                  << ", without one: " << abutNoVerdict
+                  << (abutNoVerdict > 0 ? "  <-- those corners are UNCHECKED, not clean\n" : "\n");
+    }
     if (!overlappingJoints.empty()) {
         std::string msg =
             "ConductorBuilder: " + std::to_string(overlappingJoints.size()) +
             " mitred corner(s) did not abut -- the two sides overlap instead of sharing the "
             "bisector face:";
         for (const auto& j : overlappingJoints) msg += "\n  " + j;
-        throw std::runtime_error(msg);
+        // ABT #685: the same escape the certified enamel gate carries (MVB_ALLOW_ENAMEL) -- OFF by
+        // default, so anything that ships is a design whose corners abut. Set it only to EXPORT a
+        // known-faulty design for visual review; the fault is still printed in full.
+        if (std::getenv("MVB_ALLOW_ABUTMENT")) {
+            std::cerr << "[corners] " << msg
+                      << "\n  (MVB_ALLOW_ABUTMENT set: reported, not refused)\n";
+        } else {
+            throw std::runtime_error(msg);
+        }
     }
     // Per-solid analysis (union-find connectivity, volumes, interpenetration) is O(n^2) EXACT
     // BRepExtrema/classification -- ~15k queries on a 170-prim toroid, tens of minutes. Keep it
