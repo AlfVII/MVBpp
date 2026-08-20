@@ -6115,6 +6115,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     dv.kind = 1; dv.ci = cv; dv.trans = i; dv.entrance = false;
                     dv.r = b.x; dv.y0 = std::min(a.y, b.y); dv.y1 = std::max(a.y, b.y);
                     dv.rw = rwCoat; dv.rwBare = rwBare;
+                    // ABT #830: a dragback is a CHAIN, not a bare vertical. appendZDragback draws
+                    // it as the winder lays it -- step out radially at the height it arrived at,
+                    // drop at the next layer's radius, then ride out onto the turn it feeds -- and
+                    // the fan modelled only the drop. The RADIAL RUN-OUT is what a lead running
+                    // along a nearby row actually meets: on 17_cllc the Secondary's entrance lead
+                    // crosses its OWN conductor's 'turn 13_ending -> turn 14 (dragback)' 17.4 um
+                    // inside the envelope, and the fan saw nothing there to dodge because the leg
+                    // it hits was not in the model. Modelled as the two legs the emitter draws.
+                    dv.segs = {{a.x, a.y, b.x, a.y}, {b.x, a.y, b.x, b.y}};
                     dv.wname = ct.winding;   // ABT #685: sibling returns block-allocate together
                     // the climb of the layer this return LANDS on (its own band, not the
                     // conductor's net direction -- a serpentine conductor has none)
@@ -6282,8 +6291,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // bundles then collided further out.
                 if (K.wname == O.wname && O.kind == 0) return 0.0;
                 const std::vector<std::array<double, 4>> otherRoute =
-                    O.kind == 1 ? std::vector<std::array<double, 4>>{{O.r, O.y0, O.r, O.y1}}
-                                : O.segs;
+                    (O.kind == 1 && O.segs.empty())
+                        ? std::vector<std::array<double, 4>>{{O.r, O.y0, O.r, O.y1}}
+                        : O.segs;
                 if (routeDist(K.segs, otherRoute) > dSep - 1e-6) return 0.0;
                 const double rr2 = std::max(std::min(A.r, B.r), dSep);
                 return std::asin(std::min(1.0, dSep / rr2));
@@ -6355,8 +6365,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             } else if (A.kind != B.kind) {
                 const Vert& L = A.kind == 0 ? A : B;
                 const Vert& D = A.kind == 0 ? B : A;
-                // The lead's drawn route against the dragback's vertical descent.
-                std::vector<std::array<double, 4>> dseg{{D.r, D.y0, D.r, D.y1}};
+                // ABT #830: the lead's drawn route against the dragback's DRAWN CHAIN (run-out
+                // plus descent), not against a bare vertical -- see the chain the pre-scan builds.
+                const std::vector<std::array<double, 4>> dseg =
+                    D.segs.empty() ? std::vector<std::array<double, 4>>{{D.r, D.y0, D.r, D.y1}}
+                                   : D.segs;
                 if (routeDist(L.segs, dseg) > dSep - 1e-6) return 0.0;
             } else {
                 // Two dragbacks: a conductor's OWN returns deliberately stack in one column
