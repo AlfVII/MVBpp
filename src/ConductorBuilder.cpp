@@ -6036,6 +6036,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         std::vector<Vert> verts;
         struct WireRow {       // one station row, with its conductor's signed advance
             double r, y, adv, rw;   // rw = BARE radius (the gate's criterion)
+            // COATED radius, for the one check planned at the enamel criterion (a lead against
+            // its OWN conductor's rows, below): wires may touch at their coated envelopes,
+            // never interpenetrate, and that gate certifies the coated figure.
+            double rwCoat;
             size_t ci;
             // Azimuth validity of this row's copper in the fan frame (crossings sit at
             // c = 0): the FIRST station's wrap exists only for c >= 0, the LAST only for
@@ -6253,11 +6257,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const PlanePt st = station(ct.turns[i]);
                 if (i + 1 < nEmitP && transKindP[i] == 0) {
                     const double advLeaving = station(ct.turns[i + 1]).y - st.y;
-                    rows.push_back({st.x, st.y, advLeaving, rwBare, cv, 0.0, 1e30, i});
+                    rows.push_back({st.x, st.y, advLeaving, rwBare, rwCoat, cv, 0.0, 1e30, i});
                 }
                 if (i > 0 && transKindP[i - 1] == 0) {
                     const double advArriving = st.y - station(ct.turns[i - 1]).y;
-                    rows.push_back({st.x, st.y, advArriving, rwBare, cv, -1e30, 0.0, i});
+                    rows.push_back({st.x, st.y, advArriving, rwBare, rwCoat, cv, -1e30, 0.0, i});
                 }
             }
         }
@@ -6461,15 +6465,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // zero while the wire crosses on the plane, and the vertical's own slot once that
         // vertical carries its conductor's crossing with it.
         auto rowVertGap = [&](const WireRow& R, double rowPhase, const Vert& L, double c,
-                              std::string* why = nullptr) -> bool {
+                              std::string* why = nullptr,
+                              const std::vector<std::array<double, 4>>* segsOv = nullptr,
+                              double clrOv = -1.0) -> bool {
             if (R.r + R.rw < L.r - L.rw - 1e-12) return true;
             if (std::abs(R.adv) < 1e-12) return true;
-            const double clr = L.rwBare + R.rw;
+            const double clr = clrOv > 0.0 ? clrOv : L.rwBare + R.rw;
             const double a = std::clamp(c, R.cLo + rowPhase, R.cHi + rowPhase);
             const double yWrap = R.y + R.adv * (a - rowPhase) / kTwoPi;
             // Beyond the copper's end crossing the obstacle is the crossing point itself.
             const double arc = R.r * std::abs(c - a);
-            for (const auto& sg : L.segs) {
+            for (const auto& sg : (segsOv != nullptr ? *segsOv : L.segs)) {
                 const double rLo = std::min(sg[0], sg[2]), rHi = std::max(sg[0], sg[2]);
                 if (rHi - rLo > 1e-12 && R.r >= rLo - 1e-12 && R.r <= rHi + 1e-12) {
                     // run (or absorbed diagonal) crossing the row's radius
@@ -6530,6 +6536,48 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // wraps; across windings its crossing-point argument is exact.
                 else if (conductors[R.ci].winding == L.wname) continue;
                 if (!rowVertGap(R, 0.0, L, c, why)) return false;
+            }
+            return true;
+        };
+        // ABT #830/#839: A LEAD AGAINST ITS OWN CONDUCTOR'S ROWS, AT THE ENAMEL CRITERION.
+        //
+        // MKF reserves a terminal lead's row exactly one coated OD from the neighbouring
+        // station row -- zero margin by design -- and the emitted lead is NOT the flat row: its
+        // attach sits at the TURN (up to a whole absorbed stub above the row) and the pitch-true
+        // dip moves that attach with the slot. On 06_llc the entrance lead's absorbed diagonal
+        // rises 26 um toward its attach and crosses under its own conductor's rows (the
+        // over-dragback wrap, the layer link's end, the exit stub) 4-5 um inside the COATED
+        // envelope -- which is what the certified enamel gate enforces, while everything the fan
+        // checks for this class is bare-criterion or skips same-winding copper outright.
+        //
+        // So the one honest addition: evaluated with the MEMBER'S DIPPED ROUTE at the candidate
+        // slot (the dip is the fan's own model -- without it the requirement is wildly
+        // overestimated, because moving off-plane lowers the attach and buys most of the
+        // clearance back), against SAME-CONDUCTOR rows only (sibling parallels stay separated
+        // by MKF's rows and the existing models; widening to the whole winding was tried under
+        // ABT #830 and left 06_llc with no feasible slot at all). Rows within one station of
+        // the attach are the copper the lead legitimately joins -- the gate's own
+        // |ordinal diff| <= 1 exemption, mirrored. SOFT: a design with no coated-clear slot
+        // packs exactly as today and the gate keeps the final word.
+        auto dippedSegsAt = [&](const Vert& L, double c) {
+            std::vector<std::array<double, 4>> segs2 = L.segs;
+            if (L.hasAttachSeg && !segs2.empty() && L.attachAdvance != 0.0) {
+                auto seg = L.attachSegIdeal;
+                const double dip = L.attachAdvance * (std::abs(c) / kTwoPi);
+                seg[1] += L.entrance ? -dip : dip;
+                segs2.front() = seg;
+            }
+            return segs2;
+        };
+        auto leadOwnRowsSoft = [&](const Vert& L, double c, std::string* why = nullptr) {
+            if (L.kind != 0) return true;
+            const auto segs2 = dippedSegsAt(L, c);
+            for (const auto& R : rows) {
+                if (R.ci != L.ci) continue;
+                const size_t dS = R.station > L.attachStation ? R.station - L.attachStation
+                                                              : L.attachStation - R.station;
+                if (dS <= 1) continue;
+                if (!rowVertGap(R, 0.0, L, c, why, &segs2, L.rw + R.rwCoat)) return false;
             }
             return true;
         };
@@ -6876,6 +6924,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
                 return true;
             };
+            // ABT #839: every member's dipped route against its own conductor's rows at the
+            // enamel criterion (see leadOwnRowsSoft) -- soft, like the drift windows.
+            auto blockOwnRowsOk = [&](double c) {
+                for (size_t g = 0; g < group.size(); ++g) {
+                    const double cg = azMember(g, c);
+                    if (std::isnan(cg)) return false;
+                    if (!leadOwnRowsSoft(verts[group[g]], cg)) return false;
+                }
+                return true;
+            };
+            bool ownRowsBinding = false;   // some anchor failed ONLY the own-rows check
             bool have = false;
             double best = 0.0;
             // SIDES RULE (Alf, 2026-08-15): "the connections for the terminal happen in the +X
@@ -6899,7 +6958,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             const double cMax = 0.0;
             auto consider = [&](double c, bool withSoft) {
                 if (std::isnan(c) || c > cMax + 1e-12) return;
-                if (!blockHardOk(c) || (withSoft && !blockSoftOk(c))) return;
+                if (!blockHardOk(c)) return;
+                if (withSoft) {
+                    const bool softOk = blockSoftOk(c);
+                    const bool ownOk = blockOwnRowsOk(c);
+                    if (softOk && !ownOk) ownRowsBinding = true;
+                    if (!softOk || !ownOk) return;
+                }
                 // ABT #685 (Alf, 2026-08-15): the block ANCHORS AT THE PLANE — its first member
                 // as close to the Y axis as feasible, the parallels spreading toward +X from
                 // there. Every winding starts at the same place ("the parallels of another
@@ -6935,8 +7000,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     if (std::abs(iv.hi) <= kFanReach) cand.push_back(anchorFor(g, iv.hi));
                 }
             }
-            for (int tier = 0; tier < 2 && !have; ++tier)
+            for (int tier = 0; tier < 2 && !have; ++tier) {
                 for (double c : cand) consider(c, tier == 0);
+                // ABT #839: the own-rows boundary is not among the exact candidates (the dip
+                // couples the route to the slot), so when THAT check alone rejected an anchor
+                // that everything else accepted, sweep outward for the nearest slot that clears
+                // it too. Gated on ownRowsBinding: any block the new check never touches packs
+                // exactly as before, tier fallbacks included.
+                if (tier == 0 && !have && ownRowsBinding)
+                    for (int i = 1; i <= 720 && !have; ++i)
+                        consider(cMax - i * (kPi / 720.0), true);
+            }
             if (!have) {
                 // The exact candidates are the touching positions; in X they can all be
                 // infeasible while a position between two of them is not (three members'
