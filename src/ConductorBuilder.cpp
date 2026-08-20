@@ -3458,9 +3458,19 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
             // sits at the turn.
             return {{station.x, station.y}, {borderX, edgeY}};
         }
-        // Sub-micron offsets are layout noise, not a drawn stub: run flat at the turn's row.
+        // Sub-micron offsets are not a drawn stub -- but the row is still MKF's RESERVATION, and
+        // the reservation is what everything else was stacked against. Running flat at the TURN's
+        // row instead (the old behaviour) put this lead's copper wherever its turn happened to
+        // sit, while the neighbouring winding's row had been stacked one envelope from edgeY: on
+        // 24_margin_interleaved_flyback the two disagreed by 5 nm, and the Primary's lead ended
+        // exactly that far inside the Secondary's, on all three of that design's lead pairs.
+        // Run flat at MKF's row. The leftover offset to the turn is far below anything a wire can
+        // bend (a hundred nanometres against a 171 um wire radius) and is closed where every
+        // other endpoint mismatch is, in the assembler's joint -- not by moving the copper of a
+        // lead that a whole row stack depends on. Axis-parallel either way (Alf: "terminals
+        // should always be parallel to X axis").
         if (rowOffset <= 1e-7) {
-            return {{station.x, station.y}, {borderX, station.y}};
+            return {{station.x, edgeY}, {borderX, edgeY}};
         }
         return {{station.x, station.y}, {station.x, edgeY}, {borderX, edgeY}};
     }
@@ -5933,6 +5943,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     struct LaidDragback { double az; double radius; double diam; };
     std::vector<LaidDragback> laidDragbacks;
     std::map<std::pair<size_t, size_t>, double> dragAzOf;   // (conductor, transition) -> azimuth
+    std::map<std::pair<size_t, size_t>, double> linkAzOf;   // ABT #831: the same, for U links
     std::map<size_t, double> leadAzIn, leadAzOut;           // conductor -> lead azimuth
     double fanWidth = 0.0;
     // ABT #685 COMMON SEAM (Alf, 2026-08-16): the lead-aim (core-opening probe) must be computed
@@ -5968,6 +5979,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // moves BY -advance*delta/2pi, exit attach by +advance*delta/2pi.
             double attachAdvance = 0.0;
             std::array<double, 4> attachSegIdeal{};   // segs[0] as built from MKF's waypoints
+            // ABT #830: which station this lead attaches to -- the one wrap it may touch.
+            size_t attachStation = 0;
             bool hasAttachSeg = false;
             // Leads: one vert per (conductor, side). `segs` is the MKF-drawn 2D lead
             // route in the (r, y) half-plane (vertical stub + horizontal run -- Alf,
@@ -6032,6 +6045,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // (11_pushpull: Secondary 1 par 0's stub is clear just past par 1's last
             // crossing, where par 1's ended wrap no longer exists).
             double cLo = -1e30, cHi = 1e30;
+            // ABT #831: which station this row belongs to, so a vertical that MOVES its own
+            // crossing can find the two wraps that move with it.
+            size_t station = 0;
         };
         std::vector<WireRow> rows;   // NB: WireRow.rw carries the BARE radius: rows are MKF's
                                      // geometry, and lead corridors past them are planned at
@@ -6075,6 +6091,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             std::vector<PlanePt> stationsP;
             for (const MAS::Turn* t : ct.turns) stationsP.push_back(station(t));
             const auto bandsP = computePitchBands(stationsP, rwEmit);
+            // ABT #831: what each transition IS -- 0 wrap, 1 dragback, 2 link -- recorded as the
+            // classification happens, so the obstacle rows below can carry each WRAP's own
+            // advance instead of one median for the whole conductor (see the rows loop).
+            std::vector<int> transKindP(nEmitP > 0 ? nEmitP - 1 : 0, 0);
             for (size_t i = 0; i + 1 < nEmitP; ++i) {
                 PlanePt a = station(ct.turns[i]), b = station(ct.turns[i + 1]);
                 const PitchBand bandP = bandAt(bandsP, a.x, rwEmit, mp, adv);
@@ -6090,6 +6110,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     mkfSaysReturn(ct.turns[i]->get_name(), ct.turns[i + 1]->get_name(),
                                   isZReturn(a, b, rwEmit, bandP.medianPitch, bandP.advance,
                                             ct.parallels))) {
+                    transKindP[i] = 1;
                     Vert dv;
                     dv.kind = 1; dv.ci = cv; dv.trans = i; dv.entrance = false;
                     dv.r = b.x; dv.y0 = std::min(a.y, b.y); dv.y1 = std::max(a.y, b.y);
@@ -6110,11 +6131,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     // vertical stood exactly on P1's link end (distance 0). Registered as a
                     // PINNED vert so every lead packs around it. Same detection window as
                     // appendRoundWrap's link branch, kept in lockstep.
+                    transKindP[i] = 2;
                     Vert lv;
                     lv.kind = 2; lv.ci = cv; lv.trans = i; lv.entrance = false;
-                    lv.r = std::min(a.x, b.x); lv.y0 = a.y; lv.y1 = a.y;
+                    lv.r = std::min(a.x, b.x);
+                    lv.y0 = std::min(a.y, b.y); lv.y1 = std::max(a.y, b.y);
                     lv.rw = rwCoat; lv.rwBare = rwBare;
-                    lv.segs = {{a.x, a.y, b.x, a.y}};   // level at the DEPARTURE height
+                    // ABT #831: the link the emitter draws DESCENDS -- it leaves its wrap at a.y
+                    // and settles on its own destination station b.y ("the link ENDS ON ITS OWN
+                    // TURN"). Modelling it LEVEL at the departure height told the fan two sibling
+                    // links were a full wire apart, when parallel diagonals at vertical spacing s
+                    // are only s*cos(alpha) apart perpendicular: 0.8491 mm against 0.855 on
+                    // 14_dab, the 5.84 um the gate reports on all four of its link pairs. The
+                    // model is the drawn geometry, so the fan can see it and give each sibling
+                    // its own azimuth.
+                    lv.segs = {{a.x, a.y, b.x, b.y}};
                     lv.ys = {a.y};
                     lv.cis = {cv};
                     lv.wname = ct.winding;
@@ -6134,7 +6165,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 ct.winding + " parallel " + std::to_string(ct.parallel);
             auto [egrp, xgrp] = splitTerminalGroups(tRects, whoV);
             auto routeVert = [&](std::vector<PlanePt> wpv, bool entrance,
-                                 const PlanePt& attach, double attachAdvance = 0.0) {
+                                 const PlanePt& attach, double attachAdvance = 0.0,
+                                 size_t attachStation = 0) {
                 // Model EXACTLY what the emitter draws: same kink absorption, same tolerance
                 // (the emitter's wire radius -- rwEmit is "what the emitter bends").
                 wpv = absorbLeadWaypoints(wpv, rwEmit);
@@ -6154,6 +6186,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 v.attachY = attach.y;
                 v.wname = ct.winding;
                 v.attachAdvance = attachAdvance;
+                v.attachStation = attachStation;   // ABT #830: the wrap this lead may touch
                 if (!v.segs.empty()) {
                     v.attachSegIdeal = v.segs.front();
                     v.hasAttachSeg = true;
@@ -6187,16 +6220,36 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               tp = station(ct.turns[nEmitP - 2]);
                 if (std::abs(tl.x - tp.x) <= rwEmit) advOut = tl.y - tp.y;
             }
-            routeVert(terminalWaypoints(egrp, pf, whoV + " entrance"), true, pf, advIn);
+            routeVert(terminalWaypoints(egrp, pf, whoV + " entrance"), true, pf, advIn, 0);
             if (!xgrp.empty())
-                routeVert(terminalWaypoints(xgrp, pl, whoV + " exit"), false, pl, advOut);
+                routeVert(terminalWaypoints(xgrp, pl, whoV + " exit"), false, pl, advOut,
+                          nEmitP - 1);
             else   // one drawn lead: synthesized straight-out exit (see splitTerminalGroups)
-                routeVert({{pl.x, pl.y}, {pl.x + 1.0, pl.y}}, false, pl, advOut);
+                routeVert({{pl.x, pl.y}, {pl.x + 1.0, pl.y}}, false, pl, advOut, nEmitP - 1);
+            // ABT #831: ONE ROW PER WRAP END, carrying THAT WRAP'S OWN ADVANCE.
+            //
+            // A station used to contribute a single row whose drift was the conductor's MEDIAN
+            // advance -- fine while every revolution climbs the same lane, and badly wrong at the
+            // two places a conductor does something else. On 14_dab the wrap leaving the last
+            // turn is the steep exit landing: it descends 37.6 mm in one revolution, and the
+            // median said 3.66. A link placed a couple of degrees off the plane therefore read
+            // 1.27 mm of clearance from copper that was really 0.58 mm away (against 0.8 mm of
+            // envelope), and the fan walked it straight into the sibling's landing.
+            //
+            // Each station now contributes the wrap LEAVING it (valid ahead of the crossing) and
+            // the wrap ARRIVING at it (valid behind), each with its own measured advance -- the
+            // two halves of the same helix, which is what the bounds were always describing. A
+            // transition that is a dragback or a link is not a wrap and contributes neither.
             for (size_t i = 0; i < nEmitP; ++i) {
                 const PlanePt st = station(ct.turns[i]);
-                rows.push_back({st.x, st.y, adv, rwBare, cv,
-                                i == 0 ? 0.0 : -1e30,
-                                i + 1 == nEmitP ? 0.0 : 1e30});
+                if (i + 1 < nEmitP && transKindP[i] == 0) {
+                    const double advLeaving = station(ct.turns[i + 1]).y - st.y;
+                    rows.push_back({st.x, st.y, advLeaving, rwBare, cv, 0.0, 1e30, i});
+                }
+                if (i > 0 && transKindP[i - 1] == 0) {
+                    const double advArriving = st.y - station(ct.turns[i - 1]).y;
+                    rows.push_back({st.x, st.y, advArriving, rwBare, cv, -1e30, 0.0, i});
+                }
             }
         }
         // Angular clearance two verticals need between them, taken at the innermost radius where
@@ -6388,61 +6441,82 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // `why`, when given, receives the blocking row and the two numbers that decide it
         // (delivered vs required), so a block that ends up off the plane can say WHAT held it
         // there instead of leaving the reader to reverse-engineer the packing.
-        auto leadRowsClear = [&](const Vert& L, double c, std::string* why = nullptr) {
-            if (L.kind != 0) return true;
-            for (const auto& R : rows) {
-                // CROSS-WINDING rows only: a winding's own parallels are the K-filar family
-                // the bundle machinery lays out (side-by-side slots, pitch-true attaches,
-                // terminal chords) -- this coarse row model called gate-passing sibling
-                // geometry infeasible (flyback/single_switch refused to pack). Across
-                // windings the model's crossing-point argument is exact and it is the
-                // coverage the dropped drift bands lost.
-                if (conductors[R.ci].winding == L.wname) continue;
-                if (R.r + R.rw < L.r - L.rw - 1e-12) continue;
-                if (std::abs(R.adv) < 1e-12) continue;
-                const double clr = L.rwBare + R.rw;
-                const double a = std::clamp(c, R.cLo, R.cHi);
-                const double yWrap = R.y + R.adv * a / kTwoPi;
-                // Beyond the copper's end crossing the obstacle is the crossing point itself.
-                const double arc = R.r * std::abs(c - a);
-                for (const auto& sg : L.segs) {
-                    const double rLo = std::min(sg[0], sg[2]), rHi = std::max(sg[0], sg[2]);
-                    if (rHi - rLo > 1e-12 && R.r >= rLo - 1e-12 && R.r <= rHi + 1e-12) {
-                        // run (or absorbed diagonal) crossing the row's radius
-                        const double t = (R.r - sg[0]) / (sg[2] - sg[0]);
-                        const double yProbe = sg[1] + (sg[3] - sg[1]) * t;
-                        const double got = std::hypot(yProbe - yWrap, arc);
-                        if (got + 1e-12 < clr) {
-                            if (why != nullptr) {
-                                std::ostringstream w;
-                                w << "run crosses " << conductors[R.ci].winding << " row (ci="
-                                  << R.ci << ") at r=" << R.r * 1e3 << " mm: " << got * 1e3
-                                  << " mm delivered vs " << clr * 1e3 << " mm bare envelope"
-                                  << " (route y=" << yProbe * 1e3 << ", row y=" << yWrap * 1e3
-                                  << " mm)";
-                                *why = w.str();
-                            }
-                            return false;
+        // ABT #831: ONE implementation of "how close does this row's copper come to this
+        // vertical", used in both directions -- a vertical measured against the window's rows
+        // (leadRowsClear, below) and a MOVED conductor's own rows measured against everyone
+        // else's verticals (movedRowsClear). `rowPhase` is the azimuth of the row's crossing:
+        // zero while the wire crosses on the plane, and the vertical's own slot once that
+        // vertical carries its conductor's crossing with it.
+        auto rowVertGap = [&](const WireRow& R, double rowPhase, const Vert& L, double c,
+                              std::string* why = nullptr) -> bool {
+            if (R.r + R.rw < L.r - L.rw - 1e-12) return true;
+            if (std::abs(R.adv) < 1e-12) return true;
+            const double clr = L.rwBare + R.rw;
+            const double a = std::clamp(c, R.cLo + rowPhase, R.cHi + rowPhase);
+            const double yWrap = R.y + R.adv * (a - rowPhase) / kTwoPi;
+            // Beyond the copper's end crossing the obstacle is the crossing point itself.
+            const double arc = R.r * std::abs(c - a);
+            for (const auto& sg : L.segs) {
+                const double rLo = std::min(sg[0], sg[2]), rHi = std::max(sg[0], sg[2]);
+                if (rHi - rLo > 1e-12 && R.r >= rLo - 1e-12 && R.r <= rHi + 1e-12) {
+                    // run (or absorbed diagonal) crossing the row's radius
+                    const double t = (R.r - sg[0]) / (sg[2] - sg[0]);
+                    const double yProbe = sg[1] + (sg[3] - sg[1]) * t;
+                    const double got = std::hypot(yProbe - yWrap, arc);
+                    if (got + 1e-12 < clr) {
+                        if (why != nullptr) {
+                            std::ostringstream w;
+                            w << "run crosses " << conductors[R.ci].winding << " row (ci="
+                              << R.ci << ") at r=" << R.r * 1e3 << " mm: " << got * 1e3
+                              << " mm delivered vs " << clr * 1e3 << " mm bare envelope"
+                              << " (route y=" << yProbe * 1e3 << ", row y=" << yWrap * 1e3
+                              << " mm)";
+                            *why = w.str();
                         }
-                    } else if (rHi - rLo <= 1e-12 && std::abs(sg[0] - R.r) <= clr) {
-                        // vertical stub within reach of the row's radius
-                        const double yLo = std::min(sg[1], sg[3]), yHi = std::max(sg[1], sg[3]);
-                        const double dy = std::max({yLo - yWrap, yWrap - yHi, 0.0});
-                        const double got = std::hypot(std::hypot(dy, sg[0] - R.r), arc);
-                        if (got + 1e-12 < clr) {
-                            if (why != nullptr) {
-                                std::ostringstream w;
-                                w << "vertical stub near " << conductors[R.ci].winding << " row (ci="
-                                  << R.ci << ") at r=" << R.r * 1e3 << " mm: " << got * 1e3
-                                  << " mm delivered vs " << clr * 1e3 << " mm bare envelope"
-                                  << " (stub y=[" << yLo * 1e3 << "," << yHi * 1e3 << "], row y="
-                                  << yWrap * 1e3 << " mm)";
-                                *why = w.str();
-                            }
-                            return false;
+                        return false;
+                    }
+                } else if (rHi - rLo <= 1e-12 && std::abs(sg[0] - R.r) <= clr) {
+                    // vertical stub within reach of the row's radius
+                    const double yLo = std::min(sg[1], sg[3]), yHi = std::max(sg[1], sg[3]);
+                    const double dy = std::max({yLo - yWrap, yWrap - yHi, 0.0});
+                    const double got = std::hypot(std::hypot(dy, sg[0] - R.r), arc);
+                    if (got + 1e-12 < clr) {
+                        if (why != nullptr) {
+                            std::ostringstream w;
+                            w << "vertical stub near " << conductors[R.ci].winding << " row (ci="
+                              << R.ci << ") at r=" << R.r * 1e3 << " mm: " << got * 1e3
+                              << " mm delivered vs " << clr * 1e3 << " mm bare envelope"
+                              << " (stub y=[" << yLo * 1e3 << "," << yHi * 1e3 << "], row y="
+                              << yWrap * 1e3 << " mm)";
+                            *why = w.str();
                         }
+                        return false;
                     }
                 }
+            }
+            return true;
+        };
+        auto leadRowsClear = [&](const Vert& L, double c, std::string* why = nullptr) {
+            if (L.kind == 1) return true;   // dragbacks keep the drift-window model
+            for (const auto& R : rows) {
+                // ABT #831: a LINK is scoped the OPPOSITE way to a lead. On the plane it is safe
+                // by construction (MKF's stations there are exactly one wire apart), but the
+                // moment the fan moves it aside it runs under wraps that are descending -- which
+                // is the whole reason it moved. Its OWN conductor's rows are the wrap it leaves
+                // and the turn it joins, so those are exempt; every other conductor's copper,
+                // sibling parallels included, is not.
+                if (L.kind == 2) {
+                    if (R.ci == L.ci) continue;
+                }
+                // CROSS-WINDING rows only for a LEAD. Widening this to a winding's own wraps was
+                // tried under ABT #830 (with the exemption made exact -- only the station the
+                // lead attaches to) and is NOT viable: 06_llc's fan then had no feasible slot at
+                // all ("the terminal leads ... cannot all be laid out clear"), while 17_cllc --
+                // whose lead meets its own DRAGBACK segment and a rect-column FACE, neither of
+                // which is a round-wrap row -- was unchanged. This model's coverage stops at the
+                // wraps; across windings its crossing-point argument is exact.
+                else if (conductors[R.ci].winding == L.wname) continue;
+                if (!rowVertGap(R, 0.0, L, c, why)) return false;
             }
             return true;
         };
@@ -6581,7 +6655,19 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 continue;
             }
             if (verts[k].kind == 2) {
-                az[k] = 0.0;   // links live at the plane; emission puts them there, not the fan
+                // ABT #831: links stay PINNED at the plane -- but now for a MEASURED reason, not
+                // by assumption. With the model honest (the link modelled as the diagonal it is,
+                // and every wrap carrying its own advance instead of the conductor's median), the
+                // fan was asked to give 14_dab's sibling links their own azimuths and found NONE
+                // feasible within its reach: +2.6 deg runs under the next sibling's steep landing,
+                // -2.6 deg drags this conductor's own landing onto the previous sibling's link,
+                // and the plane itself is 5.84 um short. That is not a packing failure -- it is
+                // MKF spacing the stations these links leave from at EXACTLY one bare envelope
+                // (0.855 mm, zero margin) while the wire leaving them is inclined at tan 0.17.
+                // Parallel diagonals at spacing s clear s*cos(alpha), so the stations must be
+                // od*sqrt(1 + tan^2) = 0.8672 mm apart. Azimuth cannot buy that back; only the
+                // spacing can, and the spacing is MKF's (ABT #831).
+                az[k] = 0.0;
                 azAssigned[k] = 1;
                 continue;
             }
@@ -7081,7 +7167,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         for (size_t k = 0; k < verts.size(); ++k) {
             const double a = kPlaneAz + az[k];
             if (verts[k].kind == 2) {
-                continue;   // links are obstacles only — nothing consumes a slot for them
+                // ABT #831: a link is an obstacle AND a slot now -- emission must draw it where
+                // the fan cleared it, or the separation just computed is fiction (the same
+                // lesson the leads' fan slots taught).
+                linkAzOf[{verts[k].ci, verts[k].trans}] = a;
+                continue;
             }
             if (verts[k].kind == 1) {
                 dragAzOf[{verts[k].ci, verts[k].trans}] = a;
@@ -8889,6 +8979,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (const auto& [m, azv] : zDragbackAzimuth) {
                 crossAz[m] = azv;
                 crossAz[m + 1] = azv;
+            }
+            // ABT #831: the U link takes the slot the fan gave it. Its sibling's link is one
+            // station away and descends alongside it, so all of them on one plane sit closer
+            // than their envelopes; the fan spreads them and the crossing follows. The arriving
+            // wrap simply ends at that azimuth -- pitch-true already carries its height there,
+            // as it does for every other off-plane crossing.
+            for (const auto& [key, azv] : linkAzOf) {
+                if (key.first != ci || key.second + 1 >= nEmit) continue;
+                crossAz[key.second] = azv;
             }
             // A LAYER LINK never changes azimuth: it hands its own azimuth FORWARD to the
             // next crossing, so the radial step and whatever follows (usually the exit lead)
