@@ -955,6 +955,23 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
             const double stubMax = 2.0 * kPi * r * r * (grow + 2.0 * r);
             if (removed <= stubMax && gpAfter.Mass() > 0.0) {
                 if (std::getenv("MVB_MITRE_DIAG")) {
+                    std::cerr << "[trim] " << what << " removed=" << removed * 1e9
+                              << " mm3 (grow=" << grow * 1e3 << " mm)" << std::endl;
+                    if (removed < 1e-15) {
+                        Bnd_Box bs;
+                        BRepBndLib::Add(solid, bs);
+                        double sx0, sy0, sz0, sx1, sy1, sz1;
+                        bs.Get(sx0, sy0, sz0, sx1, sy1, sz1);
+                        std::cerr << "[trim-miss] P=(" << P.X() * 1e3 << "," << P.Y() * 1e3
+                                  << "," << P.Z() * 1e3 << ") w=(" << w.X() << "," << w.Y()
+                                  << "," << w.Z() << ") stubDir=(" << stubDir.X() << ","
+                                  << stubDir.Y() << "," << stubDir.Z() << ") depth="
+                                  << depth * 1e3 << " uPos=" << uPos * 1e3 << " uNeg="
+                                  << uNeg * 1e3 << " vHalf=" << vHalf * 1e3
+                                  << " solidBB=[" << sx0 * 1e3 << "," << sy0 * 1e3 << ","
+                                  << sz0 * 1e3 << "]..[" << sx1 * 1e3 << "," << sy1 * 1e3
+                                  << "," << sz1 * 1e3 << "]" << std::endl;
+                    }
                     int ns = 0;
                     for (TopExp_Explorer e(trimmed, TopAbs_SOLID); e.More(); e.Next()) ++ns;
                     if (ns != 1)
@@ -1057,6 +1074,37 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     }
     int nCut = 0, nRepaired = 0, nInvalid = 0;
     std::vector<TopoDS_Shape> built;
+    // MITRED-JOINT ABUTMENT CHECK (ABT #685, Alf 2026-08-20: "there is no real bisection, just
+    // overlapping solids ... learn how to detect those and add that to the checkings"). A
+    // mitred corner slices BOTH sides on one shared bisector plane, so the two solids must
+    // ABUT: their boolean COMMON is empty. Any residual volume is copper counted twice -- not
+    // a valid FEM assembly and not a real winding. Checked for every CORNER joint as it is
+    // built; bridged (near-tangent) joints are exempt, their wedge fill overlaps by design.
+    // The floor is a (10 um)^3 cube in the mm frame: orders of magnitude above the boolean's
+    // face-coincidence noise and orders below any real un-bisected corner.
+    TopoDS_Shape prevBuilt;
+    std::vector<std::string> overlappingJoints;
+    auto checkMitredAbutment = [&](const TopoDS_Shape& a, const TopoDS_Shape& b,
+                                   const std::string& joint) {
+        if (a.IsNull() || b.IsNull()) return;
+        try {
+            gp_Trsf up;
+            up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+            BRepAlgoAPI_Common common(
+                BRepBuilderAPI_Transform(a, up, Standard_True).Shape(),
+                BRepBuilderAPI_Transform(b, up, Standard_True).Shape());
+            if (!common.IsDone() || common.Shape().IsNull()) return;   // no verdict, no claim
+            GProp_GProps gcp;
+            BRepGProp::VolumeProperties(common.Shape(), gcp);
+            if (gcp.Mass() > 1e-6) {
+                overlappingJoints.push_back(joint + " overlaps by " +
+                                            std::to_string(gcp.Mass()) + " mm^3");
+            }
+        } catch (const Standard_Failure&) {
+            // The boolean itself failing is a different defect; the invalid-cut paths
+            // already throw where the trim happens.
+        }
+    };
     for (size_t i = 0; i < n; ++i) {
         // Bend at each end: a tangent joint (wrap SEG<->ARC) needs no growth and no boolean; only a
         // real corner (the entrance/exit leads) is grown and sliced on its angle-bisector plane.
@@ -1393,6 +1441,11 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // exporter's per-solid naming, above all) is off by one from that point on, which is how
         // 'turn 15 -> turn 16' ended up naming the wrong piece of copper. One solid, one
         // component, one name.
+        if (bentS && i > 0) {
+            checkMitredAbutment(prevBuilt, solid,
+                                "'" + ptrs[i - 1]->label + "' -> '" + ptrs[i]->label + "'");
+        }
+        prevBuilt = solid;
         for (TopExp_Explorer solidExplorer(solid, TopAbs_SOLID); solidExplorer.More();
              solidExplorer.Next()) {
             builder.Add(compound, solidExplorer.Current());
@@ -1415,6 +1468,14 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                       << " ratio=" << (nominal > 0 ? gpr.Mass() / nominal : 0.0)
                       << " y=[" << y0 << "," << y1 << "]\n";
         }
+    }
+    if (!overlappingJoints.empty()) {
+        std::string msg =
+            "ConductorBuilder: " + std::to_string(overlappingJoints.size()) +
+            " mitred corner(s) did not abut -- the two sides overlap instead of sharing the "
+            "bisector face:";
+        for (const auto& j : overlappingJoints) msg += "\n  " + j;
+        throw std::runtime_error(msg);
     }
     // Per-solid analysis (union-find connectivity, volumes, interpenetration) is O(n^2) EXACT
     // BRepExtrema/classification -- ~15k queries on a 170-prim toroid, tens of minutes. Keep it
