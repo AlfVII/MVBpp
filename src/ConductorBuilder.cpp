@@ -6798,7 +6798,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // within clearance of the lead's row, the azimuth is forbidden -- this is what put
         // 06_llc's P2 entrance 0.402 mm under P0's outer rows at the plane, and squeezed
         // 23's secondary entrances between their siblings' rising first wraps.
-        struct AzInterval { double lo, hi; };
+        // ABT #839: intervals carry WHICH ROW made them. A forbidden band is an assertion
+        // about specific copper, and without naming it the diagnostic can only say a block was
+        // pushed out, never by what -- which is how a wrong story about 14_dab's Primary exit
+        // ("sibling landing wraps") survived a whole session unchallenged.
+        struct AzInterval {
+            double lo, hi;
+            size_t rowCi = 0;
+            size_t rowStation = 0;
+            double rowR = 0, rowY = 0, rowAdv = 0;
+        };
         // Validity bound of the fan's linearized models: half-way to the XY-plane crossings,
         // where the ride-over halves change regime. The fan-vs-core-opening guard and the
         // bump-boundary guard both throw far earlier for any real design.
@@ -6862,6 +6871,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     // the reach edge fabricated a "feasible" boundary slot there while the
                     // real forbidden band continued past it.
                     if (iv.lo <= -kFanReach && iv.hi >= kFanReach) continue;
+                    iv.rowCi = R.ci; iv.rowStation = R.station;
+                    iv.rowR = R.r; iv.rowY = R.y; iv.rowAdv = R.adv;
                     forbid[k].push_back(iv);
                 }
             }
@@ -7112,6 +7123,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 return true;
             };
             bool ownRowsBinding = false;   // some anchor failed ONLY the own-rows check
+            // ABT #839 (Alf, 14_dab: "redo the change for having terminals at x=0"). EXPERIMENT,
+            // default OFF: place every lead block on the plane whenever the HARD constraints
+            // allow it, ignoring the soft drift windows entirely. What it shows on 14_dab is in
+            // the ticket -- the four Primary parallels share ONE MKF exit row (y = -20.5675), so
+            // the higher-attaching leads must descend up to 2.71 mm AT THE LAYER RADIUS, straight
+            // through where their own siblings' final turns lie. The azimuth spread is what buys
+            // that descent a corridor; on the plane there is none to buy.
+            const bool forcePlane = std::getenv("MVB_FAN_TERMINALS_ON_PLANE") != nullptr;
             bool have = false;
             double best = 0.0;
             // SIDES RULE (Alf, 2026-08-15): "the connections for the terminal happen in the +X
@@ -7177,7 +7196,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     if (std::abs(iv.hi) <= kFanReach) cand.push_back(anchorFor(g, iv.hi));
                 }
             }
-            for (int tier = 0; tier < 2 && !have; ++tier) {
+            for (int tier = forcePlane ? 1 : 0; tier < 2 && !have; ++tier) {
                 for (double c : cand) consider(c, tier == 0);
                 // ABT #839: the own-rows boundary is not among the exact candidates (the dip
                 // couples the route to the slot), so when THAT check alone rejected an anchor
@@ -7246,9 +7265,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         if (cg > iv.lo + 1e-12 && cg < iv.hi - 1e-12)
                             std::fprintf(stderr,
                                          "   member ci=%zu: SOFT drift window [%.4f,%.4f] deg "
-                                         "covers the plane\n",
+                                         "covers the plane -- from %s row ci=%zu station=%zu "
+                                         "r=%.4f y=%.4f adv=%.4f mm/rev\n",
                                          (size_t)verts[group[g]].ci, iv.lo * 180 / kPi,
-                                         iv.hi * 180 / kPi);
+                                         iv.hi * 180 / kPi,
+                                         conductors[iv.rowCi].winding.c_str(),
+                                         (size_t)iv.rowCi, iv.rowStation, iv.rowR * 1e3,
+                                         iv.rowY * 1e3, iv.rowAdv * 1e3);
                     std::string ownWhy;
                     if (!leadOwnRowsSoft(verts[group[g]], cg, &ownWhy))
                         std::fprintf(stderr, "   member ci=%zu: SOFT own-rows: %s\n",
