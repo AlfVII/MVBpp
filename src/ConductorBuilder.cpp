@@ -4951,7 +4951,7 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         const double dy = s1.y - s0.y;
         if (std::getenv("MVB_RECT_DIAG")) {
             std::fprintf(stderr,
-                "[rect-wrap] '%s' y=[%.9f,%.9f] dy=%.9f L=%.9f slope=%.9f "
+                "[rect-wrap] '%s' y=[%.12f,%.12f] dy=%.12f L=%.9f slope=%.12f "
                 "(segX=%.6f segZ=%.6f q=%.6f rides=%.6f/%.6f endCut=%.6f begX=%.6f)\n",
                 label.c_str(), s0.y, s1.y, dy, L, dy / L, s0.segX, s0.segZ, q, ride0,
                 rideBack0, endCut, begX);
