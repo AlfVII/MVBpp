@@ -4111,7 +4111,9 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
                      int64_t parallels = 1, bool stubAtStart = false, bool stubAtEnd = false,
                      double endYOverride = std::numeric_limits<double>::quiet_NaN(),
                      bool steepFinal = false, bool translateSiblingAtStart = false,
-                     bool translateSiblingAtEnd = false) {
+                     bool translateSiblingAtEnd = false,
+                     double stubSweepCapStart = std::numeric_limits<double>::infinity(),
+                     double stubSweepCapEnd = std::numeric_limits<double>::infinity()) {
     // U (SERPENTINE) LAYER LINK -- Alf, 2026-08-07, 14_dab; descent form Alf, 2026-08-08 (ABT
     // #608 final form). Layers wound in U (this one bottom to top, the next top to bottom)
     // connect DIFFERENTLY from a dragback, and differently from a cone: the wire leaves the
@@ -4244,8 +4246,28 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
     const double stubAz = 2.0 * std::asin(std::min(1.0, wireRadius / std::max(s.x, 1e-9)));
     const double sweepSpan = (azE + kTwoPi) - azS;
     const bool roomForStubs = sweepSpan > 4.0 * stubAz;
-    const double azFrom = (stubAtStart && roomForStubs) ? azS + stubAz : azS;
-    const double azTo = (stubAtEnd && roomForStubs) ? azE + kTwoPi - stubAz : azE + kTwoPi;
+    // ABT #839, MECHANISM C -- THE STUB MUST NOT CROSS A ROTATED SIBLING'S LANE. Sibling
+    // terminal complexes on their own fan slots are screw-related, and for helix-like copper
+    // the construction is at EXACT TOUCH by itself: the pitch-true stretch and the helical
+    // pitch conspire to (s_y + m*dPhi)*cos(alpha) = od, exactly. The nm deficits the gate
+    // reported (0.3..5.2 nm, 14_dab) come ONLY from ARC copper deviating from the helix
+    // inside the neighbour's lane -- and azimuth cannot buy them back: rotating a sibling's
+    // complex slides its helix-like copper along itself (screw invariance), measured at a
+    // 0.3% distance response per unit of lane widening (the refuted lane charge, see ABT
+    // #839). So the arc is kept OUT of the neighbour's lane instead: the fan hands each side
+    // a sweep cap of half its lane gap, the wrap keeps helix copper over the rest, and what
+    // crosses the lane is the exact-touch helix. The cap keeps a leg the assembler's corner
+    // machinery accepts (1.1 wire radii of arc); translate siblings cap nothing (their
+    // osculating stub is exact at any sweep).
+    const double minStubAz = 1.1 * wireRadius / std::max(s.x, 1e-9);
+    auto cappedStub = [&](double cap) {
+        if (!std::isfinite(cap)) return stubAz;
+        return std::min(stubAz, std::max(minStubAz, cap));
+    };
+    const double stubAzStart = cappedStub(stubSweepCapStart);
+    const double stubAzEnd = cappedStub(stubSweepCapEnd);
+    const double azFrom = (stubAtStart && roomForStubs) ? azS + stubAzStart : azS;
+    const double azTo = (stubAtEnd && roomForStubs) ? azE + kTwoPi - stubAzEnd : azE + kTwoPi;
     auto heightAtAz = [&](double az) {
         return s.y + (yEnd - s.y) * ((az - azS) / sweepSpan);
     };
@@ -6122,6 +6144,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     std::map<std::pair<size_t, size_t>, double> dragAzOf;   // (conductor, transition) -> azimuth
     std::map<std::pair<size_t, size_t>, double> linkAzOf;   // ABT #831: the same, for U links
     std::map<size_t, double> leadAzIn, leadAzOut;           // conductor -> lead azimuth
+    // ABT #839 mechanism C: per (conductor, side), the stub sweep cap -- half the azimuth gap
+    // to the nearest ROTATED same-winding sibling lane on the stub's own sweep side. Filled at
+    // the fan tail, consumed by the emission (see appendRoundWrap's cappedStub).
+    std::map<size_t, double> stubCapIn, stubCapOut;
     double fanWidth = 0.0;
     // ABT #685 COMMON SEAM (Alf, 2026-08-16): the lead-aim (core-opening probe) must be computed
     // ONCE for the whole window and shared by every conductor. The fan reserves azimuth slots
@@ -7506,6 +7532,33 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 std::fprintf(stderr, "[dip] pass=%d violated=%d\n", dipPass, int(dipViolated));
             if (!dipViolated) break;
             if (dipPass == 0) runPack();
+        }
+        // ABT #839 mechanism C: stub sweep caps. An ENTRANCE stub sweeps forward from its
+        // slot (increasing az); an EXIT stub sweeps backward from its slot (the arc occupies
+        // [azE - sweep, azE]) -- measured: 14_dab's exit stubs reached the sibling one lane
+        // OUTWARD (P2's stub at x=1.455 from its own lane 0.855, into P1's 1.710). The cap is
+        // half the gap to the nearest ROTATED sibling on that side; translate siblings (equal
+        // slots) are excluded -- their osculating stub is exact at any sweep.
+        for (size_t k = 0; k < verts.size(); ++k) {
+            if (verts[k].kind != 0) continue;
+            double gap = std::numeric_limits<double>::infinity();
+            for (size_t j = 0; j < verts.size(); ++j) {
+                if (j == k || verts[j].kind != 0) continue;
+                if (verts[j].wname != verts[k].wname) continue;
+                if (verts[j].entrance != verts[k].entrance) continue;
+                const double d = az[j] - az[k];
+                if (std::abs(d) < 1e-12) continue;   // translate sibling: exact, no cap
+                // entrance sweeps toward +az; exit occupies az below its slot, so a sibling
+                // at -d is in the exit sweep's path.
+                if (verts[k].entrance ? d > 0.0 : d < 0.0) {
+                    gap = std::min(gap, std::abs(d));
+                }
+            }
+            auto& capMap = verts[k].entrance ? stubCapIn : stubCapOut;
+            for (size_t m : verts[k].cis) {
+                capMap[m] = std::isfinite(gap) ? gap / 2.0
+                                               : std::numeric_limits<double>::infinity();
+            }
         }
         double lo = 0.0, hi = 0.0;
         for (double a : az) { lo = std::min(lo, a); hi = std::max(hi, a); }
@@ -9176,6 +9229,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // cross-winding row pair at the crossing (rows at exactly 0.32325 mm = the envelope).
             // The elbow confines the climb to two absorb-tolerances of the attach whatever else
             // the route carries.
+            // A UNIVERSAL elbow (every mode, round columns too) was measured 2026-08-21 and
+            // REVERTED: in default (fan) mode the diagonal is LOAD-BEARING -- the fan placed
+            // the surrounding copper around it, and holding the row walked 06_llc to 14.9 um
+            // and 14_dab to 3.6 um. The elbow belongs exactly where no azimuth funds a slope:
+            // rect columns, and the hard plane anchor.
             if ((rectFamily || planeAnchored) && !rectWire && kept.size() >= 2) {
                 const size_t attIdx = stationAtFront ? 0 : kept.size() - 1;
                 const size_t nbIdx = stationAtFront ? 1 : kept.size() - 2;
@@ -9819,7 +9877,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                 /*stubAtStart=*/i == 0, /*stubAtEnd=*/i + 2 == nEmit, endY,
                                 /*steepFinal=*/i + 2 == nEmit &&
                                     std::abs(nxt.x - s.x) > wireRadius,
-                                translateSiblingIn, translateSiblingOut);
+                                translateSiblingIn, translateSiblingOut,
+                                stubCapIn.count(ci) ? stubCapIn.at(ci)
+                                                    : std::numeric_limits<double>::infinity(),
+                                stubCapOut.count(ci) ? stubCapOut.at(ci)
+                                                     : std::numeric_limits<double>::infinity());
             } else if (rectFamily) {
                 {
                     const RectStation rs0 = rectStation(s, rectHalfW, rectHalfD, minBend, path.name);
