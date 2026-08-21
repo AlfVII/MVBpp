@@ -6773,8 +6773,23 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // default: this reorders the whole corpus's packing, and the current order is tuned
         // (11_pushpull's stub rule, below).
         const bool steepestFirst = std::getenv("MVB_FAN_STEEPEST_FIRST") != nullptr;
-        std::stable_sort(verts.begin(), verts.end(), [steepestFirst](const Vert& a, const Vert& b) {
-            if (a.kind != b.kind) return a.kind > b.kind;
+        // ABT #839 (hard anchor): with the terminals PINNED at the plane, the dodging has to be
+        // done by whoever can still move -- the dragbacks. Normally dragbacks place first and
+        // leads pack around them; pinned leads packing last collide with a dragback that took
+        // c=0 never knowing the plane was spoken for (13_current_sense: the secondary's own
+        // return descended exactly through its entrance climb, 13.1 um). Placing the pinned
+        // leads FIRST makes the existing need()/clears() machinery move the dragbacks instead:
+        // rank 2 (pinned links), then 0 (pinned leads), then 1 (dragbacks dodge both).
+        const bool planePinnedLeads = std::getenv("MVB_FAN_TERMINALS_ON_PLANE") != nullptr;
+        std::stable_sort(verts.begin(), verts.end(),
+                         [steepestFirst, planePinnedLeads](const Vert& a, const Vert& b) {
+            if (a.kind != b.kind) {
+                if (planePinnedLeads) {
+                    auto rank = [](int k) { return k == 2 ? 0 : (k == 0 ? 1 : 2); };
+                    return rank(a.kind) < rank(b.kind);
+                }
+                return a.kind > b.kind;
+            }
             if (a.kind == 0 && steepestFirst) {
                 const double sa = std::abs(a.attachAdvance), sb = std::abs(b.attachAdvance);
                 if (std::abs(sa - sb) > 1e-9) return sa > sb;
@@ -7145,6 +7160,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // the higher-attaching leads must descend up to 2.71 mm AT THE LAYER RADIUS, straight
             // through where their own siblings' final turns lie. The azimuth spread is what buys
             // that descent a corridor; on the plane there is none to buy.
+            // ABT #839 (Alf: "put a hard constraint on all terminals anchoring at 0 deg, and
+            // find out why the wires are colliding when they shouldn't"): the switch is now a
+            // TRUE hard anchor. Every lead block takes c = 0 -- member 0's centreline exactly on
+            // the plane, siblings at their xoff lanes -- with no search, no soft tier, and no
+            // dodge. Every disagreement between the plan and the drawn copper then lands at the
+            // certified gate as a named pair instead of being absorbed by an azimuth the rule
+            // says the terminals should not need. Diagnostic campaign switch, default OFF.
             const bool forcePlane = std::getenv("MVB_FAN_TERMINALS_ON_PLANE") != nullptr;
             bool have = false;
             double best = 0.0;
@@ -7211,7 +7233,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     if (std::abs(iv.hi) <= kFanReach) cand.push_back(anchorFor(g, iv.hi));
                 }
             }
-            for (int tier = forcePlane ? 1 : 0; tier < 2 && !have; ++tier) {
+            if (forcePlane) {
+                best = cMax;   // = 0: the anchor IS the plane, unconditionally
+                have = true;
+            }
+            for (int tier = 0; tier < 2 && !have; ++tier) {
                 for (double c : cand) consider(c, tier == 0);
                 // ABT #839: the own-rows boundary is not among the exact candidates (the dip
                 // couples the route to the slot), so when THAT check alone rejected an anchor
@@ -9136,15 +9162,30 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // (see the reverted experiment above). Here the climb is confined instead: an elbow
             // waypoint two absorb-tolerances out from the attach keeps the run on its row and
             // gives the climb a spine leg long enough for the assembler's corner machinery.
-            if (rectFamily && !rectWire && kept.size() == 2) {
-                const size_t attIdx = stationAtFront ? 0 : 1;
-                const PlanePt& att = kept[attIdx];
-                const PlanePt& farEnd = kept[1 - attIdx];
-                const double dir = farEnd.x > att.x ? 1.0 : -1.0;
-                if (std::abs(att.y - farEnd.y) > 1e-12 &&
-                    std::abs(farEnd.x - att.x) > 3.0 * absorbTol) {
-                    kept.insert(kept.begin() + (stationAtFront ? 1 : 1),
-                                PlanePt{att.x + dir * 2.0 * absorbTol, farEnd.y});
+            // ABT #839 (Alf: hard anchor at 0 deg): with every terminal pinned to the plane
+            // there is no azimuth left to fund a sloped run on ROUND columns either -- the
+            // 7.2 um found at anchor-0 on 14_dab is exactly this diagonal (the Secondary
+            // entrance rising 23.6 um across the exit layer's radius). So under the hard
+            // anchor the row-hold applies to every column shape; the default (fan) mode keeps
+            // the diagonal on round columns, where the fan models and funds it.
+            const bool planeAnchored = std::getenv("MVB_FAN_TERMINALS_ON_PLANE") != nullptr;
+            // ...applied to the ATTACH-ADJACENT SEGMENT, not only to two-point routes: a
+            // border-tip waypoint (extendBorder) makes the route three points, and the ==2 gate
+            // then let the absorbed diagonal through -- 13_current_sense's Primary entrance rose
+            // its whole 0.8 um stub over a ~1 mm leg and spent 0.336 um of a ZERO-margin
+            // cross-winding row pair at the crossing (rows at exactly 0.32325 mm = the envelope).
+            // The elbow confines the climb to two absorb-tolerances of the attach whatever else
+            // the route carries.
+            if ((rectFamily || planeAnchored) && !rectWire && kept.size() >= 2) {
+                const size_t attIdx = stationAtFront ? 0 : kept.size() - 1;
+                const size_t nbIdx = stationAtFront ? 1 : kept.size() - 2;
+                const PlanePt att = kept[attIdx];
+                const PlanePt nb = kept[nbIdx];
+                const double dir = nb.x > att.x ? 1.0 : -1.0;
+                if (std::abs(att.y - nb.y) > 1e-12 &&
+                    std::abs(nb.x - att.x) > 3.0 * absorbTol) {
+                    kept.insert(kept.begin() + (stationAtFront ? 1 : kept.size() - 1),
+                                PlanePt{att.x + dir * 2.0 * absorbTol, nb.y});
                 }
             }
 
