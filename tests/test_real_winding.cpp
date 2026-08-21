@@ -291,6 +291,46 @@ void requireNoPairwiseOverlap(const std::vector<mvb::NamedShape>& named, double 
 // value the union left invalid seams, BRepCheck rejected it, and the builder SILENTLY
 // returned a compound of disconnected per-turn solids — geometry that names and volumes
 // alone cannot distinguish from the real thing, and that gmsh cannot mesh at all.
+// ABT #615 / Alf (custom_magnetic 37, 2026-08-21): AN INTER-SECTION CONNECTION MUST HAVE A WAY
+// OUT OF ITS OWN SECTION.
+//
+// E 16/6/5, Primary 22t x 2p interleaved. Primary section 0 is the FULL window height (6.5 mm)
+// and its single layer is completely full: parallel 0 holds y = -3.094..-0.163 mm and parallel 1
+// holds +0.163..+3.094, 20 turns at a 0.326 mm pitch. Parallel 0's last turn therefore sits in
+// the MIDDLE of the stack, at the boundary with its sibling.
+//
+// MKF then routes that turn to the next section on an inter-section BAND at a window edge, choosing
+// the edge with `exitTurn.y >= windowCentre`. At -0.163 that reads "below centre" and sends the band
+// to the BOTTOM, so the wire must descend 1.58 mm back through its own turns 4..8 -- and by ABT
+// #615's own rule a continuation reserves nothing in its own section, so nothing is blocked out of
+// its way. The 3D gate refuses it as a hard bare-copper collision, correctly.
+//
+// There is no good edge: down crosses parallel 0's turns, up crosses parallel 1's. The section is
+// full, so both are copper. The defect is that the layout does not pay for the escape at all --
+// MKF reports the wind as fitting, then hands over a route that cannot be drawn. Fixing the edge
+// choice alone is NOT enough (measured: it moves the failure to parallel 1); either the band must
+// sit at the exit turn's own row, or a full section owing an inter-section exit must be one turn
+// over capacity and refused.
+//
+// This test pins the CONTRACT, not today's behaviour: a design MKF accepts must be buildable. It
+// fails today by design and is the regression pin for whichever fix lands.
+TEST_CASE("Real winding: an inter-section return escapes its own full section",
+          "[realwinding][connectivity][abt615][!shouldfail]") {
+    auto magneticJson = loadFixture("realwinding_interleaved_full_section_e16.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    // EXACTLY the CLI's path and config (mvbpp_step_generator --real), because that is where the
+    // defect shows: buildAllNamed with polygonSegments=0 builds this design without complaint,
+    // so a test written against it would have reported the bug fixed while the tool still refused.
+    mvb::DrawConfig cfg{"step", /*includeBobbin=*/true, /*scale=*/1.0, /*symmetryPlanes=*/0};
+    cfg.useRealWindingGeometry = true;
+    cfg.paintCoating = true;
+    // The gate is the assertion: it throws on any bare-copper overlap, so a clean build IS the
+    // contract. Nothing is relaxed here -- see ABT #839, the gate is never weakened to pass.
+    REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
+}
+
 TEST_CASE("Real winding: rect-column conductor fuses into ONE connected solid",
           "[realwinding][connectivity]") {
     auto magneticJson = loadFixture("realwinding_e138_rectcolumn.json");  // E 13/7/4, 6 turns, 0.4 mm round
