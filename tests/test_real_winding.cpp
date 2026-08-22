@@ -312,10 +312,18 @@ void requireNoPairwiseOverlap(const std::vector<mvb::NamedShape>& named, double 
 // sit at the exit turn's own row, or a full section owing an inter-section exit must be one turn
 // over capacity and refused.
 //
-// This test pins the CONTRACT, not today's behaviour: a design MKF accepts must be buildable. It
-// fails today by design and is the regression pin for whichever fix lands.
-TEST_CASE("Real winding: an inter-section return escapes its own full section",
-          "[realwinding][connectivity][abt615][!shouldfail]") {
+// This test pins the CONTRACT: a design MKF accepts must be buildable. It was written failing
+// ([!shouldfail]) and flipped on 2026-08-22 when the design first built CERTIFIED CLEAR (0 nm,
+// every pair proven). What it took, in order (ABT #849): MKF's N-filar law (placement f5cb139f +
+// distribution 1f897b5c) so every layer holds all parallels side by side and the exit turn is at
+// the layer's end, not mid-stack; whole-winding parallel-order continuity (c318b004, kept through
+// the L-shape revert 90c253bf); and on the MVB++ side the band chain riding one OD off the
+// destination face (b16b2ff), the chain ending where the next wrap begins (no 180-degree fold at
+// the crossing), and EXIT LANES -- parallels leave side by side on the +X face, the last wrap
+// ending at its lane, the stub one OD off the face (Alf: 'as parallels they should be going out
+// side by side'). Any regression in that chain shows here as the gate's own refusal.
+TEST_CASE("Real winding: an interleaved N-filar design builds CERTIFIED CLEAR (cm37)",
+          "[realwinding][connectivity][abt615][abt849]") {
     auto magneticJson = loadFixture("realwinding_interleaved_full_section_e16.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
 

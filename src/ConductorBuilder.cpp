@@ -4856,7 +4856,11 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                     // (one endCut share short of s1.y when a descent slot cuts the path), and a
                     // return chain starts at the height the preceding rising wrap delivered.
                     double* riseEndYOut = nullptr,
-                    double chainStartY = std::numeric_limits<double>::quiet_NaN()) {
+                    double chainStartY = std::numeric_limits<double>::quiet_NaN(),
+                    // ABT #849: where the chain's tail ENDS -- the destination wrap's own
+                    // pitch-true start height when that wrap begins at the slot (it starts
+                    // begX-share above its station, see yAt), s1.y otherwise. NaN = s1.y.
+                    double chainEndY = std::numeric_limits<double>::quiet_NaN()) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -5031,6 +5035,11 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         const double yChain = std::isnan(chainStartY) ? y : chainStartY;
         const double zDesc = s1.zPos + chainRide;   // the descent's face depth
         const double zDest = s1.zPos + destRide;    // the destination crossing's depth
+        // Pitch-true chain END (ABT #849): the destination wrap that begins at the slot starts
+        // begX-share above its station; the chain lands exactly there (caller computes it with
+        // the same full-path slope the wrap uses). Otherwise the wrap starts at the crossing,
+        // at its station height.
+        const double yEnd = std::isnan(chainEndY) ? s1.y : chainEndY;
         // The chain STARTS at the slot: the preceding rising turn already ends there
         // (stopAtX) and corners into the step-out -- the old run from the face crossing
         // to the slot doubled back over the just-arrived straight (Alf, 17_cllc:
@@ -5058,16 +5067,31 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             pts.insert(pts.end(), {gp_Pnt(xSlot, yChain, -(zN0 - slotSag)),
                                     gp_Pnt(xSlot, bandY, -(zN0 - slotSag)),
                                     gp_Pnt(xSlot, bandY, -zDesc),
-                                    gp_Pnt(xSlot, s1.y, -zDesc),
-                                    gp_Pnt(xSlot, s1.y, -zDest),
-                                    gp_Pnt(0, s1.y, -zDest)});
+                                    gp_Pnt(xSlot, yEnd, -zDesc),
+                                    gp_Pnt(xSlot, yEnd, -zDest)});
         }
         else {
             pts.insert(pts.end(), {gp_Pnt(xSlot, yChain, -(zN0 - slotSag)),
                                     gp_Pnt(xSlot, yChain, -zDesc),
-                                    gp_Pnt(xSlot, s1.y, -zDesc),
-                                    gp_Pnt(xSlot, s1.y, -zDest),
-                                    gp_Pnt(0, s1.y, -zDest)});
+                                    gp_Pnt(xSlot, yEnd, -zDesc),
+                                    gp_Pnt(xSlot, yEnd, -zDest)});
+        }
+        // THE CHAIN ENDS WHERE THE NEXT WRAP BEGINS (ABT #849, Alf on cm37: 'the joint between
+        // Secondary parallel 0 / turn 18 -> turn 19 face -Z out and turn 17_ending -> turn 18
+        // (dragback) seg 2 is not done properly'). Every wrap departs the crossing toward
+        // local -X (its 'face -Z out' runs -begX -> -segX). A slot on the +X side is BEHIND
+        // that departure: the run slot -> 0 and the wrap's 0 -> -segX are collinear, one
+        // wire. A slot on the -X side is ON it: running back to the crossing and then
+        // departing over the same stretch is a 180-degree FOLD at x = 0 -- exactly the
+        // 'U-fold pieces must not exist' the chain START already forbids (17_cllc). So for a
+        // -X slot the chain ends AT the slot and the destination wrap begins there
+        // (startAtX = -xSlot, the entrance-lead mechanism), its first straight the remainder
+        // segX - |xSlot|; for a +X slot nothing changes. Measured before the fix: S p0 seg 3
+        // (+0.367 -> 0, world frame of the mirrored face) folded straight back into 'face -Z
+        // out' (0 -> +2.875, same y, same z).
+        // MVB_NO_CHAIN_END_SLOT bisects this rule (house pattern, like MVB_NO_OSCULATING_STUB).
+        if (!(xSlot < -1e-12) || std::getenv("MVB_NO_CHAIN_END_SLOT")) {
+            pts.push_back(gp_Pnt(0, yEnd, -zDest));
         }
         appendFilletedPolyline(path.prims, pts, wireRadius, label + " (dragback)", ordinal,
                                /*isLead=*/false, /*isConnection=*/true,
@@ -5960,6 +5984,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // and exit routes): parallels interleave one wire apart, which puts each lead exactly midway
     // between the sibling's turns -- one envelope from each, the flyback's own packing.
     std::map<size_t, double> leadSlotOf;
+    std::map<size_t, double> exitSlotOf;   // ABT #849: exit lane per conductor (+X side)
     if (rectFamily) {
         std::map<size_t, double> slotOf;   // conductor -> x slot
         double maxDiam = 0.0;
@@ -6087,6 +6112,35 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const int face = windingFace.at(conductors[cv].winding);
                 const int k = kOfFace[face]++ + (crossingTaken[face] ? 1 : 0);
                 leadSlotOf[cv] = double(k) * odOfFace.at(face);
+            }
+            // EXIT LANES (ABT #849, Alf 2026-08-22: 'as parallels they should be going out
+            // side by side'). The exit of every conductor on a face used to leave at the
+            // crossing, x = 0 -- fine while each parallel's last turn sat on its own row,
+            // but MKF lays a multi-parallel winding's exit leads on ONE shared group row, so
+            // two exits ran radially coincident and the upper one's stub descended straight
+            // through its sibling's last face straight (cm37: Primary p1 exit vs p0 turn 21
+            // 'face -Z in', centreline distance 1e-18). Exits get their own lanes exactly as
+            // entrances do, on the OPPOSITE end of the face (+X, the arrival side: the last
+            // straight arrives +segX -> 0, so ending it at +slot shortens it, never runs past
+            // the crossing and back). Same ordering rule as the entrance: highest row ->
+            // smallest x, so the arriving sibling straights (which CLIMB as they run) move away
+            // from the lead above them. A conductor alone on its face keeps lane 0.
+            std::map<int, int> kExitOfFace;
+            std::vector<std::pair<double, size_t>> byLastRow;   // (last row, conductor)
+            for (size_t cv = 0; cv < conductors.size(); ++cv) {
+                const auto& ct = conductors[cv];
+                if (ct.turns.empty()) continue;
+                byLastRow.push_back({station(ct.turns.back()).y, cv});
+            }
+            std::sort(byLastRow.begin(), byLastRow.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            // MVB_NO_EXIT_LANES bisects the whole exit-lane mechanism: with no lanes allocated,
+            // stopX falls back to NaN and the lead's xShift to 0, i.e. exactly the old behaviour.
+            const bool noExitLanes = std::getenv("MVB_NO_EXIT_LANES") != nullptr;
+            for (const auto& [row, cv] : byLastRow) {
+                const int face = windingFace.at(conductors[cv].winding);
+                const int k = kExitOfFace[face]++;
+                exitSlotOf[cv] = noExitLanes ? 0.0 : double(k) * odOfFace.at(face);
             }
         }
         // Distinct destination depths, ascending, PER SIDE. Each level displaces everything
@@ -9981,11 +10035,37 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     // endX, which changes the arc length the last turn distributes its pitch
                     // over: the two parallels' final turns then climbed at different rates and
                     // converged to 1.0777 mm against a 1.1154 mm envelope.
+                    // ABT #849: the LAST wrap ends at the conductor's exit lane (see exitSlotOf)
+                    // -- the pitch-true profile distributes dy over the FULL path (begX + endCut
+                    // included), so the shortened last straight no longer steepens the helix,
+                    // which was the reason exits were left unslotted (isolated_buck, before
+                    // ABT #685/#831 made the profile full-path).
+                    // A last wrap with NO lane and round wire keeps stopX = NaN exactly as before
+                    // (a non-NaN 0.0 is a descent slot AT the crossing, which re-shapes the wrap's
+                    // end and collided the U layer link on realwinding_round_2p, measured).
+                    const bool hasExitSlot = exitSlotOf.count(ci) && exitSlotOf.at(ci) > 1e-12;
+                    const double exitSlot = hasExitSlot ? exitSlotOf.at(ci) : 0.0;
                     const double stopX = nextRet ? nextRet->xSlot
-                                       : (rw && i + 2 == nEmit && !ret ? rs1.cornerR : kNaN);
+                                       : (i + 2 == nEmit && !ret && (rw || hasExitSlot)
+                                              ? (rw ? rs1.cornerR : 0.0) + exitSlot
+                                              : kNaN);
+                    // ABT #849: a wrap fed by a RETURN whose slot sits on the departure side
+                    // (local -X) begins AT that slot -- the chain ends there (see appendRectWrap's
+                    // chain tail); beginning at the crossing would retrace the chain's own last
+                    // run as a 180-degree fold.
+                    // RECT FAMILY ONLY: rectReturns is populated for rect/stadium columns; on a
+                    // round column the fan's azimuth owns the join and a startAtX here re-shaped
+                    // the rising wrap after a U layer link (realwinding_round_2p: 5 mitred corners
+                    // overlapping instead of abutting, measured 2026-08-22).
+                    const RectReturn* prevRetForStart = nullptr;
+                    if (rectFamily && !std::getenv("MVB_NO_CHAIN_END_SLOT"))
+                        for (const auto& r : rectReturns)
+                            if (r.ci == ci && i > 0 && r.trans == i - 1) prevRetForStart = &r;
                     const double startX = (i == 0 && !ret)
                                               ? (rw ? rs0.cornerR : 0.0) + leadSlot
-                                              : kNaN;
+                                              : (prevRetForStart && !ret && prevRetForStart->xSlot < -1e-12
+                                                     ? -prevRetForStart->xSlot
+                                                     : kNaN);
                     double ringEndY = std::numeric_limits<double>::quiet_NaN();
                     if (ret) {
                         // SINGLE-TURN LAYER (Alf, 26_psps: "layers 12 13 14 not drawn"): a
@@ -10018,12 +10098,37 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                             chainStartY = reIt->second;
                         }
                     }
+                    // ABT #849: a return whose slot sits on the departure side (local -X) hands
+                    // the wire to a destination wrap that BEGINS at the slot, begX-share above
+                    // its station on the full-path helix (the same slope appendRectWrap's yAt
+                    // uses: dy over straights + corners + rides + begX + endCut). The chain's
+                    // tail must end exactly there -- measured 4.5-6.4 um steps on cm37's
+                    // Secondary when it ended at the bare station.
+                    double chainEndY = std::numeric_limits<double>::quiet_NaN();
+                    if (ret && xSlot < -1e-12 && i + 2 < nEmit) {
+                        const RectStation rsN = rectStation(station(turns[i + 2]), rectHalfW,
+                                                            rectHalfD, minBend, path.name);
+                        const double begXN = -xSlot;
+                        // The destination wrap's own descent slot (if ITS next transition is a
+                        // return) shortens its path exactly as stopX does for every wrap.
+                        double stopXN = kNaN;
+                        for (const auto& r : rectReturns)
+                            if (r.ci == ci && r.trans == i + 2) stopXN = r.xSlot;
+                        const bool rwN = path.isRectangular;
+                        if (std::isnan(stopXN) && rwN && i + 3 == nEmit) stopXN = rsN.cornerR;
+                        const double endCutN = rectRisingEndCut(rs1, stopXN);
+                        const double LN = rectRisingLength(rs1, rectRideFor(rs1.zPos, side),
+                                                           rectRideFor(rs1.zPos, 1 - side),
+                                                           endCutN, begXN);
+                        const double dyN = rsN.y - rs1.y;
+                        chainEndY = rs1.y + dyN * begXN / (LN + begXN + endCutN);
+                    }
                     double riseEndY = std::numeric_limits<double>::quiet_NaN();
                     appendRectWrap(path, rs0, rs1, label, i, wireRadius,
                                    rectRideFor(rs0.zPos, side),
                                    rectRideFor(rs0.zPos, 1 - side), ret != nullptr,
                                    chainRide, destRide, xSlot, stopX, startX, bandY,
-                                   ret ? nullptr : &riseEndY, chainStartY);
+                                   ret ? nullptr : &riseEndY, chainStartY, chainEndY);
                     if (!ret && !std::isnan(riseEndY)) {
                         rectRiseEndY[i] = riseEndY;
                     }
@@ -10103,6 +10208,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     bool retLast = false;
                     for (const auto& r : rectReturns)
                         if (r.ci == ci && r.trans + 2 == nEmit) retLast = true;
+                    // ABT #849: the lead attaches where the last wrap ACTUALLY ends -- its
+                    // pitch-true end, endCut-share short of the station when the wrap stops at
+                    // the exit lane (round wire too, not only the rect-wire corner branch below;
+                    // measured 4-6 um attach steps on cm37 once the exits were slotted).
+                    if (auto reIt = rectRiseEndY.find(nEmit - 2);
+                        nEmit > 1 && !retLast && reIt != rectRiseEndY.end() &&
+                        !std::getenv("MVB_NO_EXIT_ATTACH_PITCH")) {
+                        lLead.y = reIt->second;
+                    }
                     if (rectWire && nEmit > 1 && !retLast) {
                         double exitRowY = last.y;
                         if (auto reIt = rectRiseEndY.find(nEmit - 2);
@@ -10169,9 +10283,25 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // z = -15.4755 mm -- a 6.069 mm gap, exactly the three stacked wire diameters
                 // the secondaries' lanes had accumulated. The outer waypoints keep the full
                 // lift, so the ride-over protection is unchanged where it applies.
+                // ABT #849 (rect family): the exit descends OFF THE FACE. With a shared group
+                // row the lead's stub drops past the sibling's arriving last straight, which
+                // lies ON the face at the same depth; the lane separates the two along the
+                // face but the stub still crosses that straight. So when the route carries a
+                // vertical, the stub is moved one coated OD out from the attach (a radial
+                // step at the attach height, then the vertical) -- the wire rides over face
+                // copper by exactly the gate's envelope, the same rule the dragback chain
+                // uses for its descent. Two-point routes (attach on its own row) are untouched.
+                const double exitLane = rectFamily && exitSlotOf.count(ci) ? exitSlotOf.at(ci) : 0.0;
+                if (rectFamily && !rectWire && !std::getenv("MVB_NO_EXIT_OFFFACE") && wp.size() >= 2 &&
+                    std::abs(wp[0].y - wp[1].y) > 1e-12 && std::abs(wp[0].x - wp[1].x) < 1e-12) {
+                    const double od = 2.0 * wireRadius;
+                    wp.insert(wp.begin() + 1, PlanePt{wp[0].x + od, wp[0].y});
+                    wp[2].x += od;
+                }
                 pushPlaneSegs(wp, "exit lead", nEmit - 1, /*stationAtFront=*/true, exitRaise,
                               azExit,
-                              [&](double r) { return tallestBumpColumn(bumpsForTurn(r)).first; });
+                              [&](double r) { return tallestBumpColumn(bumpsForTurn(r)).first; },
+                              exitLane);
             }
         }
 
