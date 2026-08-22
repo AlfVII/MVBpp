@@ -5047,9 +5047,18 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             // adjacent to the band and the receiving section's first turn just under it, so
             // the stubs are stumps; the run crosses the intervening sections at the band row,
             // where MKF blocked their turns one OD below — clearance is the model's own.
+            //
+            // ABT #849 (2026-08-22): the DESCENT rides at zDesc — one level off the
+            // destination face — and steps out at the entry height, exactly as the classic
+            // adjacent-layer chain below does. Dropping at zDest itself ran the vertical
+            // straight through the SIBLING's own face run (its seg 3 at its entry height
+            // crosses every slot on its way to x=0; measured on cm37 with the whole-winding
+            // parallel order: p0's drop hit p1's run at distance 0). zDesc is the chain's
+            // own reservation, so the clearance is one OD by construction.
             pts.insert(pts.end(), {gp_Pnt(xSlot, yChain, -(zN0 - slotSag)),
                                     gp_Pnt(xSlot, bandY, -(zN0 - slotSag)),
-                                    gp_Pnt(xSlot, bandY, -zDest),
+                                    gp_Pnt(xSlot, bandY, -zDesc),
+                                    gp_Pnt(xSlot, s1.y, -zDesc),
                                     gp_Pnt(xSlot, s1.y, -zDest),
                                     gp_Pnt(0, s1.y, -zDest)});
         }
