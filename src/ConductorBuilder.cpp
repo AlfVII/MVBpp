@@ -4,6 +4,7 @@
 #include "mvb/Utils.h"
 #include <array>
 #include <functional>
+#include <deque>
 #include <set>
 #include "constructive_models/Coil.h"
 #include "constructive_models/Wire.h"
@@ -1693,6 +1694,12 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
     std::vector<gp_Dir> axisBefore(path.prims.size(), gp_Dir(0, 1, 0));
     std::vector<bool> hasAxisAfter(path.prims.size(), false), hasAxisBefore(path.prims.size(), false);
     std::vector<TopoDS_Shape> leadElbows;
+    // An inserted elbow is a PRIMITIVE like any other, and the rebuild strategies below re-emit
+    // every piece from its primitive -- so the elbows need storage to point at (ABT #373).
+    // A deque, not a vector: splitArgs stores raw `const Primitive*`, and a vector would dangle
+    // every pointer already handed out the moment it reallocated.
+    std::deque<Primitive> leadElbowPrims;
+    std::vector<gp_Dir> leadElbowAxis;   // the bend axis each elbow was emitted on
     for (size_t i = 0; i + 1 < path.prims.size(); ++i) {
         const Primitive& A = path.prims[i];
         const Primitive& B = path.prims[i + 1];
@@ -1721,10 +1728,19 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         gp_XYZ Bp = P.XYZ() + dB.XYZ() * trim;
         if (primEndpoints(elbow).second.Distance(gp_Pnt(Bp)) > 1e-6)
             elbow.arc.axis = bendAxis * -1.0;
+        // It sits BETWEEN two lead segments, so it is lead copper: the wrap-only fuse strategy
+        // sorts pieces by this flag and, having no primitive for the elbows, used to drop them
+        // from the emitted compound altogether (ABT #373). The label is what MVB_RECT_TRACE and
+        // the "rectPrimSolid failed" refusal print, so give it a real one.
+        elbow.isLead = true;
+        elbow.turnOrdinal = A.turnOrdinal;
+        elbow.label = A.label + " -> " + B.label + " elbow";
         TopoDS_Shape es = rectPrimSolid(elbow, path.wireWidth, path.wireHeight, gp_Dir(bendAxis),
                                         gp_Dir(bendAxis), 0.0, 0.0, round, radius);
         if (es.IsNull()) continue;
         leadElbows.push_back(es);
+        leadElbowPrims.push_back(elbow);
+        leadElbowAxis.push_back(gp_Dir(bendAxis));
         trimEnd[i] = trim;
         trimStart[i + 1] = trim;
         axisAfter[i] = gp_Dir(elbow.arc.axis);
@@ -1792,10 +1808,29 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         solids.push_back(s);
         for (TopExp_Explorer e(s, TopAbs_FACE); e.More(); e.Next()) ++compoundFaces;
     }
-    for (const auto& es : leadElbows) {
-        solids.push_back(es);
-        for (TopExp_Explorer e(es, TopAbs_FACE); e.More(); e.Next()) ++compoundFaces;
+    for (size_t e = 0; e < leadElbows.size(); ++e) {
+        solids.push_back(leadElbows[e]);
+        // ONE SplitArg PER SOLID, same order (ABT #373). Every rebuild strategy below looks a
+        // piece up by its index in `solids` and then reads splitArgs at that index; while the
+        // elbows were appended to `solids` alone the two ran out of step by exactly
+        // leadElbows.size(), and STRATEGY 2.5 read splitArgs[103] out of a 103-element vector.
+        // That is inside the vector's spare CAPACITY -- so it is not a wild pointer but a stale
+        // `const Primitive*` left by a previous conductor's freed splitArgs buffer, pointing at
+        // a destroyed prims vector. It dereferenced to plausible-looking garbage (the trace even
+        // printed a valid label and extrusion length) and then SIGSEGV'd inside
+        // BRepPrimAPI_MakePrism -- the hard crash of 'Real winding: toroidal RECTANGULAR wire
+        // threads the crossings'. Keeping the two arrays the same length is the invariant that
+        // makes every one of those lookups meaningful.
+        splitArgs.push_back({&leadElbowPrims[e], leadElbowAxis[e], leadElbowAxis[e], 0.0, 0.0});
+        for (TopExp_Explorer ex(leadElbows[e], TopAbs_FACE); ex.More(); ex.Next()) ++compoundFaces;
     }
+    if (splitArgs.size() != solids.size())
+        throw std::logic_error(
+            "ConductorBuilder: emitRectColumn built " + std::to_string(solids.size()) +
+            " solids but " + std::to_string(splitArgs.size()) +
+            " rebuild descriptors for '" + path.name +
+            "'. The rebuild strategies index both with the same index; refusing to run them "
+            "against a mismatched pair (ABT #373).");
     if (solids.empty()) {
         throw std::runtime_error(
             "ConductorBuilder: rectangular-wire rect/oblong column produced no solids for '" +
@@ -2311,7 +2346,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
             double accMass = lvol2(acc);
             int accCount = 1;
             size_t accStart = 0;
-            std::vector<size_t> singleIdx;   // splitArgs index of single-prim groups
+            std::vector<size_t> singleIdx;   // index in `solids` (== in splitArgs) of single-prim groups
             auto flush = [&](size_t nextStart) {
                 if (accCount == 1) singleIdx.push_back(accStart);
                 groups.push_back({acc, accCount});
@@ -2343,13 +2378,6 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
             if (groups.size() > 1 && groups.size() * 6 < solids.size()) {
                 // rebuild the single-prim groups with split profiles
                 bool okSingles = true;
-                size_t gi = 0;
-                for (auto& g : groups) {
-                    if (g.second == 1) {
-                        // find which splitArgs index: singles were recorded in order
-                        (void)gi;
-                    }
-                }
                 std::vector<TopoDS_Shape> rebuilt;
                 for (size_t si : singleIdx) {
                     TopoDS_Shape rs = rectPrimSolid(*splitArgs[si].pr, path.wireWidth,
