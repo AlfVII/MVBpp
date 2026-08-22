@@ -1502,8 +1502,18 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
             // orientation, are plain prisms (SEG -> cylinder for round). Only a rect straight whose
             // ends differ (a toroidal chord advancing azimuthally to the next turn) is TWISTED by
             // lofting between the two oriented rectangles, so it meets its elbows at their own angle.
+            const bool trace = std::getenv("MVB_RECT_TRACE") != nullptr;
+            if (trace) {
+                std::fprintf(stderr,
+                             "[rect-seg] '%s' round=%d angle=%.6g ext=%.6g branch=%s\n",
+                             pr.label.c_str(), int(round), axialStart.Angle(axialEnd),
+                             ext.Modulus(),
+                             (round || axialStart.Angle(axialEnd) < 0.01) ? "prism" : "loft");
+                std::fflush(stderr);
+            }
             if (round || axialStart.Angle(axialEnd) < 0.01) {
                 TopoDS_Face face = BRepBuilderAPI_MakeFace(profile(sa, t, axialStart)).Face();
+                if (trace) { std::fprintf(stderr, "[rect-seg]   face built\n"); std::fflush(stderr); }
                 return BRepPrimAPI_MakePrism(face, gp_Vec(ext)).Shape();
             }
             BRepOffsetAPI_ThruSections loft(Standard_True);  // solid
@@ -1749,8 +1759,23 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         // overlap (0.05-0.3 x wireRadius) fragments the union instead of cleaning it, because the
         // grown straight pokes out of the neighbouring corner/blend.
         double extA = -trimStart[i], extB = -trimEnd[i];
+        // MVB_RECT_TRACE: name every primitive BEFORE it is turned into a solid, flushed, so a
+        // hard crash inside OCC names its own culprit (the last line printed). ABT #373.
+        if (std::getenv("MVB_RECT_TRACE")) {
+            const double segLen = pr.kind == Primitive::SEG
+                                      ? pr.seg.a.Distance(pr.seg.b) : std::nan("");
+            std::fprintf(stderr,
+                         "[rect-trace] %s kind=%d '%s' trims %.6g/%.6g len=%.6g remaining=%.6g\n",
+                         path.name.c_str(), int(pr.kind), pr.label.c_str(), extA, extB,
+                         segLen, segLen + extA + extB);
+            std::fflush(stderr);
+        }
         TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB, extA,
                                        extB, round, radius, /*splitOverride=*/-1);
+        if (std::getenv("MVB_RECT_TRACE")) {
+            std::fprintf(stderr, "[rect-trace]   -> solid built for '%s'\n", pr.label.c_str());
+            std::fflush(stderr);
+        }
         if (s.IsNull()) {
             // NO silent drops (Alf): a failed primitive solid means the emitted copper is
             // missing from the conductor -- 17_cllc shipped its secondary WITHOUT the exit
