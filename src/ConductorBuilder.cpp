@@ -5043,36 +5043,13 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             : 0.0;
         std::vector<gp_Pnt> pts;
         if (!std::isnan(bandY)) {
-            // DIAGONAL ROUTE (ABT #849, Alf 2026-08-22): MKF now draws the inter-section
-            // continuation as the single diagonal from the exit turn to the entry turn --
-            // "Secondary turn 5 is lower than turn 6, so the connection should change
-            // height". Followed verbatim (the MKF-drawn-routes doctrine): the wire leaves
-            // its slot on the source face and slopes STRAIGHT to the destination height
-            // while stepping radially out, arriving at the destination face exactly at the
-            // receiving turn's height; the face run carries it to the crossing. The old
-            // three-level band chain (rise to bandY, cross, drop) is gone -- with a 2-point
-            // route its marker midpoint put bandY MID-DIAGONAL and the vertical rise
-            // crossed the sibling's face wrap (measured on cm37: p1's drop hit p0's
-            // 'face -Z in' at 1.6e-19 m).
-            // ...with ONE exact concession to the source face: a sibling's wrap (its own
-            // exit crossing, one pitch below) runs ON that face, and the straight chord
-            // from the slot passes 26 um inside its envelope (measured, cm37 P p0 wrap vs
-            // p1 chord: 261 um centre distance for a 287 um OD). The real wire RIDES OVER
-            // face copper, so the chord first steps radially out by one OD at the exit
-            // height -- the minimum that clears any face-resident envelope exactly -- and
-            // slopes from there. Endpoint heights stay MKF's verbatim. (wireRadius is
-            // the coated radius, so 2*wireRadius is exactly the gate's envelope diameter.)
-            // The DESTINATION face is its mirror: the sibling's own face run lies ON it
-            // at the sibling's entry height, which the descending chord crosses (measured,
-            // cm37: p0's slope vs p1's seg-2 run, 228 um centre distance). So the chord
-            // arrives one OD OFF the face at its entry height, and steps in level -- the
-            // whole descent stays an OD clear of face copper at both ends, exactly.
-            const double zA = zN0 - slotSag;
-            const double zStep = std::min(zA + 2.0 * wireRadius, zDest);
-            const double zIn = std::max(zStep, zDest - 2.0 * wireRadius);
-            pts.insert(pts.end(), {gp_Pnt(xSlot, yChain, -zA),
-                                    gp_Pnt(xSlot, yChain, -zStep),
-                                    gp_Pnt(xSlot, s1.y, -zIn),
+            // BAND ROUTE (ABT #615 stage 3): MKF's stage-2 alternation puts the exit turn
+            // adjacent to the band and the receiving section's first turn just under it, so
+            // the stubs are stumps; the run crosses the intervening sections at the band row,
+            // where MKF blocked their turns one OD below — clearance is the model's own.
+            pts.insert(pts.end(), {gp_Pnt(xSlot, yChain, -(zN0 - slotSag)),
+                                    gp_Pnt(xSlot, bandY, -(zN0 - slotSag)),
+                                    gp_Pnt(xSlot, bandY, -zDest),
                                     gp_Pnt(xSlot, s1.y, -zDest),
                                     gp_Pnt(0, s1.y, -zDest)});
         }
