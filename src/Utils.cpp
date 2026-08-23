@@ -29,6 +29,7 @@
 #include <variant>
 #include <stdexcept>
 #include <sstream>
+#include <iostream>
 #include <numbers>
 #include <map>
 
@@ -355,23 +356,26 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
     // latched from the IDEAL verdict before the blocking loop grows anything — so the only
     // signal died silently and the certified gate cannot see it (the displaced turns clear each
     // OTHER). Re-derive the final fit verdict here and refuse with MKF's own named reason.
-    // MVB_ALLOW_SQUISH is the documented diagnostic opt-in to overflow (the gate above offers
-    // it); with it set the operator has ASKED to see the non-fitting geometry, so this refusal
-    // must stand down too — otherwise the bypass builds squished layouts but never overflowing
-    // ones, and the walk-out that motivated ABT #864 could not be exported for review at all.
-    if (useRealWindingGeometry && !std::getenv("MVB_ALLOW_SQUISH")) {
+    // ABT #864 amendment (Alf, 2026-08-24: "it's a bad design, but a possible one; if it
+    // spreads and collides with the core we must show the user so he knows, but the coil is
+    // correct — though really inefficient"). A blocked layout that does not fit its window is
+    // BUILT, not refused: the coil itself is legal winding data, and the user must SEE the
+    // copper leave the window/core to judge the design. The verdict still cannot pass silently
+    // (that silence is what #864 was about), so it is said out loud here with MKF's own named
+    // reason, and the build proceeds.
+    if (useRealWindingGeometry) {
         auto& enrichedCoil = enriched.get_mutable_coil();
         const bool layoutFits = enrichedCoil.are_sections_and_layers_fitting();
         const bool copperInside = enrichedCoil.are_turns_inside_winding_window();
         if (!layoutFits || !copperInside) {
-            throw std::runtime_error(
-                "magnetic_autocomplete_safe: MKF applied real-winding connection blocking but "
-                "the BLOCKED layout does not fit its winding window (" +
-                (enrichedCoil._lastFitFailure.empty() ? std::string("unnamed fit failure")
-                                                      : enrichedCoil._lastFitFailure) +
-                "). The design as drawn cannot hold its turns plus the connection corridors; "
-                "MVB++ will not build copper outside the window — fix the design data (fewer "
-                "turns, larger window, thinner wire), or rework the layout in the adviser.");
+            std::cerr << "[magnetic_autocomplete_safe] WARNING (ABT #864): the real-winding "
+                         "BLOCKED layout does not fit its winding window ("
+                      << (enrichedCoil._lastFitFailure.empty() ? std::string("unnamed fit failure")
+                                                               : enrichedCoil._lastFitFailure)
+                      << "). Building it anyway so the overflow is visible — the design is "
+                         "legal but cannot hold its turns plus the connection corridors inside "
+                         "the window; expect copper outside the window (possibly outside the "
+                         "core)." << std::endl;
         }
     }
 
