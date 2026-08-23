@@ -346,6 +346,30 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
             "corridors and cannot be built as FEM-grade CAD. Fix the design data, or set "
             "MVB_ALLOW_SQUISH=1 (diagnostic) to allow coating squish and horizontal overflow.");
     }
+    // ABT #864: the OTHER half of that contract. Blocking can be APPLIED and the BLOCKED layout
+    // still not fit — the fixpoint grows layers until the winding walks radially out of the
+    // window (13_current_sense: the 1-turn fat primary's two terminal leads reserve ~0.53 mm at
+    // BOTH edges of every secondary layer, capacity 16 -> 4 turns/layer, 80 turns -> 20 layers,
+    // copper at x=4.69 mm past the CORE edge 4.675 in a window ending at 3.8125). wind() returns
+    // false for such a coil, but magnetic_autocomplete discards that bool, and the flag above is
+    // latched from the IDEAL verdict before the blocking loop grows anything — so the only
+    // signal died silently and the certified gate cannot see it (the displaced turns clear each
+    // OTHER). Re-derive the final fit verdict here and refuse with MKF's own named reason.
+    if (useRealWindingGeometry) {
+        auto& enrichedCoil = enriched.get_mutable_coil();
+        const bool layoutFits = enrichedCoil.are_sections_and_layers_fitting();
+        const bool copperInside = enrichedCoil.are_turns_inside_winding_window();
+        if (!layoutFits || !copperInside) {
+            throw std::runtime_error(
+                "magnetic_autocomplete_safe: MKF applied real-winding connection blocking but "
+                "the BLOCKED layout does not fit its winding window (" +
+                (enrichedCoil._lastFitFailure.empty() ? std::string("unnamed fit failure")
+                                                      : enrichedCoil._lastFitFailure) +
+                "). The design as drawn cannot hold its turns plus the connection corridors; "
+                "MVB++ will not build copper outside the window — fix the design data (fewer "
+                "turns, larger window, thinner wire), or rework the layout in the adviser.");
+        }
+    }
 
     // No-fallbacks rule: if the design has windings but MKF produced zero
     // turnsDescription (typically because the winding does not fit the
