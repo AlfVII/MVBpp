@@ -25,6 +25,8 @@
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <cstdio>
 #include <BRepAlgoAPI_Cut.hxx>
+#include <ShapeFix_ShapeTolerance.hxx>
+#include <Precision.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepAlgoAPI_Common.hxx>
@@ -81,6 +83,8 @@
 #include <ShapeFix_Face.hxx>
 #include <ShapeFix_Wire.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopoDS.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -827,6 +831,88 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
     return {};
 }
 
+// SCALING A SHAPE SCALES ITS TOLERANCE TOO -- AND A 1000x TOLERANCE BLINDS THE BOOLEAN.
+// ABT #860 (2026-08-23). Every mitre boolean runs in the MILLIMETRE frame because OCC mis-frames
+// sub-millimetre profiles in metres. BRepBuilderAPI_Transform carries the shape's tolerances
+// through the same scale, so a solid holding OCC's own confusion (1e-7) in metres arrives in the
+// millimetre frame claiming 1e-4 -- a tenth of a micron of slop on geometry that is analytically
+// exact. At that tolerance OCC 7.9.3 declares a TOROIDAL face and the knife's PLANE
+// non-intersecting: Cut returns its argument UNCHANGED and Common returns EMPTY, both reporting
+// IsDone with no error and no warning. Measured on 24_margin's entrance corner (--segments 0):
+// 0.0581 mm3 of the terminal stub stands inside the knife box by point classification, and both
+// booleans see nothing; with the tolerance reset to 1e-7 the same Cut removes 0.0583 mm3. That is
+// the whole '--segments 0 mitred corner did not abut' failure -- the faceted profile never hit it
+// because a plane/plane intersection survives the inflated tolerance that a plane/torus one does
+// not.
+// A shape does not become less accurate by being measured in millimetres, so the millimetre copy
+// is given the millimetre frame's confusion -- and only if it is still VALID with it, because a
+// swept BSpline pipe may genuinely need the slop it carries.
+static const gp_Trsf& mitreUpTrsf() {
+    static const gp_Trsf t = [] { gp_Trsf x; x.SetScale(gp_Pnt(0, 0, 0), 1000.0); return x; }();
+    return t;
+}
+static const gp_Trsf& mitreDownTrsf() {
+    static const gp_Trsf t = [] { gp_Trsf x; x.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0); return x; }();
+    return t;
+}
+static TopoDS_Shape toMitreFrame(const TopoDS_Shape& metres) {
+    TopoDS_Shape mm = BRepBuilderAPI_Transform(metres, mitreUpTrsf(), Standard_True).Shape();
+    if (mm.IsNull()) return mm;
+    TopoDS_Shape tight = BRepBuilderAPI_Copy(mm).Shape();
+    ShapeFix_ShapeTolerance().SetTolerance(tight, Precision::Confusion());
+    if (!tight.IsNull() && BRepCheck_Analyzer(tight).IsValid()) return tight;
+    return mm;   // the shape really does need its slop: leave it, the probe below still judges it
+}
+// Back to metres. The inverse scale divides the tolerances too, which would leave the result
+// claiming 1e-10 -- below the kernel's own confusion, which OCC reports as an invalid tolerance.
+// Raise the too-small ones back to confusion and leave anything larger alone.
+static TopoDS_Shape fromMitreFrame(const TopoDS_Shape& mm) {
+    TopoDS_Shape metres = BRepBuilderAPI_Transform(mm, mitreDownTrsf(), Standard_True).Shape();
+    if (!metres.IsNull()) ShapeFix_ShapeTolerance().LimitTolerance(metres, Precision::Confusion());
+    return metres;
+}
+
+// DID THE MITRE ACTUALLY HAPPEN? ABT #860 (2026-08-23). Every previous verdict on a mitre cut came
+// from the SAME boolean kernel that performs it -- 'removed' from the Cut, 'shouldRemove' from a
+// Common with the knife -- so when the kernel goes blind (above) it reports success AND reports
+// nothing left to remove, and the untrimmed overhang ships. The suggested cure of probing with a
+// large half-space is blind in exactly the same way: measured on the same corner, Common against a
+// 4691 mm3 box returned 0 mm3 while point classification found 0.058 mm3 of the solid inside it.
+// So the check must not be a boolean at all. It asks the trimmed solid a question with a
+// yes/no answer: is a point on the piece's OWN CENTRELINE, past the bisector plane, still inside
+// it? The overhang runs from the piece's un-grown end `stubEnd` along `stubDir` for `grow`; a
+// correct mitre leaves none of it. Only points standing at least kProbeClear past the plane are
+// asked, so the answer never depends on the tolerance of the mitre face itself; an overhang
+// thinner than that is thinner than the modelling tolerance and there is nothing to detect.
+// Returns the largest stand-off (in metres) at which copper was found beyond the plane, or -1
+// when the piece is clean.
+static double overhangBeyondPlane(const TopoDS_Shape& trimmed, const gp_Pnt& stubEnd,
+                                  const gp_Dir& stubDir, const gp_Pnt& P, const gp_XYZ& w,
+                                  double grow) {
+    if (trimmed.IsNull() || grow <= 0.0) return -1.0;
+    const double rate = stubDir.XYZ().Dot(w);          // how fast the overhang leaves the plane
+    if (rate <= 1e-9) return -1.0;                     // it does not head into the discard side
+    const double s0 = (stubEnd.XYZ() - P.XYZ()).Dot(w);
+    const double kProbeClear = 1e-6;                   // 1 um: 10x the shapes' own tolerance
+    const double tCross = (kProbeClear - s0) / rate;   // first t standing clear of the plane
+    if (tCross >= grow) return -1.0;                   // the grown end never reaches past it
+    const double tFrom = std::max(0.0, tCross);
+    double worst = -1.0;
+    for (double f : {0.30, 0.55, 0.80, 0.97}) {
+        const double t = tFrom + f * (grow - tFrom);
+        const gp_Pnt probe(stubEnd.XYZ() + stubDir.XYZ() * t);
+        const double stand = (probe.XYZ() - P.XYZ()).Dot(w);
+        if (stand < kProbeClear) continue;
+        // Per SOLID: a trim that fragmented the piece is a compound, and the classifier
+        // silently misclassifies one of those.
+        for (TopExp_Explorer ex(trimmed, TopAbs_SOLID); ex.More(); ex.Next()) {
+            BRepClass3d_SolidClassifier c(TopoDS::Solid(ex.Current()), probe, Precision::Confusion());
+            if (c.State() == TopAbs_IN) { worst = std::max(worst, stand); break; }
+        }
+    }
+    return worst;
+}
+
 // Trim the grown overhang of `solid` that pokes past the mitre plane (through P, material side =
 // keepDir): SUBTRACT a small knife box sitting on the discard side, localized to the junction.
 // Neither of the two 'obvious' cuts is correct here:
@@ -873,8 +959,8 @@ static TopoDS_Shape refuseTrim(const std::string& why, const TopoDS_Shape& untri
 // The halves overlap by half a wire radius of arc at a tangent seam and are fused back into ONE
 // solid after both corners are trimmed, so a wrap still ships as a single named part.
 static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, const gp_Dir& keepDir,
-                                   const gp_Dir& stubDir, double r, double grow, const std::string& what,
-                                   double neighbourStep,
+                                   const gp_Dir& stubDir, const gp_Pnt& stubEnd, double r,
+                                   double grow, const std::string& what, double neighbourStep,
                                    const std::string& diagnosis) {
     // HOW FAR MAY EACH KNIFE AXIS TRAVEL? ABT #685 (Alf, 2026-08-18). The same wire's next pass
     // sits `neighbourStep` away ALONG THE COLUMN AXIS (one pitch per revolution -- and a
@@ -1010,16 +1096,11 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
         // a 418 mm3 wrap, and Common(wrap, knife) returned ZERO -- OCC could not even see that the
         // two solids touch, though the joint sits exactly on the wrap's centreline. Scaling is an
         // EXACT affine map both ways, so this is a numerical frame choice, not an approximation.
-        gp_Trsf up, down;
-        up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
-        down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
-        const TopoDS_Shape solidMm =
-            BRepBuilderAPI_Transform(solidIn, up, Standard_True).Shape();
-        const TopoDS_Shape boxMm = BRepBuilderAPI_Transform(box, up, Standard_True).Shape();
+        const TopoDS_Shape solidMm = toMitreFrame(solidIn);
+        const TopoDS_Shape boxMm = toMitreFrame(box);
         BRepAlgoAPI_Cut cut(solidMm, boxMm);
         if (cut.IsDone() && !cut.Shape().IsNull()) {
-            TopoDS_Shape trimmed =
-                BRepBuilderAPI_Transform(cut.Shape(), down, Standard_True).Shape();
+            TopoDS_Shape trimmed = fromMitreFrame(cut.Shape());
             // REPAIR BEFORE JUDGING. ABT #685 (Alf, 2026-08-18): cutting a swept-pipe wrap leaves a
             // shell OCC reports as invalid -- and the volume of an invalid shell is meaningless
             // (the divergence integral needs a closed one). Measured on the push-pull: a 418 mm3
@@ -1071,12 +1152,10 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
             double removed = gpBefore.Mass() - gpAfter.Mass();
             if (removed < 1e-15 && canRetryHalfSpace && !bigBox.IsNull()) {
                 // The local knife cut nothing off a grown end: retry with the half-space knife.
-                const TopoDS_Shape bigMm =
-                    BRepBuilderAPI_Transform(bigBox, up, Standard_True).Shape();
+                const TopoDS_Shape bigMm = toMitreFrame(bigBox);
                 BRepAlgoAPI_Cut cut2(solidMm, bigMm);
                 if (cut2.IsDone() && !cut2.Shape().IsNull()) {
-                    TopoDS_Shape trimmed2 =
-                        BRepBuilderAPI_Transform(cut2.Shape(), down, Standard_True).Shape();
+                    TopoDS_Shape trimmed2 = fromMitreFrame(cut2.Shape());
                     if (!BRepCheck_Analyzer(trimmed2).IsValid()) {
                         try {
                             ShapeFix_Shape fix2(trimmed2);
@@ -1104,40 +1183,27 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
                     }
                 }
             }
-            if (removed < 1e-15) {
-                // Zero removal is LEGITIMATE when the grown end only reaches the mitre plane
-                // without crossing it (a large endpoint mismatch shifts J toward the other
-                // piece). It is a FAILED CUT when the knife's own Common with the piece shows
-                // material that should have gone (measured: OCC cut a steep spiral pipe with
-                // "success" while Common reported 0.09 mm3 inside the knife). Ask the Common.
-                double shouldRemove = 0.0;
-                try {
-                    const TopoDS_Shape probeMm = canRetryHalfSpace && !bigBox.IsNull()
-                        ? BRepBuilderAPI_Transform(bigBox, up, Standard_True).Shape()
-                        : boxMm;
-                    BRepAlgoAPI_Common inKnife(solidMm, probeMm);
-                    if (inKnife.IsDone() && !inKnife.Shape().IsNull() &&
-                        BRepCheck_Analyzer(inKnife.Shape()).IsValid()) {
-                        GProp_GProps gc;
-                        BRepGProp::VolumeProperties(inKnife.Shape(), gc);
-                        shouldRemove = gc.Mass();   // mm^3
-                    }
-                } catch (const Standard_Failure&) {
-                }
-                if (shouldRemove > 1e-6) {
-                    return refuseTrim(
-                        "ConductorBuilder: the mitre knife at " + what + " removed NOTHING while " +
-                            std::to_string(shouldRemove) +
-                            " mm^3 of the piece stands inside it (the cut reported success but "
-                            "left the overhang; half-space retry " +
-                            (canRetryHalfSpace ? "also removed nothing" : "unavailable") + "); " +
-                            diagnosis,
-                        solid);
-                }
-                if (std::getenv("MVB_MITRE_DIAG"))
-                    std::cerr << "[trim-zero-ok] " << what
-                              << " grown end reaches but does not cross the plane" << std::endl;
+            // THE ONLY VERDICT THAT IS NOT THE BOOLEAN'S OWN. ABT #860 (2026-08-23): both of the
+            // old verdicts came from the kernel that does the cutting -- `removed` from the Cut and
+            // a Common against the knife -- so a kernel that goes blind passes both while the
+            // overhang still stands (it did, on every --segments 0 terminal stub). Ask the trimmed
+            // solid directly whether copper of its own is still standing past the bisector plane.
+            const double leftBeyond =
+                overhangBeyondPlane(trimmed, stubEnd, stubDir, P, w, grow);
+            if (leftBeyond > 0.0) {
+                std::ostringstream why2;
+                why2 << "ConductorBuilder: the mitre cut at " << what << " left the overhang"
+                     << " standing -- a point on the piece's own centreline " << leftBeyond * 1e3
+                     << " mm past the bisector plane is still INSIDE the trimmed solid (the cut"
+                     << " reported success and removed " << removed * 1e9 << " mm3 of "
+                     << gpBefore.Mass() * 1e9 << " mm3; growth " << grow * 1e3 << " mm, wire r "
+                     << r * 1e3 << " mm, half-space retry "
+                     << (canRetryHalfSpace ? "available" : "unavailable") << "); " << diagnosis;
+                return refuseTrim(why2.str(), solid);
             }
+            if (removed < 1e-15 && std::getenv("MVB_MITRE_DIAG"))
+                std::cerr << "[trim-zero-ok] " << what
+                          << " grown end reaches but does not cross the plane" << std::endl;
             // stub bound: the overhang is at most a full-radius tube of length grow+2r, doubled
             // for the tilted-ellipse wedge. More than that = the knife ate distant material.
             const double stubMax = 2.0 * kPi * r * r * (grow + 2.0 * r);
@@ -1276,37 +1342,70 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // "the boolean never answered". Count the joints that got a real verdict against the ones that
     // did not, so a clean corpus can be told apart from a blind one (MVB_MITRE_DIAG prints both).
     size_t abutChecked = 0, abutNoVerdict = 0;
+    // MEASURE ONLY WHAT THE KERNEL CAN VALIDLY PRODUCE, AND TAKE THE WORST OF IT. ABT #860
+    // (2026-08-23): this gate used to read the volume of whatever BRepAlgoAPI_Common handed back,
+    // in the millimetre frame, without asking whether the result was a valid solid -- the one thing
+    // the rest of this file already knows never to do ("the volume of an invalid shell is
+    // meaningless"). Measured on 13_current_sense at --segments 0: the Common of two VALID solids
+    // came back INVALID reading 0.000973882 mm3 -- 87% of the 0.001118 mm3 dragback stub, i.e. the
+    // stub reported as very nearly buried inside its neighbour -- and the design was refused for a
+    // corner that does not overlap at all. The SAME two solids intersect in exactly 0, valid, when
+    // the boolean runs in metres (and after a BRep round trip, and at any fuzzy value >= 1e-5 mm);
+    // no point of the stub classifies inside the neighbour; and the faceted build of that very
+    // design reports the joint clean. So: run the boolean in BOTH frames, discard any answer OCC
+    // reports as invalid, and take the LARGEST of the trustworthy ones. That is conservative in the
+    // direction a gate must be conservative -- a valid answer that shows overlap is never
+    // discarded, and the frame that goes blind (also measured, see toMitreFrame) cannot argue a
+    // corner clean on its own. If NEITHER frame gives a valid answer the joint is counted as
+    // unchecked, loudly, and never as clean.
     auto checkMitredAbutment = [&](const TopoDS_Shape& a, const TopoDS_Shape& b,
                                    const std::string& joint) {
         if (a.IsNull() || b.IsNull()) { ++abutNoVerdict; return; }
-        try {
-            gp_Trsf up;
-            up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
-            BRepAlgoAPI_Common common(
-                BRepBuilderAPI_Transform(a, up, Standard_True).Shape(),
-                BRepBuilderAPI_Transform(b, up, Standard_True).Shape());
-            if (!common.IsDone() || common.Shape().IsNull()) {   // no verdict, no claim
-                ++abutNoVerdict;
-                return;
+        double worst = -1.0;                 // mm^3, over the frames that answered validly
+        Bnd_Box worstBox;
+        // scale: how many mm^3 one cubic unit of that frame's result is worth
+        const std::array<double, 2> frameScale{1.0, 1e9};
+        for (int frame = 0; frame < 2; ++frame) {
+            try {
+                const TopoDS_Shape x = frame == 0 ? toMitreFrame(a) : a;
+                const TopoDS_Shape y = frame == 0 ? toMitreFrame(b) : b;
+                BRepAlgoAPI_Common common(x, y);
+                if (!common.IsDone() || common.Shape().IsNull()) continue;
+                if (!BRepCheck_Analyzer(common.Shape()).IsValid()) continue;   // debris, not a volume
+                GProp_GProps gcp;
+                BRepGProp::VolumeProperties(common.Shape(), gcp);
+                const double mm3 = gcp.Mass() * frameScale[frame];
+                if (mm3 > worst) {
+                    worst = mm3;
+                    Bnd_Box cb;
+                    BRepBndLib::Add(common.Shape(), cb);
+                    if (frame == 1 && !cb.IsVoid()) {   // report every box in mm
+                        double bx0, by0, bz0, bx1, by1, bz1;
+                        cb.Get(bx0, by0, bz0, bx1, by1, bz1);
+                        Bnd_Box scaled;
+                        scaled.Update(bx0 * 1e3, by0 * 1e3, bz0 * 1e3,
+                                      bx1 * 1e3, by1 * 1e3, bz1 * 1e3);
+                        cb = scaled;
+                    }
+                    worstBox = cb;
+                }
+            } catch (const Standard_Failure&) {
+                // The boolean itself failing is a different defect; the invalid-cut paths
+                // already throw where the trim happens. Let the other frame answer.
             }
-            ++abutChecked;
-            GProp_GProps gcp;
-            BRepGProp::VolumeProperties(common.Shape(), gcp);
-            if (gcp.Mass() > 1e-6) {
-                Bnd_Box cb;
-                BRepBndLib::Add(common.Shape(), cb);
+        }
+        if (worst < 0.0) { ++abutNoVerdict; return; }   // no frame produced a valid answer
+        ++abutChecked;
+        if (worst > 1e-6) {
+            std::ostringstream where;
+            where << joint << " overlaps by " << worst << " mm^3";
+            if (!worstBox.IsVoid()) {
                 double cx0, cy0, cz0, cx1, cy1, cz1;
-                cb.Get(cx0, cy0, cz0, cx1, cy1, cz1);
-                std::ostringstream where;
-                where << joint << " overlaps by " << gcp.Mass() << " mm^3, common bbox mm ["
-                      << cx0 << "," << cy0 << "," << cz0 << "]..[" << cx1 << "," << cy1 << ","
-                      << cz1 << "]";
-                overlappingJoints.push_back(where.str());
+                worstBox.Get(cx0, cy0, cz0, cx1, cy1, cz1);
+                where << ", common bbox mm [" << cx0 << "," << cy0 << "," << cz0 << "]..["
+                      << cx1 << "," << cy1 << "," << cz1 << "]";
             }
-        } catch (const Standard_Failure&) {
-            // The boolean itself failing is a different defect; the invalid-cut paths
-            // already throw where the trim happens.
-            ++abutNoVerdict;
+            overlappingJoints.push_back(where.str());
         }
     };
     for (size_t i = 0; i < n; ++i) {
@@ -1485,7 +1584,8 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             const gp_Pnt J(0.5 * (primEndpoints(*ptrs[i - 1]).second.XYZ() +
                                   primEndpoints(*ptrs[i]).first.XYZ()));
             parts.front() =
-                localMitreTrim(parts.front(), J, nS, gp_Dir(fs[i].XYZ() * -1.0), wireRadius, overS,
+                localMitreTrim(parts.front(), J, nS, gp_Dir(fs[i].XYZ() * -1.0),
+                               primEndpoints(*ptrs[i]).first, wireRadius, overS,
                                "'" + ptrs[i - 1]->label + "' -> '" + ptrs[i]->label + "'",
                                neighbourHere, junctionDiag(fe[i - 1], fs[i], *ptrs[i]));
             ++nCut;
@@ -1494,7 +1594,8 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             const gp_Pnt J(0.5 * (primEndpoints(*ptrs[i]).second.XYZ() +
                                   primEndpoints(*ptrs[i + 1]).first.XYZ()));
             parts.back() =
-                localMitreTrim(parts.back(), J, gp_Dir(nE.XYZ() * -1.0), fe[i], wireRadius, overE,
+                localMitreTrim(parts.back(), J, gp_Dir(nE.XYZ() * -1.0), fe[i],
+                               primEndpoints(*ptrs[i]).second, wireRadius, overE,
                                "'" + ptrs[i]->label + "' -> '" + ptrs[i + 1]->label + "'",
                                neighbourHere, junctionDiag(fe[i], fs[i + 1], *ptrs[i]));
             ++nCut;
