@@ -21,7 +21,19 @@ set -u
 ROOT=/home/alf/OpenMagnetics/MVB++
 GEN=$ROOT/build/mvbpp_step_generator
 OUT=${1:?usage: sweep_real_steps.sh <outdir> [jobs]}
-JOBS=${2:-3}
+# ONE GENERATOR AT A TIME (Alf, 2026-08-23: "never run multiple mvbpp_step_generator --real;
+# if you launch another one, kill the previous ones"). This script used to default to THREE,
+# which is how the box reached 0 GB available on 2026-08-23 -- one design
+# (06_llc_xfmr_eq4128_3c97) took a single generator to 33 GB, and three at once is the exact
+# condition that forced the 2026-07-27 OOM reboot. The per-job `ulimit -v 16G` below caps each
+# process; it does not stop three of them adding up.
+JOBS=${2:-1}
+if [ "$JOBS" -gt 1 ] && [ -z "${MVB_ALLOW_PARALLEL_SWEEP:-}" ]; then
+    echo "sweep_real_steps.sh: refusing jobs=$JOBS -- one generator at a time on this box." >&2
+    echo "  A single design has been measured at 33 GB; concurrent sweeps took it to 0 GB free." >&2
+    echo "  Set MVB_ALLOW_PARALLEL_SWEEP=1 to override deliberately." >&2
+    exit 2
+fi
 
 mkdir -p "$OUT"
 : > "$OUT/RESULTS.tsv"
