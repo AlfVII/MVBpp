@@ -4631,6 +4631,90 @@ struct PendingZ {
     std::string label;
 };
 
+// THE CORE AS AN OBSTACLE (ABT #353). The routers plan against the copper they can see -- ring
+// inventories, reserved spaces, MKF's drawn routes -- and the core is in none of those models, so
+// a route that leaves the winding band leaves it into whatever is there. On the WE-TI 7447720470
+// drum that is the bottom flange (groove floor y = -3.2488 mm, flange band down to y = -4.25 mm
+// out to r = 3.898 mm, all measured from the built solid), and the Z end-run's duck plane -- 1.2
+// wire radii past the outermost ring, computed from the ring inventory alone -- sat 0.22 mm below
+// that floor with its wire tube 0.43 mm inside the ferrite.
+//
+// The obstacle model is the CORE SOLIDS themselves. The bobbin's processedDescription cannot serve:
+// its winding windows carry correct height/width but UNINITIALISED coordinates (measured on the
+// whole corpus: 5.09e-310 / 1.33e-276 on 01_simple_inductor_etd34, 1.83e+230 on the drum), so the
+// window's position -- which is exactly what "where does the core begin" needs -- is not knowable
+// from it. MagneticBuilder already hands the solids down for lead aiming (Options::coreObstacles);
+// this uses the same ones.
+//
+// WHAT IS TESTED is the wire's own footprint, not its centreline: a centreline that clears a
+// flange face by less than the wire's half-height still buries copper in it. Round wire probes at
+// +-radius; a rectangular wire probes at its own copper half-extents (axial != radial -- probing a
+// 3.04 x 0.5 mm rect wire as if it were 3.04 mm tall reported four false hits on 03_buck_pq3230,
+// whose turns clear the yoke correctly by 0.15 mm).
+struct WireEnvelope {
+    double halfAxial = 0.0, halfRadial = 0.0;
+};
+
+WireEnvelope copperEnvelopeOf(const ConductorPath& p) {
+    // condWidth / condHeight are the FULL bare-copper section (TurnBuilder::wireDimensions with
+    // paintCoating = false; width = radial, height = axial, as TurnBuilder::build_rect_profile
+    // orients it) -- hence the halving. condRadius is the half-DIAGONAL, the conservative round
+    // bound, and stands in only when the section dimensions are absent.
+    const double fallback = p.condRadius > 0.0 ? p.condRadius : p.wireRadius;
+    WireEnvelope e;
+    e.halfAxial = p.condHeight > 0.0 ? p.condHeight / 2.0 : fallback;
+    e.halfRadial = p.condWidth > 0.0 ? p.condWidth / 2.0 : fallback;
+    return e;
+}
+
+// Every point of a centreline whose wire footprint reaches inside a core solid, as text. Five
+// probes per sample -- the centre and the footprint's four axial/radial extremes -- bound the
+// section at a cost the whole path can afford. The bounding-box test in front of the classifier is
+// EXACT, not a tolerance: a point further than the wire's own reach outside a solid's box cannot be
+// inside that solid, and skipping it is what keeps the classifier off the vast majority of a
+// winding's samples.
+std::vector<std::string> coreHits(const std::vector<TopoDS_Shape>& coreObstacles,
+                                  const std::vector<gp_Pnt>& pts, const WireEnvelope& env,
+                                  const std::string& what, size_t maxReports) {
+    std::vector<std::string> hits;
+    if (coreObstacles.empty() || pts.empty()) return hits;
+    const double reach = std::max(env.halfAxial, env.halfRadial);
+    for (const auto& obst : coreObstacles) {
+        for (TopExp_Explorer se(obst, TopAbs_SOLID); se.More(); se.Next()) {
+            Bnd_Box box;
+            BRepBndLib::Add(se.Current(), box);
+            box.Enlarge(reach);
+            BRepClass3d_SolidClassifier cls(se.Current());
+            for (const gp_Pnt& q : pts) {
+                if (box.IsOut(q)) continue;
+                const double r = std::hypot(q.X(), q.Z());
+                const double ux = r > 1e-12 ? q.X() / r : 1.0;
+                const double uz = r > 1e-12 ? q.Z() / r : 0.0;
+                const gp_Pnt probes[5] = {
+                    q,
+                    gp_Pnt(q.X(), q.Y() - env.halfAxial, q.Z()),
+                    gp_Pnt(q.X(), q.Y() + env.halfAxial, q.Z()),
+                    gp_Pnt(q.X() - ux * env.halfRadial, q.Y(), q.Z() - uz * env.halfRadial),
+                    gp_Pnt(q.X() + ux * env.halfRadial, q.Y(), q.Z() + uz * env.halfRadial)};
+                for (const gp_Pnt& probe : probes) {
+                    cls.Perform(probe, 1e-9);
+                    if (cls.State() != TopAbs_IN) continue;
+                    char buf[320];
+                    std::snprintf(buf, sizeof(buf),
+                                  "%s: copper at (%.4f, %.4f, %.4f) mm (r = %.4f mm, y = %.4f mm, "
+                                  "copper section %.4f axial x %.4f radial mm) is INSIDE the core",
+                                  what.c_str(), q.X() * 1e3, q.Y() * 1e3, q.Z() * 1e3, r * 1e3,
+                                  q.Y() * 1e3, env.halfAxial * 2e3, env.halfRadial * 2e3);
+                    hits.push_back(buf);
+                    break;
+                }
+                if (hits.size() >= maxReports) return hits;
+            }
+        }
+    }
+    return hits;
+}
+
 // Absorb NEGLIGIBLE KINKS from a drawn lead route -- never a corner (ABT #685). A waypoint
 // within `absorbTol` of the running kept point or of the route's endpoint lies inside the pipe
 // body of the adjacent edge; sub-tolerance spine edges also crash OCCT's pipe-shell corner
@@ -4767,14 +4851,35 @@ std::vector<Primitive> buildZEndRun(const PlanePt& s, const PlanePt& n, double a
     return prims;
 }
 
+// ABT #353. NOTE ON REACHABILITY: nothing has populated `pending` since commit 2578ae8
+// (2026-08-03), which replaced the deferred end-run lane search with the physical +Z dragback --
+// the route a winder actually takes. The planner is kept because a lane search is still the only
+// answer for a return that cannot ride the layer it just finished, and it is fixed here rather
+// than left core-blind, so that a revival cannot re-introduce the defect the ticket recorded: the
+// duck plane came from the CONDUCTOR RING INVENTORY alone (1.2 wire radii past the outermost ring)
+// and, on the WE-TI drum, sat 0.22 mm below the groove floor with its wire 0.43 mm inside the
+// bottom flange. Now every candidate route is CLASSIFIED AGAINST THE CORE SOLIDS before it can be
+// chosen, the duck steps back towards the winding until one clears, and a return with no clear
+// plane is REFUSED by name instead of being buried in ferrite.
 void planZEndRuns(std::vector<ConductorPath>& paths, std::vector<PendingZ>& pending,
-                  const std::vector<RingInv>& rings) {
+                  const std::vector<RingInv>& rings,
+                  const std::vector<TopoDS_Shape>& coreObstacles) {
     if (pending.empty() || rings.empty()) return;
     double maxEdge = -1e30, yLoEdge = 1e30, yHiEdge = -1e30;
     for (const RingInv& g : rings) {
         maxEdge = std::max(maxEdge, g.r + g.rw);
         yLoEdge = std::min(yLoEdge, g.y - g.rw);
         yHiEdge = std::max(yHiEdge, g.y + g.rw);
+    }
+    // WHERE THE CORE IS is knowable ONLY from the core solids here: the bobbin's winding windows
+    // carry correct height/width but uninitialised COORDINATES (see the coreHits header), so their
+    // floor and ceiling cannot be placed. Routing out of the winding band without them would be
+    // guessing, and guessing is what produced this defect -- so it refuses instead.
+    if (coreObstacles.empty()) {
+        throw std::runtime_error(
+            "ConductorBuilder: cannot plan a Z-return end-run -- no core solids were provided as "
+            "obstacles (Options::coreObstacles is empty), so there is no way to know where the "
+            "core begins below or above the winding, and the duck plane would be a guess");
     }
     // Sampled polyline cache of every existing primitive (obstacle field), kept current as
     // end-runs are inserted.
@@ -4788,18 +4893,64 @@ void planZEndRuns(std::vector<ConductorPath>& paths, std::vector<PendingZ>& pend
     for (auto& pz : pending) {
         ConductorPath& P = paths[pz.pathIdx];
         const double crw = P.condRadius > 0 ? P.condRadius : P.wireRadius;
+        const WireEnvelope env = copperEnvelopeOf(P);
         const double rOut = maxEdge + 1.2 * crw;
         const bool viaBottom = std::abs(pz.n.y - yLoEdge) <= std::abs(pz.n.y - yHiEdge);
-        const double yEnd = viaBottom ? (yLoEdge - 1.2 * crw) : (yHiEdge + 1.2 * crw);
+        // DUCK PLANES, in preference order. First the old rule -- clear the winding by 1.2 wire
+        // radii -- on the near side, then the same on the far side; then, for each side in turn,
+        // planes stepping BACK TOWARDS the winding in fifth-of-a-wire steps down to the winding's
+        // own edge. Stepping back is what a winder does when the flange is in the way; stepping
+        // further out is what buried copper in the drum's flange. A plane is a candidate only
+        // until its route has been classified against the core -- that test, not this list,
+        // decides.
+        struct YCand { double y; const char* where; };
+        std::vector<YCand> yCands;
+        auto ladder = [&](bool bottom) {
+            const char* where = bottom ? "below the winding" : "above the winding";
+            const double edge = bottom ? yLoEdge : yHiEdge;
+            const double sign = bottom ? -1.0 : 1.0;
+            for (int k = 0; k <= 6; ++k)
+                yCands.push_back({edge + sign * (1.2 - 0.2 * k) * crw, where});
+        };
+        ladder(viaBottom);
+        ladder(!viaBottom);
         // Candidate lanes x arc directions, scored by worst clearance slack vs everything built.
+        // A lane is accepted only once its copper has been proven clear of the core.
         double bestSlack = -1e30;
+        double bestY = yCands.front().y;
+        const char* bestWhere = yCands.front().where;
         std::vector<Primitive> best;
+        std::string coreRefusal;
         const double azA = kPlaneAz + P.seamRot;   // this path's rotated connection plane
+        // (The lane search below is unchanged and deliberately left at its own indentation, so
+        // the diff that added this plane loop around it stays readable.)
+        for (size_t yi = 0; yi < yCands.size() && bestSlack < 0.0; ++yi) {
+        const double yEnd = yCands[yi].y;
         for (int ai = 0; ai < 16 && bestSlack < 0.0; ++ai) {
             const double azOff = azA + 0.35 + ai * (kTwoPi - 0.7) / 15.0;
             for (int dir = 0; dir < 4 && bestSlack < 0.0; ++dir) {
                 auto cand = buildZEndRun(pz.s, pz.n, azA, azOff, dir & 1, dir & 2, rOut, yEnd,
                                          pz.label, pz.ordinal);
+                // THE CORE FIRST, and per LANE: a route through ferrite is not a worse lane, it is
+                // no lane at all, and whether it hits depends on the azimuth (an E core's window is
+                // open where its yoke is not). Classify before the far more expensive all-pairs
+                // copper scoring, and drop the lane outright when it fails.
+                {
+                    std::vector<gp_Pnt> pts;
+                    for (const auto& pr : cand)
+                        for (const auto& q : samplePrim(pr, P.wireRadius)) pts.push_back(q);
+                    const auto hits =
+                        coreHits(coreObstacles, pts, env,
+                                 "duck plane y = " + std::to_string(yEnd * 1e3) + " mm at lane " +
+                                     std::to_string((azOff - azA) * 180.0 / kPi) + " deg", 1);
+                    if (!hits.empty()) {
+                        if (coreRefusal.empty()) coreRefusal = hits.front();
+                        if (std::getenv("MVB_DIAG"))
+                            std::cerr << "[z-endrun]   REFUSED by the core: " << hits.front()
+                                      << "\n";
+                        continue;
+                    }
+                }
                 double slack = 1e30;
                 std::string worst;
                 for (size_t k = 0; k < cand.size(); ++k) {
@@ -4828,16 +4979,30 @@ void planZEndRuns(std::vector<ConductorPath>& paths, std::vector<PendingZ>& pend
                 }
                 if (slack > bestSlack) {
                     bestSlack = slack;
+                    bestY = yEnd;
+                    bestWhere = yCands[yi].where;
                     best = std::move(cand);
                     if (std::getenv("MVB_DIAG") && !worst.empty())
                         std::cerr << "[z-endrun]   cand az=" << (azOff - azA) << " dirs=" << dir
-                                  << " slack=" << slack * 1e6 << "um worst: " << worst << "\n";
+                                  << " y=" << yEnd * 1e3 << "mm slack=" << slack * 1e6
+                                  << "um worst: " << worst << "\n";
                 }
             }
         }
+        }
+        if (best.empty()) {
+            throw std::runtime_error(
+                "ConductorBuilder: the Z-return end-run of " + pz.label +
+                " has nowhere to duck -- every plane from 1.2 wire radii past the winding (y = " +
+                std::to_string(yCands.front().y * 1e3) + " mm) back to the winding's own edge, on "
+                "BOTH sides, runs the wire into the CORE. Last refusal: " + coreRefusal +
+                ". The return cannot be routed without driving copper through ferrite");
+        }
         if (std::getenv("MVB_DIAG"))
-            std::cerr << "[z-endrun] " << pz.label << ": bestSlack=" << bestSlack * 1e6
-                      << "um " << (bestSlack >= 0 ? "CLEAR" : "CONFLICT") << "\n";
+            std::cerr << "[z-endrun] " << pz.label << ": duck at y=" << bestY * 1e3 << " mm ("
+                      << bestWhere << ", winding y=[" << yLoEdge * 1e3 << "," << yHiEdge * 1e3
+                      << "] mm) bestSlack=" << bestSlack * 1e6 << "um "
+                      << (bestSlack >= 0 ? "CLEAR" : "CONFLICT") << "\n";
         // Insert the best candidate (a conflict-free one when found; otherwise the least-bad —
         // checkCollisions stays the final arbiter and reports it honestly).
         const size_t at = pz.insertAt + inserted[pz.pathIdx];
@@ -10854,39 +11019,35 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         paths.push_back(std::move(path));
     }
 
-    // MVB_LEAD_CORE_CHECK: verify what the aim only PREDICTED -- classify the emitted lead
-    // copper against the core solids and report any sample inside one. The aim probes a coarse
-    // azimuth/radius/height lattice before the leads exist; this checks the actual centreline
-    // after the seam rotation, which is the claim that matters.
-    if (std::getenv("MVB_LEAD_CORE_CHECK") && !opts.coreObstacles.empty()) {
-        int hits = 0;
+    // MVB_CORE_CLEARANCE (ABT #353): DIAGNOSTIC ONLY -- measure the emitted copper against the
+    // core solids and report every piece whose own section reaches inside one. It generalises the
+    // old MVB_LEAD_CORE_CHECK from the leads to every primitive, and it verifies what the lead aim
+    // only PREDICTED (that probe runs on a coarse lattice before the leads exist, and cannot see a
+    // connection at all).
+    //
+    // It NEVER refuses a build, by Alf's ruling (2026-08-23): "about the collision with the core,
+    // I don't care so much about those, as they depend on the user and the filling factor" -- a
+    // winding that touches the core is a consequence of what the user asked for, not a defect the
+    // builder gets to veto. What the builder DOES owe is not to PLACE a connection there itself,
+    // which is the planner's job (see planZEndRuns) and is enforced there, at placement time.
+    if (std::getenv("MVB_CORE_CLEARANCE") && !opts.coreObstacles.empty()) {
+        std::vector<std::string> hits;
         for (const auto& p : paths) {
-            for (const auto& pr : p.prims) {
-                if (!pr.isLead) continue;
-                for (const auto& q : samplePrim(pr, p.wireRadius)) {
-                    for (const auto& obst : opts.coreObstacles) {
-                        for (TopExp_Explorer se(obst, TopAbs_SOLID); se.More(); se.Next()) {
-                            BRepClass3d_SolidClassifier cls(se.Current());
-                            cls.Perform(q, 1e-7);
-                            if (cls.State() == TopAbs_IN) {
-                                std::cerr << "[lead-core] " << p.name << " '" << pr.label
-                                          << "' sample (" << q.X() * 1e3 << "," << q.Y() * 1e3
-                                          << "," << q.Z() * 1e3 << ") mm is INSIDE the core\n";
-                                ++hits;
-                            }
-                        }
-                    }
-                }
-            }
+            const WireEnvelope env = copperEnvelopeOf(p);
+            for (const auto& pr : p.prims)
+                for (auto& h : coreHits(opts.coreObstacles, samplePrim(pr, p.wireRadius), env,
+                                        p.name + " '" + pr.label + "'", 1))
+                    hits.push_back(std::move(h));
         }
-        std::cerr << "[lead-core] VERDICT: " << (hits ? "FAIL" : "PASS") << " (" << hits
-                  << " lead samples inside the core)\n";
+        for (const auto& h : hits) std::cerr << "[core-clearance] " << h << "\n";
+        std::cerr << "[core-clearance] VERDICT: " << (hits.empty() ? "PASS" : "FAIL") << " ("
+                  << hits.size() << " piece(s) of copper inside the core)\n";
     }
 
     // Deferred Z-return end-runs: planned against the FULL obstacle field (every conductor's
     // helices, links and leads, plus already-planned end-runs), choosing a conflict-free
     // azimuth lane per return.
-    planZEndRuns(paths, pendingZ, allRings);
+    planZEndRuns(paths, pendingZ, allRings, opts.coreObstacles);
 
     // Clean zero-net-progress retraces before anything consumes the paths, so the collision gate,
     // the sweep and the compound all see the same simple path.

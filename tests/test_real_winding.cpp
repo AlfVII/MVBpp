@@ -35,6 +35,7 @@
 #include <TopoDS.hxx>
 #include <gp_Pnt.hxx>
 #include <cmath>
+#include <memory>
 #include <fstream>
 #include <numbers>
 #include <variant>
@@ -1291,4 +1292,140 @@ TEST_CASE("TMP fixture probe", "[tmpfix]") {
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[fix] %s THROW: %s\n", name, e.what());
     }
+}
+
+// ABT #353 -- NO ROUTED COPPER IN THE FLANGE. The WE-TI 7447720470 drum is the design the ticket
+// was filed on: its winding groove runs y = [-3.2488, +3.2488] mm and its flanges fill the bands
+// beyond that (the bottom one out to r = 3.898 mm, the top one to r = 2.498 mm), so anything a
+// router places "just below the winding" is inside ferrite. The Z end-run planner did exactly
+// that -- its duck plane came from the copper ring inventory alone and sat 0.23 mm below the
+// groove floor, with the wire 0.44 mm into the flange -- and it now classifies every candidate
+// lane against the core solids instead (planZEndRuns). This is the design-level pin: what MVB++
+// routes on this drum stays in the groove.
+//
+// SCOPE (Alf, 2026-08-23): copper touching the core is a filling-factor consequence of what the
+// user asked for, not something the builder vetoes -- there is deliberately no general
+// copper-vs-core refusal in the build. What is pinned here is MVB++'s own PLACEMENT on a design
+// whose turns fit their window with room to spare; a failure means a router put copper in the
+// ferrite, and is not to be relaxed away.
+//
+// Deliberately on the PATH (centreline) API: it exercises the same routing as the solid build
+// without depending on wire assembly, so a defect in the assembler cannot mask -- or fake -- a
+// routing regression.
+TEST_CASE("Real winding: the drum's connections stay out of the core flange (ABT #353)",
+          "[realwinding]") {
+    auto magneticJson = loadFixture("realwinding_drum_we_ti.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    // Hands the core solids down to ConductorBuilder as routing obstacles.
+    auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE(!paths.empty());
+    auto coreShapes = builder.buildCoreNamed(enriched.get_core());
+    REQUIRE(!coreShapes.empty());
+
+    // The obstacle, measured from the CORE SOLID itself rather than from any dimension in the
+    // fixture: the flange radius is the core's own bounding radius, and the groove floor/ceiling
+    // are found by walking the axis of the winding band until the classifier reports material.
+    // Nothing here can be defused by editing a number in the JSON.
+    double flangeR = 0.0;
+    for (const auto& ns : coreShapes) {
+        Bnd_Box bx;
+        BRepBndLib::Add(ns.shape, bx);
+        double x0, y0, z0, x1, y1, z1;
+        bx.Get(x0, y0, z0, x1, y1, z1);
+        flangeR = std::max({flangeR, std::abs(x0), std::abs(x1), std::abs(z0), std::abs(z1)});
+    }
+    REQUIRE(flangeR > 0.0);
+
+    std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> cls;
+    for (const auto& ns : coreShapes)
+        for (TopExp_Explorer se(ns.shape, TopAbs_SOLID); se.More(); se.Next())
+            cls.push_back(std::make_unique<BRepClass3d_SolidClassifier>(se.Current()));
+    REQUIRE(!cls.empty());
+    auto material = [&](double x, double y, double z) {
+        for (auto& c : cls) {
+            c->Perform(gp_Pnt(x, y, z), 1e-9);
+            if (c->State() == TopAbs_IN) return true;
+        }
+        return false;
+    };
+
+    // The groove and the two flanges, MEASURED from the solid (this drum's flanges differ:
+    // the bottom one is the full 7.8 mm OD, the top one only 5.0 mm). Walk the post's own
+    // radius up and down until material starts -- that is the groove face -- then walk radially
+    // inside each flange band to find how far that flange reaches.
+    const double step = flangeR / 2000.0;
+    double postR = 0.0;
+    for (double r = step; r < flangeR; r += step)
+        if (material(r, 0.0, 0.0)) postR = r;
+    REQUIRE(postR > 0.0);
+    const double rGroove = postR + 4.0 * step;
+    REQUIRE(!material(rGroove, 0.0, 0.0));
+    double yFloor = 0.0, yCeil = 0.0;
+    for (double y = 0.0; y > -flangeR * 4.0; y -= step)
+        if (material(rGroove, y, 0.0)) { yFloor = y + step; break; }
+    for (double y = 0.0; y < flangeR * 4.0; y += step)
+        if (material(rGroove, y, 0.0)) { yCeil = y - step; break; }
+    REQUIRE(yFloor < 0.0);
+    REQUIRE(yCeil > 0.0);
+    double rBottomFlange = 0.0, rTopFlange = 0.0;
+    for (double r = rGroove; r < flangeR + step; r += step) {
+        if (material(r, yFloor - 4.0 * step, 0.0)) rBottomFlange = r;
+        if (material(r, yCeil + 4.0 * step, 0.0)) rTopFlange = r;
+    }
+    REQUIRE(rBottomFlange > postR);
+    REQUIRE(rTopFlange > postR);
+    std::fprintf(stderr,
+                 "[ABT353] drum measured from the solid: post r=%.4f mm, groove y=[%.4f, %.4f] "
+                 "mm, bottom flange to r=%.4f mm, top flange to r=%.4f mm\n",
+                 postR * 1e3, yFloor * 1e3, yCeil * 1e3, rBottomFlange * 1e3, rTopFlange * 1e3);
+
+    int inFlange = 0, inCore = 0;
+    double deepest = 0.0;   // worst excursion past a groove face, over the flange (metres)
+    for (const auto& p : paths) {
+        for (const auto& prim : p.prims) {
+            for (const auto& q : prim) {
+                const double r = std::hypot(q[0], q[2]);
+                const double ux = r > 1e-12 ? q[0] / r : 1.0;
+                const double uz = r > 1e-12 ? q[2] / r : 0.0;
+                // (a) the ticket's own measurement: the wire TUBE reaching past the groove floor
+                //     or ceiling while still under that side's flange is copper inside ferrite.
+                {
+                    const double over =
+                        std::max(r <= rBottomFlange ? yFloor - (q[1] - p.wireRadius) : -1.0,
+                                 r <= rTopFlange ? (q[1] + p.wireRadius) - yCeil : -1.0);
+                    if (over > 1e-9) {
+                        INFO("copper at r=" << r * 1e3 << " mm y=" << q[1] * 1e3
+                                            << " mm reaches " << over * 1e3
+                                            << " mm past the groove face (floor " << yFloor * 1e3
+                                            << ", ceiling " << yCeil * 1e3 << " mm, flanges r="
+                                            << rBottomFlange * 1e3 << "/" << rTopFlange * 1e3
+                                            << " mm) in '" << p.name << "'");
+                        ++inFlange;
+                        deepest = std::max(deepest, over);
+                    }
+                }
+                // (b) the general statement: no part of the wire tube is inside a core solid.
+                const std::array<std::array<double, 3>, 5> probes{{
+                    {q[0], q[1], q[2]},
+                    {q[0], q[1] - p.wireRadius, q[2]},
+                    {q[0], q[1] + p.wireRadius, q[2]},
+                    {q[0] - ux * p.wireRadius, q[1], q[2] - uz * p.wireRadius},
+                    {q[0] + ux * p.wireRadius, q[1], q[2] + uz * p.wireRadius}}};
+                for (const auto& pr : probes) {
+                    if (!material(pr[0], pr[1], pr[2])) continue;
+                    INFO("copper at (" << q[0] * 1e3 << "," << q[1] * 1e3 << "," << q[2] * 1e3
+                                       << ") mm has tube material inside the core, in '" << p.name
+                                       << "'");
+                    ++inCore;
+                    break;
+                }
+            }
+        }
+    }
+    std::fprintf(stderr, "[ABT353] deepest excursion into a flange band: %.4f mm\n",
+                 deepest * 1e3);
+    CHECK(inFlange == 0);
+    CHECK(inCore == 0);
 }
