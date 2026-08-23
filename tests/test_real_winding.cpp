@@ -704,8 +704,14 @@ void requireCrossingOnCenterline(const TopoDS_Shape& conductor, const gp_Pnt& cr
     // land outside the copper along a face normal even for a perfectly centred wire, so the
     // offset is measured against the apothem -- still a tight centring bound (the probe sits
     // within ~1% of the real material boundary), just an honest one for a faceted section.
+    // ABT #860: segments <= 0 is the EXACT CIRCLE -- no flats, so the apothem IS the radius.
+    // Dividing pi by a zero segment count gave cos(inf) = NaN, and a NaN probe is inside
+    // nothing: the moment the default became analytic this helper failed four designs while
+    // the geometry was correct.
     const double sectionApothem =
-        wireRadius * std::cos(std::numbers::pi / mvb::DEFAULT_WIRE_POLYGON_SEGMENTS);
+        mvb::DEFAULT_WIRE_POLYGON_SEGMENTS > 0
+            ? wireRadius * std::cos(std::numbers::pi / mvb::DEFAULT_WIRE_POLYGON_SEGMENTS)
+            : wireRadius;
     for (const gp_Dir* d : {&perpA, &perpB}) {
         for (double sgn : {1.0, -1.0}) {
             gp_Pnt probe(crossing.XYZ() + d->XYZ() * (sgn * 0.99 * sectionApothem));

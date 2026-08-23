@@ -24,7 +24,27 @@ namespace OpenMagnetics { class Magnetic; }
 namespace mvb {
 
 constexpr int DEFAULT_CORE_POLYGON_SEGMENTS = 16;
-constexpr int DEFAULT_WIRE_POLYGON_SEGMENTS = 16;
+// WIRE CROSS-SECTIONS ARE EXACT BY DEFAULT (Alf, 2026-08-23). 0 = the true circle, which sweeps
+// to ANALYTIC surfaces (cylinder/torus); N > 0 approximates it by an N-gon prism, which sweeps to
+// N BSpline faces each carrying a pole per spine sample.
+//
+// The 16-gon was costing two orders of magnitude of memory for accuracy it did not buy. Measured
+// 2026-08-23 on the real-winding path, same design, only this value changed:
+//     01_simple_inductor_etd34_n87   23 turns    2,809 MB  ->    200 MB   (14x)
+//     14_dab_xfmr_pm8770_n97         96 turns   27,091 MB  ->     92 MB  (300x)
+// -- 120 to 280 MB of RAM PER TURN of 0.8 mm round wire, which is what took this box to 0 GB
+// available and, at a 16 GB ulimit, turns an allocation failure into a SEGFAULT inside OCC (it
+// certifies the design, then dies). The two discretisations were also unbalanced: the spine is
+// sampled to a sag of 2% of the wire radius (113-165 samples per revolution here) while the
+// 16-gon section is itself 1.9% off the true circle, so the fine sampling was holding an accuracy
+// the profile had already spent. See ABT #860.
+//
+// TRADE-OFF, deliberately taken: an exact circle revolves into a PERIODIC surface (the seam of a
+// cylinder/torus), and the faceted paths exist partly because gmsh refuses those ("Impossible to
+// mesh periodic surface" -- see MVB_SPLIT_PROFILE and DEFAULT_WIRE_REVOLUTION_SEGMENTS below).
+// Any consumer that needs node-conformal meshes should pass its own segment count rather than
+// rely on this default; the web already passes one explicitly.
+constexpr int DEFAULT_WIRE_POLYGON_SEGMENTS = 0;
 // Azimuthal segmentation of revolved wire turns. Even with a polygonal
 // cross-section, MakeRevol produces analytic surfaces of revolution that
 // STEP serialises as CYLINDRICAL/TOROIDAL_SURFACE. Setting this > 0 replaces

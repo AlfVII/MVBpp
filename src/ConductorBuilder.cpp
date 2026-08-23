@@ -1400,6 +1400,34 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
             const gp_Dir b = primFwdStart(*prims[i + 1], wireRadius);
             if (a.Angle(b) > 0.05) anyCorner = true;   // same tangency threshold as the mitre path
         }
+        //   RightCorner + a CLOSED CIRCULAR profile -- the third way TrimShellCorner fails, and
+        //                   the only one that corrupts the HEAP rather than crashing outright.
+        //                   ABT #860 (Alf, 2026-08-23: "every MAS must work either with 0
+        //                   segments or any number"). buck_inductor_complete's 63-primitive wrap
+        //                   run, swept with the exact circle (segments <= 0, hence a PERIODIC
+        //                   profile), makes BRepFill_TrimShellCorner::Perform raise
+        //                   BOPAlgo_AlertAcquiredSelfIntersection; freeing that alert list then
+        //                   dies inside glibc with a chunk size that is plainly a double bit
+        //                   pattern (av=0x0, size=4614275841924205936) -- i.e. the sweep wrote
+        //                   past an allocation. The symptom alternates between SIGABRT
+        //                   ("corrupted size vs. prev_size") and SIGSEGV run to run, which is how
+        //                   heap corruption announces itself. The SAME design at --segments 4 or
+        //                   8 builds CERTIFIED, so the trigger is the closed profile, not the
+        //                   design and not the corner alone (the corner is a legitimate 90 deg at
+        //                   a bend radius of 0.5093 mm on a 0.33 mm wire radius).
+        //                   There is no way to ask OCC whether it is about to corrupt the heap,
+        //                   so we decline the whole-run pipe here and let the caller's existing
+        //                   cascade (sweepRunChunked -> sweepPiecewise) build the same copper out
+        //                   of shorter spines that never enter the corner trimmer.
+        if (wirePolygonSegments <= 0 && !std::getenv("MVB_ALLOW_CLOSED_CORNER_PIPE")) {
+            bool corner = false;
+            for (size_t i = 0; i + 1 < count && !corner; ++i) {
+                const gp_Dir a = primFwdEnd(*prims[i], wireRadius);
+                const gp_Dir b = primFwdStart(*prims[i + 1], wireRadius);
+                if (a.Angle(b) > 0.05) corner = true;
+            }
+            if (corner) return TopoDS_Shape();
+        }
         ps.SetTransitionMode(anyCorner ? BRepBuilderAPI_RightCorner
                                        : BRepBuilderAPI_Transformed);
         ps.Add(prof);
