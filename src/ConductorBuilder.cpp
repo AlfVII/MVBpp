@@ -9362,7 +9362,19 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                      "the crossing azimuths in MKF.";
                             }
                         }
-                        throw std::runtime_error(m.str());
+                        // MVB_ALLOW_TILT_DEFICIT (diagnostic-only, ABT #865 review): build the
+                        // refused geometry anyway with the NATURAL tilt so the crossing chords can
+                        // be SEEN in a STEP. The exported copper interpenetrates — review only,
+                        // never mesh. Same house pattern as MVB_LEAD_NO_VALIDATE.
+                        if (std::getenv("MVB_ALLOW_TILT_DEFICIT")) {
+                            std::cerr << "[DIAGNOSTIC MVB_ALLOW_TILT_DEFICIT] proceeding past a "
+                                         "REFUSED tilt certification with the natural tilt — the "
+                                         "exported copper interpenetrates; review only:\n  "
+                                      << m.str() << std::endl;
+                        }
+                        else {
+                            throw std::runtime_error(m.str());
+                        }
                     }
                     if (std::getenv("MVB_TORO_ARC_DIAG")) {
                         std::cerr.precision(12);
@@ -9587,7 +9599,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                              "neighbouring corner arcs after relaxation: the coated envelopes "
                              "interpenetrate. Wires may touch at their coated envelopes, never "
                              "interpenetrate.";
-                        throw std::runtime_error(m.str());
+                        // Same diagnostic bypass as the tilt certification above (ABT #865
+                        // review): keep the wavefront's best heading and continue.
+                        if (std::getenv("MVB_ALLOW_TILT_DEFICIT")) {
+                            std::cerr << "[DIAGNOSTIC MVB_ALLOW_TILT_DEFICIT] proceeding past a "
+                                         "REFUSED corner relaxation — the exported copper "
+                                         "interpenetrates; review only:\n  "
+                                      << m.str() << std::endl;
+                        }
+                        else {
+                            throw std::runtime_error(m.str());
+                        }
                     }
                     for (size_t idx : mine) {
                         const auto& k = corners[idx];

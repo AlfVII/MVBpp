@@ -355,7 +355,11 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
     // latched from the IDEAL verdict before the blocking loop grows anything — so the only
     // signal died silently and the certified gate cannot see it (the displaced turns clear each
     // OTHER). Re-derive the final fit verdict here and refuse with MKF's own named reason.
-    if (useRealWindingGeometry) {
+    // MVB_ALLOW_SQUISH is the documented diagnostic opt-in to overflow (the gate above offers
+    // it); with it set the operator has ASKED to see the non-fitting geometry, so this refusal
+    // must stand down too — otherwise the bypass builds squished layouts but never overflowing
+    // ones, and the walk-out that motivated ABT #864 could not be exported for review at all.
+    if (useRealWindingGeometry && !std::getenv("MVB_ALLOW_SQUISH")) {
         auto& enrichedCoil = enriched.get_mutable_coil();
         const bool layoutFits = enrichedCoil.are_sections_and_layers_fitting();
         const bool copperInside = enrichedCoil.are_turns_inside_winding_window();
