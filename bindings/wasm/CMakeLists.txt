@@ -100,6 +100,26 @@ set(INCLUDE_PYMKF     OFF CACHE BOOL "" FORCE)
 set(ENABLE_MATPLOTPP  OFF CACHE BOOL "" FORCE)
 set(ENABLE_NGSPICE    OFF CACHE BOOL "" FORCE)
 
+# ABT #852 — do NOT embed the finished-core inventory in the drawing engine.
+#
+# MKF's cmrc `data` archive is force-linked whole (see --whole-archive below), so every
+# catalog listed in MKF's DATA_LIST lands in the wasm DATA section whether it is read or
+# not. mvbpp DRAWS geometry; it never looks up a core part number: nothing in MVB++ or in
+# its bindings calls load_cores / find_core_by_name / get_core_shape_names(manufacturer),
+# and no adviser or cross-referencer (the only MKF callers of those) is reachable from a
+# draw entry point. The two inventory files are 9.48 MB of the engine — 19% of it — read
+# by nobody:
+#     MAS/data/cores.ndjson        8.20 MB
+#     MAS/data/cores_stock.ndjson  1.28 MB
+# Measured on the 2026-08-22 engine: 49.75 MB -> 40.27 MB raw (-19.0%), 10.52 -> 10.14 MB
+# gzipped, with byte-identical drawCore/drawTurns/drawMagnetic output on cm37 and the
+# tests/mas_complete_fixtures battery.
+#
+# The catalogs mvbpp DOES read stay embedded: core_shapes (Core::resolve_shape),
+# core_materials (Core::resolve_material), wires, wire_materials, bobbins and
+# insulation_materials all resolve name references in the MAS files the app hands us.
+set(EMBED_MAS_CORES OFF CACHE BOOL "" FORCE)
+
 set(_MAS_LOCAL "https://github.com/OpenMagnetics/MAS.git")
 set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
 
