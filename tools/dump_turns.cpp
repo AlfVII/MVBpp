@@ -7,6 +7,7 @@
 #include <iostream>
 #include <cmath>
 #include <numbers>
+#include <cstdlib>
 
 using json = nlohmann::json;
 
@@ -17,7 +18,8 @@ int main(int argc, char* argv[]) {
     json j; f >> j;
     mvb::patch_dimension_nominals(j);
     json magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
-    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson);
+    const bool real = std::getenv("MVB_DUMP_REAL") != nullptr;
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, real);
 
     std::string filter = (argc > 2) ? argv[2] : "";
     auto turnsOpt = enriched.get_coil().get_turns_description();

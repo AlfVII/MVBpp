@@ -8715,6 +8715,69 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                            coatedRw, ct2.winding, ct2.parallel, i});
                     }
                 }
+                // THE OUTER CROSSINGS ARE PINNED DATA -- AUDIT THEM BEFORE SOLVING THE CORNERS.
+                // A corner's footprint runs all the way to the rim crossing its face chord ends
+                // on (pout), and pout is MKF's drawn value: no corner heading, and nothing else
+                // MVB++ owns, can move it. So when two crossings are drawn on top of each other
+                // the corner solve is infeasible for a reason that has nothing to do with corner
+                // tilt -- and the tilt refusal below then says "no tilt within 15 deg certifies",
+                // which reads as a builder limitation and sent a month of ABT #374 into toroidal
+                // LEAD routing. Name the drawn pieces instead.
+                //
+                // Measured (ABT #374, 2026-08-23) on both red [realwinding] toroids: MKF runs its
+                // outer-crossing lean/rest/collision sweep only when !isFirstConductionLayer
+                // (Coil.cpp wind_toroidal_additional_turns), so the FIRST ring's crossings are
+                // never collision-checked. Regular first-ring turns survive that because their
+                // crossings inherit the stations' monotone half-step; the ring-CLOSING "_ending"
+                // station does not -- its half-step is taken toward the NEXT RING's first
+                // station, a jump of tens of degrees that lands the crossing on an earlier turn's:
+                //   realwinding_toroid_3in    turn 26_ending  vs turn 0   0.1904 mm  (envelope 2.074)
+                //   realwinding_cmc_3w_2layer Secondary 10_ending vs turn 7  0.6469 mm (envelope 1.468)
+                //   realwinding_cmc_3w_2layer Tertiary   8_ending vs turn 5  0.9025 mm (envelope 1.468)
+                // Both crossings are vertical tubes at the same radius spanning the same core
+                // height, so no Z path separates them either. Refused, per "MVB++ always follows
+                // MKF geometry": a drawn value MVB++ cannot honour is an MKF defect, not ours to
+                // absorb.
+                {
+                    struct DrawnCrossing {
+                        gp_XY p;
+                        double coatedRw;
+                        std::string name;
+                    };
+                    std::vector<DrawnCrossing> crossings;
+                    for (const auto& ct2 : conductors) {
+                        if (ct2.turns.empty()) continue;
+                        auto [cw2, ch2] = TurnBuilder::wireDimensions(wireMap.at(ct2.winding),
+                                                                      *ct2.turns.front(), true);
+                        const double crw = 0.5 * std::min(cw2, ch2);
+                        for (const MAS::Turn* t : ct2.turns) {
+                            auto add = t->get_additional_coordinates();
+                            if (!(add && !add->empty() && (*add)[0].size() >= 2)) continue;
+                            crossings.push_back({gp_XY((*add)[0][0], (*add)[0][1]), crw,
+                                                 t->get_name()});
+                        }
+                    }
+                    for (size_t a2 = 0; a2 + 1 < crossings.size(); ++a2) {
+                        for (size_t b2 = a2 + 1; b2 < crossings.size(); ++b2) {
+                            const double E2 = crossings[a2].coatedRw + crossings[b2].coatedRw;
+                            const double D = (crossings[a2].p - crossings[b2].p).Modulus();
+                            if (D >= E2 - kCertEpsilon) continue;
+                            std::ostringstream m;
+                            m.precision(6);
+                            m << "ConductorBuilder: MKF drew the outer rim crossings of '"
+                              << crossings[a2].name << "' and '" << crossings[b2].name
+                              << "' " << D * 1e3 << " mm apart, inside their coated envelope of "
+                              << E2 * 1e3 << " mm. Both are vertical tubes down the outer wall over "
+                                 "the same core height, so neither a corner heading nor a Z path can "
+                                 "separate them -- the crossing azimuth/radius is drawn data and MVB++ "
+                                 "never moves a drawn value. Fix the layout in MKF (a ring-closing "
+                                 "'_ending' station takes its half-step toward the NEXT ring's first "
+                                 "station, and wind_toroidal_additional_turns skips its lean/rest/"
+                                 "collision sweep on the first conduction layer).";
+                            throw std::runtime_error(m.str());
+                        }
+                    }
+                }
                 auto rotated = [](const gp_XY& d, double rad) {
                     return gp_XY(d.X() * std::cos(rad) - d.Y() * std::sin(rad),
                                  d.X() * std::sin(rad) + d.Y() * std::cos(rad));
@@ -9008,6 +9071,37 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         return worst;
                     };
                     const double before = sampledMinAt(tilt0);
+                    if (std::getenv("MVB_TORO_ARC_DIAG")) {
+                        std::vector<std::tuple<double, size_t, size_t>> ranked;
+                        for (const auto& [ia, ib] : pairIndices) {
+                            const double E2 = corners[ia].coatedRw + corners[ib].coatedRw;
+                            ranked.push_back({footPairMin(corners[ia], dirAt(ia, tilt0),
+                                                          corners[ib], dirAt(ib, tilt0)) -
+                                                  E2,
+                                              ia, ib});
+                        }
+                        std::sort(ranked.begin(), ranked.end());
+                        std::cerr.precision(6);
+                        std::cerr << "[worst] " << (top ? "top" : "bottom") << " half, "
+                                  << pairIndices.size() << " pairs of " << half.size()
+                                  << " corners" << std::endl;
+                        for (size_t q = 0; q < ranked.size() && q < 8; ++q) {
+                            const auto& A = corners[std::get<1>(ranked[q])];
+                            const auto& B = corners[std::get<2>(ranked[q])];
+                            std::cerr << "   slack " << std::get<0>(ranked[q]) * 1e3 << " mm  "
+                                      << A.winding << " p" << A.parallel << " t" << A.transition
+                                      << " ring" << A.ring << " r=" << A.station.Modulus() * 1e3
+                                      << " az=" << std::atan2(A.station.Y(), A.station.X()) * 180.0 / kPi
+                                      << "  VS  " << B.winding << " p" << B.parallel << " t"
+                                      << B.transition << " ring" << B.ring
+                                      << " r=" << B.station.Modulus() * 1e3
+                                      << " az=" << std::atan2(B.station.Y(), B.station.X()) * 180.0 / kPi
+                                      << "  |station gap| "
+                                      << (A.station - B.station).Modulus() * 1e3
+                                      << " mm, E " << (A.coatedRw + B.coatedRw) * 1e3
+                                      << " mm, bend " << A.bend * 1e3 << std::endl;
+                        }
+                    }
                     double chosenTilt = tilt0;
                     bool found = false;
                     for (int n = 0; n <= 60 && !found; ++n) {   // 0.25 deg steps to +/-15
@@ -9051,7 +9145,25 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         if (n == 0 && found) break;
                     }
                     if (!found) {
+                        // NAME THE PAIR, AND SAY WHICH END IS PINNED. The tilt only steers a
+                        // corner's NEAR end; the face chord it drags is anchored at the rim
+                        // crossing MKF drew. A pair whose chords already cross out in the face
+                        // is therefore not a tilt problem at all, and reporting only the deficit
+                        // reads as one -- which is how ABT #374 spent a month on lead routing.
+                        size_t wa = 0, wb = 0;
+                        double worstSlack = std::numeric_limits<double>::max();
+                        for (const auto& [ia, ib] : pairIndices) {
+                            const double E2 = corners[ia].coatedRw + corners[ib].coatedRw;
+                            const double slack = footPairMin(corners[ia], dirAt(ia, tilt0),
+                                                             corners[ib], dirAt(ib, tilt0)) - E2;
+                            if (slack < worstSlack) {
+                                worstSlack = slack;
+                                wa = ia;
+                                wb = ib;
+                            }
+                        }
                         std::ostringstream m;
+                        m.precision(6);
                         m << "ConductorBuilder: no common absolute corner tilt within 15 deg of "
                              "the natural tangents certifies the "
                           << (top ? "top" : "bottom")
@@ -9059,6 +9171,32 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                              "tilt gives a certified worst pair "
                           << before << " m short). Wires may touch at their coated envelopes, "
                              "never interpenetrate.";
+                        if (worstSlack < std::numeric_limits<double>::max()) {
+                            const auto& A = corners[wa];
+                            const auto& B = corners[wb];
+                            const double stationGap = (A.station - B.station).Modulus();
+                            const double poutGap = (A.pout - B.pout).Modulus();
+                            const double E2 = A.coatedRw + B.coatedRw;
+                            m << " The worst pair is " << A.winding << " parallel " << A.parallel
+                              << " transition " << A.transition << " and " << B.winding
+                              << " parallel " << B.parallel << " transition " << B.transition
+                              << " (ring " << A.ring << "): stations " << stationGap * 1e3
+                              << " mm apart, rim crossings " << poutGap * 1e3
+                              << " mm apart, coated envelope " << E2 * 1e3 << " mm.";
+                            if (poutGap < E2 - kCertEpsilon || stationGap < E2 - kCertEpsilon) {
+                                m << " BOTH ENDS OF THAT PAIR ARE MKF-DRAWN DATA and already closer "
+                                     "than the envelope, so no corner tilt can separate them -- fix "
+                                     "the layout in MKF, not the corner solve.";
+                            }
+                            else {
+                                m << " Both ends clear, so the two FACE CHORDS cross between them: "
+                                     "each chord runs from its own drawn station to its own drawn rim "
+                                     "crossing at this ring's single face height, and the tilt only "
+                                     "steers the near end. A ring whose closing chord spans back "
+                                     "across the ring's own turns cannot be resolved by tilt -- fix "
+                                     "the crossing azimuths in MKF.";
+                            }
+                        }
                         throw std::runtime_error(m.str());
                     }
                     if (std::getenv("MVB_TORO_ARC_DIAG")) {
