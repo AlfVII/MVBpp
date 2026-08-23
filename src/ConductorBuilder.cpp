@@ -6286,6 +6286,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             bool entrance;     // leads
             double r;          // innermost radius of the vertical run
             double y0, y1;     // axial extent of the run (y0 <= y1)
+            // ABT #841: the UNDIPPED extent -- y0/y1 as MKF's drawn route gives them, before
+            // any pitch-true dip has been applied. The slot permutations must key off THIS,
+            // never off y0/y1: those carry the dip, the dip is a function of the slot, and a
+            // sort key that reads it makes runPack() a different function on every pass (see
+            // the bundle re-order below).
+            double y0Ideal = 0.0, y1Ideal = 0.0;
             double rw;         // COATED wire radius -- slot clearance is physical
             double rwBare;     // bare-copper radius -- what the collision gate enforces
             // ABT #685 PITCH-TRUE DIP (Alf, 2026-08-16): the conductor's first/last wrap
@@ -6949,6 +6955,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             return a.y0 < b.y0;
         });
+        // ABT #841: freeze the undipped extents HERE -- after the placement order is fixed and
+        // before the first pack, so nothing downstream can key an ORDER off a quantity the dip
+        // refinement itself moves. (This sort above is already outside runPack and therefore
+        // already pass-stable; the bundle re-order inside runPack was not.)
+        for (auto& v : verts) { v.y0Ideal = v.y0; v.y1Ideal = v.y1; }
+        // ABT #841 bisect switch: put the permutation keys back on the DIPPED extents (and the
+        // dip loop back to accumulating them), so the instability this ticket fixes can be
+        // re-measured on demand. On its own it reproduces the REVERTED experiment -- unstable
+        // keys, eight passes -- which is what prints [fan-perm] UNSTABLE on 14_dab. Together
+        // with MVB_NO_DIP_FIXPOINT it reproduces the pre-fix code exactly.
+        const bool dippedPermKeys = std::getenv("MVB_NO_STABLE_FAN_PERM") != nullptr;
         // Forbidden azimuth intervals per LEAD: a lead runs radially at its own row, crossing
         // every ring band outside its attachment, and the wire rising from a nearby crossed
         // row DRIFTS in y with azimuth (its wrap's pitch). Where that drift brings the wire
@@ -7051,9 +7068,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
         std::vector<double> az(verts.size(), 0.0);
         std::vector<char> azAssigned(verts.size(), 0);
+        // ABT #841: the slot PERMUTATION this pack produced, as a signature -- see the proof
+        // obligation at the call sites.
+        std::string permSig;
         auto runPack = [&]() {
         std::fill(az.begin(), az.end(), 0.0);
         std::fill(azAssigned.begin(), azAssigned.end(), 0);
+        permSig.clear();
         // BLOCK ALLOCATION for lead groups (Alf, 2026-08-15: "don't do shortest first, allocate
         // the 4 of them together always, so that the spirals then are parallel"). A winding's
         // leads of one SIDE are one physical bundle: they are placed TOGETHER as a contiguous
@@ -7536,15 +7557,32 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // one and climbs into the bridge's TOP end: measured 0.000 mm, a real
                 // intersection, against 0.904 mm this way. Ties keep Alf's rule, lower turn
                 // further round in -X.
+                // ABT #841 PASS-STABLE KEY. "Which lead has to bridge furthest" is a fact about
+                // MKF'S DRAWN ROUTE -- where the terminal row sits against the turn it feeds --
+                // and it is settled before any slot exists. Keying it on the LIVE y1-y0 read the
+                // pitch-true dip instead, and the dip is a function of the slot this very
+                // permutation hands out: on the second pack of 14_dab the four Primary members
+                // re-sorted to (3,0,2,1) and the slots came out -12.53 / -17.68 / -15.09 /
+                // -9.996 deg -- parallel 1 flung furthest out, its lead routed across parallel
+                // 0's 'turn 11 -> turn 11_ending' wrap, a HARD BARE-COPPER collision. So the key
+                // is the UNDIPPED span: runPack() is then idempotent in ordering and only the
+                // anchor moves, which is the precondition for iterating the dip to a fixpoint
+                // (ABT #841, Alf's "make the permutation pass-stable first").
                 std::sort(members.begin(), members.end(), [&](size_t a, size_t b) {
-                    const double spanA = verts[a].y1 - verts[a].y0;
-                    const double spanB = verts[b].y1 - verts[b].y0;
+                    const double spanA = dippedPermKeys ? verts[a].y1 - verts[a].y0
+                                                        : verts[a].y1Ideal - verts[a].y0Ideal;
+                    const double spanB = dippedPermKeys ? verts[b].y1 - verts[b].y0
+                                                        : verts[b].y1Ideal - verts[b].y0Ideal;
                     if (std::abs(spanA - spanB) > 1e-12) {
                         return entranceSide == 0 ? spanA < spanB : spanA > spanB;
                     }
                     return verts[a].attachY < verts[b].attachY;
                 });
                 for (size_t m = 0; m < members.size(); ++m) az[members[m]] = slots[m];
+                for (size_t m = 0; m < members.size(); ++m) {
+                    permSig += " L" + std::to_string(entranceSide) + ":" +
+                               std::to_string(members[m]);
+                }
             }
         }
         // CLIMB-AWARE SLOT ORDER for sibling dragbacks (Alf's 14_dab). The slots are correct in
@@ -7591,24 +7629,60 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 std::sort(slots.begin(), slots.end());
                 // destination station height (a return lands at its low end when it descends)
                 std::sort(group.begin(), group.end(), [&](size_t x, size_t y) {
-                    return advance > 0.0 ? verts[x].y0 > verts[y].y0
-                                         : verts[x].y0 < verts[y].y0;
+                    // ABT #841: dragbacks are never dipped (the refinement touches kind 0 only),
+                    // so y0 here IS the undipped extent -- Ideal is used anyway so the invariant
+                    // "no permutation key reads a dip" is checkable by grep, not by argument.
+                    return advance > 0.0 ? verts[x].y0Ideal > verts[y].y0Ideal
+                                         : verts[x].y0Ideal < verts[y].y0Ideal;
                 });
                 for (size_t g = 0; g < group.size(); ++g) az[group[g]] = slots[g];
+                for (size_t g = 0; g < group.size(); ++g)
+                    permSig += " D:" + std::to_string(group[g]);
             }
         }
         };   // runPack
+        // ABT #841 PROOF OBLIGATION. runPack() hands out slots AND permutes them (the lead
+        // bundle's lower-turn-furthest-in--X re-order, the climb-aware dragback order). Iterating
+        // the dip refinement is only sound while that permutation is a FIXED function of the
+        // input geometry -- otherwise every pass reshuffles the lanes and the iteration chases
+        // its own tail (ABT #841: the eight-pass experiment converged on paper and emitted a hard
+        // bare-copper collision). `permSig` is the concatenated permutation; it is compared
+        // across passes below and reported under MVB_LEAD_DIAG.
         runPack();
+        const std::string permSigFirst = permSig;
         // ABT #685 PITCH-TRUE DIP REFINEMENT (Alf, 2026-08-16). The emission attaches each lead
         // where the helix truly is at its slot (entranceAttachY / exitAttachY) — up to
         // advance*delta/2pi off the flat station the fan modelled. With big multi-filar pitches
         // the dip dwarfs MKF's packed margins (pushpull: 178 um dip vs a 28 um margin between
         // S1's first turn and P2's run row), so routes the fan called disjoint interpenetrate
         // once drawn. The slot is needed to know the dip and the dip changes the packing — so:
-        // pack, apply the REAL dips at the assigned slots, and repack once if any pair's
-        // clearance is violated. A second application after the repack updates the routes to
-        // the final slots; the collision gate keeps the final word.
-        for (int dipPass = 0; dipPass < 2; ++dipPass) {
+        // pack, apply the REAL dips at the assigned slots, and repack if any pair's clearance is
+        // violated.
+        //
+        // ABT #841 TO THE FIXPOINT (Alf: "make the permutation pass-stable first, then iterate").
+        // Two passes were never a fixpoint -- the dip depends on the slot and the slot depends on
+        // the dipped routes -- and on 14_dab the residue it handed to the gate was real copper:
+        // the Secondary's entrance lead met its own exit stub at 854.404 um against an 855 um
+        // coated envelope, 596.359 nm inside. need() had already FOUND that pair honestly
+        // (routeDist 0.8477 mm, asking sqrt(dSep^2 - dRoute^2) = 0.1115 mm of X where only
+        // 0.0866 mm was delivered); the fan simply ran out of passes to answer it.
+        //
+        // Iterating is sound only now that the permutation is pass-stable (above): with the lane
+        // ORDER fixed, each pass moves only the anchor, so the map slot -> dip -> slot is a
+        // genuine iteration instead of a reshuffle. Two guards, no silent fallback: stop the
+        // moment the slots stop moving (a true fixpoint -- any further pass is the same pass),
+        // and cap the passes so a non-converging design cannot spin. Either way the loop ends
+        // with the dips applied AT the final slots, and whatever is left is the gate's to report,
+        // exactly as before.
+        const int kMaxDipPasses = std::getenv("MVB_NO_DIP_FIXPOINT") != nullptr ? 2 : 8;
+        // ABT #841 PROOF HARNESS, diagnostic only. The permutation check below can only fire on a
+        // design that actually repacks, and most of the corpus converges on the first pass -- so
+        // "no design printed UNSTABLE" would be a weak claim. This switch runs the full pass
+        // budget whether or not anything is violated, which exercises the dip -> slot coupling on
+        // every design and makes the stability claim checkable corpus-wide. It MOVES SLOTS that
+        // the design did not need moved, so it is never for production geometry.
+        const bool permProof = std::getenv("MVB_FAN_PERM_PROOF") != nullptr;
+        for (int dipPass = 0; dipPass < kMaxDipPasses; ++dipPass) {
             bool dipViolated = false;
             for (size_t k = 0; k < verts.size(); ++k) {
                 Vert& v = verts[k];
@@ -7627,8 +7701,19 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                  v.attachAdvance * 1e3, dip * 1e3, v.attachSegIdeal[1] * 1e3,
                                  seg[1] * 1e3);
                 v.segs.front() = seg;
-                v.y0 = std::min(v.y0, seg[1]);
-                v.y1 = std::max(v.y1, seg[1]);
+                // ABT #841: recompute from the UNDIPPED extent, never accumulate. Folding each
+                // pass's dip into the previous pass's y0/y1 made the extent a function of the
+                // iteration's HISTORY -- it could only ever grow, so a slot that came back toward
+                // the plane never gave its span back. A fixpoint needs the state to be a function
+                // of the current slots alone. (Under MVB_NO_STABLE_FAN_PERM the old accumulation
+                // is kept, so the bisect switch really does restore the old behaviour.)
+                if (dippedPermKeys) {
+                    v.y0 = std::min(v.y0, seg[1]);
+                    v.y1 = std::max(v.y1, seg[1]);
+                } else {
+                    v.y0 = std::min(v.y0Ideal, seg[1]);
+                    v.y1 = std::max(v.y1Ideal, seg[1]);
+                }
             }
             for (size_t j = 0; j + 1 < verts.size() && !dipViolated; ++j) {
                 if (verts[j].kind == 2) continue;
@@ -7644,10 +7729,49 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     }
                 }
             }
-            if (std::getenv("MVB_DRAG_DIAG"))
+            if (std::getenv("MVB_DRAG_DIAG") || std::getenv("MVB_LEAD_DIAG"))
                 std::fprintf(stderr, "[dip] pass=%d violated=%d\n", dipPass, int(dipViolated));
-            if (!dipViolated) break;
-            if (dipPass == 0) runPack();
+            if (!dipViolated && !permProof) break;
+            if (dipPass + 1 >= kMaxDipPasses) break;
+            const std::vector<double> azBefore = az;
+            runPack();
+            // ABT #841: the permutation must be the SAME permutation on every pass -- that is the
+            // precondition this whole loop rests on, so it is checked, not assumed.
+            if (permSig != permSigFirst) {
+                std::fprintf(stderr,
+                             "[fan-perm] UNSTABLE at dip pass %d: the slot permutation changed "
+                             "between packs. Lane order must not depend on the dip.\n", dipPass);
+                if (std::getenv("MVB_LEAD_DIAG"))
+                    std::fprintf(stderr, "[fan-perm]   first='%s'\n[fan-perm]   now  ='%s'\n",
+                                 permSigFirst.c_str(), permSig.c_str());
+            } else if (std::getenv("MVB_LEAD_DIAG") || permProof) {
+                std::fprintf(stderr, "[fan-perm] pass=%d stable\n", dipPass);
+            }
+            // A pack that moved nothing is the fixpoint: the next pass would compute the same
+            // dips from the same slots and repack to the same place. Stop and let the gate
+            // report whatever the geometry genuinely cannot resolve.
+            bool moved = azBefore.size() != az.size();
+            for (size_t k = 0; !moved && k < az.size(); ++k)
+                if (std::abs(az[k] - azBefore[k]) > 1e-12) moved = true;
+            if (!moved && !permProof) {
+                if (std::getenv("MVB_DRAG_DIAG") || std::getenv("MVB_LEAD_DIAG"))
+                    std::fprintf(stderr, "[dip] fixpoint at pass=%d (slots unchanged)\n", dipPass);
+                // Re-apply the dips at these (unchanged) slots so the routes leaving this loop
+                // always match the slots that were finally chosen.
+                for (size_t k = 0; k < verts.size(); ++k) {
+                    Vert& v = verts[k];
+                    if (v.kind != 0 || !v.hasAttachSeg || v.attachAdvance == 0.0) continue;
+                    auto seg = v.attachSegIdeal;
+                    const double dip = v.attachAdvance * (std::abs(az[k]) / kTwoPi);
+                    seg[1] += v.entrance ? -dip : dip;
+                    v.segs.front() = seg;
+                    if (!dippedPermKeys) {
+                        v.y0 = std::min(v.y0Ideal, seg[1]);
+                        v.y1 = std::max(v.y1Ideal, seg[1]);
+                    }
+                }
+                break;
+            }
         }
         // ABT #839 mechanism C: stub sweep caps. An ENTRANCE stub sweeps forward from its
         // slot (increasing az); an EXIT stub sweeps backward from its slot (the arc occupies

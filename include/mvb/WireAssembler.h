@@ -155,6 +155,9 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& centreline, doubl
 // Sampling / geometry queries on a centreline piece, shared by the chunk builders and the
 // collision gate. Pure measurement — they build no copper.
 int curveSampleCount(double radius, double azSpan, double wireRadius);
+// A SPIRAL is not an arc: its radius (and height) run while its azimuth turns, so the
+// azimuthal rule above under-samples it. See the definition for the derivation.
+int spiralSampleCount(const Spiral& sp, double wireRadius);
 std::vector<gp_Pnt> samplePrim(const Primitive& p, double wireRadius);
 std::pair<gp_Pnt, gp_Pnt> primEndpoints(const Primitive& p);
 gp_Dir primFwdStart(const Primitive& p, double r);

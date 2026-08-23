@@ -108,6 +108,57 @@ int curveSampleCount(double radius, double azSpan, double wireRadius) {
     return std::max(2, static_cast<int>(std::ceil(azSpan / stepAz)) + 1);
 }
 
+// A SPIRAL'S SAMPLING IS NOT A CIRCLE'S. ABT #373 (:818, Alf 2026-08-23). curveSampleCount
+// sizes its step from the AZIMUTHAL geometry alone -- radius x azimuth -- which is exactly
+// right for an arc or a helix and badly wrong for a spiral whose RADIUS runs while its azimuth
+// barely turns. Measured on the FEM toroid's face crossing (realwinding_toroid, wrap
+// 'turn 6' -> 'turn 7' bottom chord): 7.98 mm of copper travelled across 0.0377 rad, radius
+// 19.978 -> 12.023 mm. The circle rule saw a 0.86 mm arc and returned TWO samples, so the
+// "spiral" was emitted as a straight two-point chord -- the very shape faceSpiral exists to
+// replace (ABT #685) -- and, worse, its swept end tangents were then the spiral's START
+// tangent at BOTH ends while the assembler mitred the joint against the analytic END tangent.
+// The junction reported 3.6e-11 deg (tangent, bridged, uncut) and was really a 4.21 deg corner:
+// the chord and the following bottom-inner-corner arc interpenetrated by (2/3) r^3 tan(4.21 deg)
+// = 0.0051 mm^3 (measured 0.00512 mm^3, 3050/216000 strict-IN grid points).
+//
+// The step therefore comes from the curve's OWN speed and curvature. For
+// P(u) = (cx + r cos u, y, cz - r sin u) with r' = k and y' = m,
+//     |P'| = sqrt(k^2 + r^2 + m^2)
+//     kappa = sqrt(m^2 (4k^2 + r^2) + (2k^2 + r^2)^2) / (k^2 + r^2 + m^2)^(3/2)
+// and a chord of length L sags by L^2 kappa / 8, so the admissible parameter step is
+// sqrt(8 sag / kappa) / |P'|. For k = m = 0 that reduces to sqrt(8 sag / r), which is the
+// small-angle form of curveSampleCount's own 2 acos(1 - sag/r): arcs and helices are sampled
+// EXACTLY as before. The circle rule is kept as a floor so no primitive anywhere can come out
+// coarser than it does today; the same [1e-3, 0.2] step clamp applies, for the same reason.
+int spiralSampleCount(const Spiral& sp, double wireRadius) {
+    const double dAz = sp.az1 - sp.az0;
+    const double azSpan = std::abs(dAz);
+    int n = curveSampleCount(std::max(sp.r0, sp.r1), azSpan, wireRadius);
+    if (azSpan < 1e-12) return n;
+    const double maxSag = samplingSag(wireRadius);
+    // The blend's r and y advance with f'(t), so k and m are read LOCALLY at each station.
+    constexpr int kStations = 9;
+    double stepAz = std::numeric_limits<double>::max();
+    for (int i = 0; i < kStations; ++i) {
+        const double t = static_cast<double>(i) / (kStations - 1);
+        const double f = sp.blend ? 0.5 * (1.0 - std::cos(kPi * t)) : t;
+        const double fp = sp.blend ? 0.5 * kPi * std::sin(kPi * t) : 1.0;
+        const double r = sp.r0 + (sp.r1 - sp.r0) * f;
+        const double k = (sp.r1 - sp.r0) * fp / dAz;
+        const double m = (sp.y1 - sp.y0) * fp / dAz;
+        const double speed2 = k * k + r * r + m * m;
+        if (speed2 < 1e-24) continue;
+        const double quad = 2.0 * k * k + r * r;
+        const double kappa =
+            std::sqrt(m * m * (4.0 * k * k + r * r) + quad * quad) / (speed2 * std::sqrt(speed2));
+        if (kappa < 1e-12) continue;   // locally straight: no sag to bound
+        stepAz = std::min(stepAz, std::sqrt(8.0 * maxSag / kappa) / std::sqrt(speed2));
+    }
+    if (stepAz == std::numeric_limits<double>::max()) return n;
+    stepAz = std::clamp(stepAz, 1e-3, 0.2);
+    return std::max(n, static_cast<int>(std::ceil(azSpan / stepAz)) + 1);
+}
+
 std::vector<gp_Pnt> samplePrim(const Primitive& p, double wireRadius) {
     if (p.kind == Primitive::SEG) return {p.seg.a, p.seg.b};
     if (p.kind == Primitive::ARC3) {
@@ -146,7 +197,7 @@ std::vector<gp_Pnt> samplePrim(const Primitive& p, double wireRadius) {
         return pts;
     }
     const Spiral& sp = p.spiral;
-    int n = curveSampleCount(std::max(sp.r0, sp.r1), std::abs(sp.az1 - sp.az0), wireRadius);
+    int n = spiralSampleCount(sp, wireRadius);
     std::vector<gp_Pnt> pts;
     pts.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
@@ -376,28 +427,58 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                 return TopoDS_Edge();
             }
         }
-        if (sp.blend) {
-            // Flat blended spiral (radius varies at constant height): a 2D spiral in
-            // the horizontal plane's parameter space, interpolated with exact azimuthal
-            // end tangents.
+        // FLAT SPIRAL (radius varies at exactly constant height) -- blended OR linear.
+        // A 2D curve in the horizontal plane's parameter space, interpolated with the EXACT
+        // analytic end tangents.
+        //
+        // ABT #373 (:818): the LINEAR case used to fall through to a 3D BSpline through
+        // samplePrim's points, and on a toroid's face crossing samplePrim returned TWO of them
+        // (see spiralSampleCount) -- so the emitted piece was a straight chord swept by
+        // MakePipeShell along a straight spine, which carries the START tangent's section to
+        // BOTH ends. The assembler, meanwhile, mitres against spiralTangent's analytic END
+        // tangent. On realwinding_toroid's 'turn 6' -> 'turn 7' bottom chord those differ by the
+        // spiral's whole turning, 4.21 deg: the joint was read as tangent (3.6e-11 deg, bridged,
+        // uncut) and the chord and the bottom-inner-corner arc interpenetrated by 0.00512 mm^3.
+        // Interpolating in the plane with the analytic tangents IMPOSED makes the swept end
+        // tangent equal the one the junction logic uses, by construction -- which is what
+        // "neighbours meet on the plane bisecting their tangents" requires.
+        {
+            const double dAz = sp.az1 - sp.az0;
+            // No azimuthal advance at all: the locus IS the straight radial segment between the
+            // endpoints (r linear, y and az constant), and that is the exact edge for it --
+            // faceSpiralTangent reports the same purely radial direction for this case.
+            if (std::abs(dAz) < 1e-12) {
+                const auto ends = primEndpoints(pr);
+                if (ends.first.Distance(ends.second) < 1e-12) return TopoDS_Edge();
+                return BRepBuilderAPI_MakeEdge(ends.first, ends.second).Edge();
+            }
             try {
                 gp_Ax3 frame(gp_Pnt(sp.cx, sp.y0, sp.cz), gp_Dir(0, 1, 0),
                              gp_Dir(1, 0, 0));
                 Handle(Geom_Plane) plane = new Geom_Plane(frame);
                 // Plane P(U,V) = O + U XDir + V YDir with YDir = -Z, so the azPointC
                 // trace maps to (U, V) = (r cos az, r sin az).
-                int n = curveSampleCount(std::max(sp.r0, sp.r1),
-                                         std::abs(sp.az1 - sp.az0), wireRadius);
+                int n = spiralSampleCount(sp, wireRadius);
                 Handle(TColgp_HArray1OfPnt2d) arr = new TColgp_HArray1OfPnt2d(1, n);
                 for (int i = 0; i < n; ++i) {
                     double t = static_cast<double>(i) / (n - 1);
-                    double f = 0.5 * (1.0 - std::cos(kPi * t));
-                    double az = sp.az0 + (sp.az1 - sp.az0) * t;
+                    double f = sp.blend ? 0.5 * (1.0 - std::cos(kPi * t)) : t;
+                    double az = sp.az0 + dAz * t;
                     double r = sp.r0 + dr * f;
                     arr->SetValue(i + 1, gp_Pnt2d(r * std::cos(az), r * std::sin(az)));
                 }
-                gp_Vec2d ta(-std::sin(sp.az0), std::cos(sp.az0));
-                gp_Vec2d tb(-std::sin(sp.az1), std::cos(sp.az1));
+                // d/dt (r cos az, r sin az) with az' = dAz and r' = dr f'(t). A cosine blend has
+                // f'(0) = f'(1) = 0, so this reduces to dAz * r * (-sin az, cos az) -- the purely
+                // azimuthal tangent the blend has always been given, now carrying dAz's SIGN as
+                // well (a spiral running the other way round was previously handed a reversed
+                // end tangent).
+                auto tangentAt = [&](double az, double r, double rp) {
+                    return gp_Vec2d(rp * std::cos(az) - r * dAz * std::sin(az),
+                                    rp * std::sin(az) + r * dAz * std::cos(az));
+                };
+                const double rp = sp.blend ? 0.0 : dr;
+                gp_Vec2d ta = tangentAt(sp.az0, sp.r0, rp);
+                gp_Vec2d tb = tangentAt(sp.az1, sp.r1, rp);
                 Geom2dAPI_Interpolate interp(arr, Standard_False, 1e-12);
                 interp.Load(ta, tb, Standard_True);
                 interp.Perform();
@@ -409,7 +490,6 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                 return TopoDS_Edge();
             }
         }
-        // Flat LINEAR spiral: falls through to the sampled BSpline below.
     }
     if (pr.kind == Primitive::BLEND) {
         // The S-blend is PLANAR (the longitudinal direction and the offset span one
@@ -448,20 +528,15 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
             return TopoDS_Edge();
         }
     }
-    // Flat varying-radius spirals at exactly constant height: approximated BSpline
-    // through the sampled centreline.
-    auto pts = samplePrim(pr, wireRadius);
-    if (pts.size() < 2) return TopoDS_Edge();
-    try {
-        TColgp_Array1OfPnt arr(1, static_cast<Standard_Integer>(pts.size()));
-        for (size_t i = 0; i < pts.size(); ++i)
-            arr.SetValue(static_cast<Standard_Integer>(i + 1), pts[i]);
-        Handle(Geom_BSplineCurve) bs = GeomAPI_PointsToBSpline(arr).Curve();
-        if (bs.IsNull()) return TopoDS_Edge();
-        return BRepBuilderAPI_MakeEdge(bs).Edge();
-    } catch (const Standard_Failure&) {
-        return TopoDS_Edge();
-    }
+    // Every kind returns above: SEG, ARC3, and all three spiral families (on a cylinder, on a
+    // cone, and flat in a plane), plus BLEND. ABT #373: the flat LINEAR spiral used to land here
+    // on a 3D BSpline through samplePrim's points -- the construction whose two-point degenerate
+    // case produced the :818 mitre interpenetration -- and it now has its own analytic branch.
+    // Nothing may fall through to a silent empty edge; a new Primitive kind must bring its own
+    // construction.
+    throw std::runtime_error(
+        "WireAssembler: primEdge has no construction for primitive '" + pr.label +
+        "' (unknown kind " + std::to_string(static_cast<int>(pr.kind)) + ")");
 }
 
 // Fuse all solids of a conductor's compound into as FEW bodies as possible, in ONE general
