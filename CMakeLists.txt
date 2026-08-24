@@ -315,6 +315,12 @@ target_link_libraries(mvbpp_dump_turns PRIVATE mvb++)
 add_executable(mvbpp_section tools/mvbpp_section.cpp)
 target_link_libraries(mvbpp_section PRIVATE mvb++)
 
+add_executable(mvbpp_fitprobe tools/mvbpp_fitprobe.cpp)
+target_link_libraries(mvbpp_fitprobe PRIVATE mvb++)
+
+add_executable(mvbpp_pathprobe tools/mvbpp_pathprobe.cpp)
+target_link_libraries(mvbpp_pathprobe PRIVATE mvb++)
+
 add_executable(mvbpp_generate_bobbins tools/generate_mvbpp_bobbins.cpp)
 target_link_libraries(mvbpp_generate_bobbins PRIVATE occt)
 
