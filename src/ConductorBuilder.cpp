@@ -8671,27 +8671,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // the lead radial's vertical clearance over the chords: measured 0.6620 mm against
             // the 0.679 mm coated envelope, the exact difference.
             const double chordReach = kRoundCornerBendFactor * wireRadius;
-            // ABT #885: seed both envelopes from EVERY station's own tube, not only from the
-            // stations that open a wrap. The pair loop below runs over consecutive turns, so it
-            // covers stations 0..n-2 and — decisively — does not run AT ALL for a conductor with
-            // a single turn. A one-turn winding therefore left windingTop and windingBot at 0,
-            // and its terminal level came out `0 + od`, i.e. one bare wire diameter off the hole
-            // plane, with nothing in it about how far the turn actually reaches over the core.
-            //
-            // Measured on current_transformer_complete's 1-turn Round 6.0 primary (OD 4.186 mm):
-            // both radial leads ran at y = +-4.186 mm and struck out to r = 17.865 mm, straight
-            // through the T 25.3/14.8/10 core, whose annulus is r 7.40..12.65 mm and whose faces
-            // are at y = +-5.0 mm. The lead crossed the ferrite for 5.25 mm of its run.
-            //
-            // A station's own tube is how far its wire rises before turning over the core face,
-            // so seeding from it gives the lead the clearance it always meant to have. Monotone:
-            // this can only RAISE the envelope, never lower it, and for a multi-turn conductor it
-            // adds only the last station, which the pair loop skipped.
-            for (const MAS::Turn* t : turns) {
-                const double tube = toroCross(t).tube;
-                windingTop = std::max(windingTop, tube + chordReach);
-                windingBot = std::max(windingBot, tube + chordReach);
-            }
             for (size_t i = 0; i + 1 < turns.size(); ++i) {
                 ToroCross c0 = toroCross(turns[i]), c1 = toroCross(turns[i + 1]);
                 windingTop = std::max(windingTop, c0.tube + chordReach);
@@ -8702,6 +8681,45 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (const MAS::Turn* t : turns)
                 maxOuterR = std::max(maxOuterR, toroCross(t).pout.Modulus());
             (void)meanAng; (void)allToroCrossings; (void)toroLeadRect;
+
+            // ABT #885: WHAT THE LEAD ACTUALLY FLIES OVER. Its level is "the top surface of the
+            // highest obstacle on its radial run, plus its own radius", and `windingTop + od`
+            // says exactly that for THIS conductor's own over-core chords: chord centreline, plus
+            // its own radius to reach the chord's top surface, plus its own radius again to clear
+            // it. That is right whenever such a chord exists.
+            //
+            // It can fail to exist. A current transformer's ONE-TURN primary passes straight
+            // through the bore and leaves radially at both ends, so its geometry is two leads and
+            // nothing else — the pair loop above never runs and windingTop stays 0. The lead then
+            // left at `0 + od` = 4.186 mm on current_transformer_complete and ploughed through the
+            // T 25.3/14.8/10 core (annulus r 7.40..12.65 mm, faces at y = +-5.0 mm) for 5.25 mm of
+            // its run. Inventing an own-chord for it (the first attempt) over-corrected the other
+            // way: 11.384 mm where 8.174 mm clears everything — 3.21 mm of pure air, which is what
+            // Alf saw in the STEP.
+            //
+            // So take the obstacles that are really there: the CORE FACE the conductor's own tube
+            // rises to, and the OTHER windings' over-core copper. Their top surfaces, plus this
+            // wire's radius. A conductor whose own chords are the highest thing near it is
+            // unaffected — `windingTop + od` still dominates — so every multi-turn toroid keeps
+            // the level it had.
+            double foreignTop = halfD;   // the bare core face: every tube rises to it
+            for (const auto& other : conductors) {
+                if (other.winding == ct.winding && other.parallel == ct.parallel) continue;
+                if (other.turns.empty()) continue;
+                const MAS::Wire& otherWire = wireMap.at(other.winding);
+                auto [otherW, otherH] =
+                    TurnBuilder::wireDimensions(otherWire, *other.turns.front(), opts.paintCoating);
+                const double otherRadius = std::min(otherW, otherH) / 2.0;
+                for (const MAS::Turn* t : other.turns) {
+                    const auto& c = t->get_coordinates();
+                    if (c.size() < 2) continue;
+                    // Same tube rule toroCrossRaw applies, in the FOREIGN wire's own radius.
+                    const double otherTube =
+                        halfD + std::max(0.0, (wwRadialHeight - std::hypot(c[0], c[1])) - otherRadius);
+                    foreignTop = std::max(foreignTop,
+                                          otherTube + kRoundCornerBendFactor * otherRadius + otherRadius);
+                }
+            }
 
             // Toroidal terminal lead: the standard 90-degree terminal. From the crossing
             // (where the turn starts) the wire continues AXIALLY out of the hole in the
@@ -8740,7 +8758,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                     const std::string& who) {
                 double crossR = cross.pin.Modulus();
                 if (crossR < 1e-9) return;
-                double level = isExit ? (windingTop + od) : -(windingBot + od);
+                // ABT #885: the highest of the three obstacles, each cleared by this wire's own
+                // radius (see foreignTop above). windingTop/windingBot already carry their own
+                // radius, hence + od there and + wireRadius here.
+                const double clearTop = std::max(windingTop + od, foreignTop + wireRadius);
+                const double clearBot = std::max(windingBot + od, foreignTop + wireRadius);
+                double level = isExit ? clearTop : -clearBot;
                 double beyondR = maxOuterR + 3.0 * od;
                 gp_XY dir = cross.pin;
                 dir.Divide(crossR);
