@@ -9731,7 +9731,25 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                       << "): no heading certifies against the already-settled "
                                          "corners. Wires may touch at their coated envelopes, "
                                          "never interpenetrate.";
-                                    throw std::runtime_error(m.str());
+                                    // MVB_ALLOW_TILT_DEFICIT (diagnostic-only, ABT #865 review):
+                                    // the STAGE 1 certification already honours this flag so the
+                                    // refused chords can be SEEN in a STEP. Stage 2 did not, so a
+                                    // design that got past stage 1 on the flag could still die
+                                    // here and produce no geometry at all — which is exactly what
+                                    // the flag exists to prevent (measured on the SP-ordered
+                                    // current_transformer). Keep the corner at its stage-1
+                                    // heading and carry on; the exported copper interpenetrates,
+                                    // review only, never mesh.
+                                    if (std::getenv("MVB_ALLOW_TILT_DEFICIT")) {
+                                        std::cerr << "[DIAGNOSTIC MVB_ALLOW_TILT_DEFICIT] "
+                                                     "proceeding past a REFUSED twist decay — the "
+                                                     "exported copper interpenetrates; review "
+                                                     "only:\n  " << m.str() << std::endl;
+                                        d = stage1Dir.count(j2) ? stage1Dir[j2] : corners[j2].want;
+                                    }
+                                    else {
+                                        throw std::runtime_error(m.str());
+                                    }
                                 }
                                 dirNow[j2] = d;
                                 moved.insert(j2);
