@@ -6161,6 +6161,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
     }
 
+    double toroLeadEnvelopeTop = 0.0, toroLeadEnvelopeBot = 0.0;
     double wwRadialHeight = 0.0;
     if (isToroidal) {
         const auto& wws = bobbinPd.get_winding_windows();
@@ -6170,6 +6171,40 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 "(required for the conductor's face-run clearance)");
         }
         wwRadialHeight = wws[0].get_radial_height().value();
+    }
+    if (isToroidal) {
+        // The face copper envelope every terminal starts above: each conductor's top chords sit
+        // at tube + bend, its bottom return chords at most (ringCount - 1) dragback ODs deeper
+        // (toroWrapDepth + wrapDepthOds stagger, bounded here without re-deriving the ring
+        // order). A single-turn bore-through conductor has no face chords and contributes
+        // nothing — pricing one an imaginary chord is the 8f41018 mistake.
+        const double toroHalfD = bobbinPd.get_column_depth();
+        toroLeadEnvelopeTop = toroLeadEnvelopeBot = toroHalfD;
+        for (const auto& envelopeConductor : conductors) {
+            if (envelopeConductor.turns.size() < 2) continue;
+            const MAS::Wire& envelopeWire = wireMap.at(envelopeConductor.winding);
+            auto [envW, envH] = TurnBuilder::wireDimensions(
+                envelopeWire, *envelopeConductor.turns.front(), opts.paintCoating);
+            const double envelopeRadius = std::min(envW, envH) / 2.0;
+            const double envelopeOd = 2.0 * envelopeRadius;
+            std::set<long> ringBuckets;
+            double maxTube = 0.0;
+            for (const MAS::Turn* t : envelopeConductor.turns) {
+                const auto& c = t->get_coordinates();
+                if (c.size() < 2) continue;
+                const double r = std::hypot(c[0], c[1]);
+                ringBuckets.insert(std::lround(r / std::max(envelopeOd, 1e-9)));
+                maxTube = std::max(maxTube,
+                                   toroHalfD + std::max(0.0, (wwRadialHeight - r) - envelopeRadius));
+            }
+            const double reach = kRoundCornerBendFactor * envelopeRadius;
+            toroLeadEnvelopeTop =
+                std::max(toroLeadEnvelopeTop, maxTube + reach + envelopeRadius);
+            toroLeadEnvelopeBot =
+                std::max(toroLeadEnvelopeBot,
+                         maxTube + double(ringBuckets.empty() ? 0 : ringBuckets.size() - 1) * envelopeOd +
+                             reach + envelopeRadius);
+        }
     }
 
     // ABT #871: the station is the turn's crossing in ITS OWN leg's frame — x measured from the
@@ -6223,12 +6258,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     std::vector<ConductorPath> paths;
     paths.reserve(conductors.size());
-    // ABT #885 (Alf): "the terminal has to be just on the minimum height to not collide with
-    // other turns... and each terminal at a different height". Toroidal terminals already placed
-    // in THIS build, so a later lead whose radial run overlaps an earlier one stacks one contact
-    // above it instead of sharing its height. {pinX, pinY, wireRadius, |level|, topSide}
-    struct PlacedToroLead { gp_XY pin; double wireRadius; double magnitude; bool topSide; };
-    std::vector<PlacedToroLead> placedToroLeads;
+    // ABT #885 (Alf): "can you simply keep track of the height of each layer and just use that
+    // for the next ones?" — LAYER-HEIGHT BOOKKEEPING for toroidal terminals, replacing the
+    // ray-geometry pricing outright. Two accumulators, one per core face, each starting at the
+    // face's copper envelope (every conductor's chords and dragback depths, computed below once
+    // wwRadialHeight is known) and growing as each terminal is placed on it: a lead's level is
+    // the accumulator plus its own radius (exact touch on whatever is highest so far), and the
+    // accumulator then advances to that lead's top surface. Monotone, deterministic (emission
+    // order), every terminal at a different height, and collision-free against wraps and other
+    // leads BY CONSTRUCTION — no ray test to miss an obstacle class, which is exactly how the
+    // previous minimal-height model shipped a lead through a foreign dragback (the gate is OFF
+    // in the MVB_LEAD_NO_VALIDATE diagnostic builds, so nothing downstream caught it either).
+    // (declared just before the wwRadialHeight block, where they are initialized)
     std::vector<PendingZ> pendingZ;   // Z-returns, planned after all conductors are built
 
     // Per-winding index (stable, MAS order) for the seam-azimuth stagger. MKF draws every winding's
@@ -8708,107 +8749,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // wire's radius. A conductor whose own chords are the highest thing near it is
             // unaffected — `windingTop + od` still dominates — so every multi-turn toroid keeps
             // the level it had.
-            // PER-TERMINAL MINIMUM HEIGHT (Alf: "the terminal has to be just on the minimum
-            // height to not collide with other turns... and each terminal at a different
-            // height"). A lead's level is the top surface of the highest thing ITS OWN radial
-            // run actually passes over, plus its own radius — exact touch, the same contract the
-            // certified gate enforces everywhere else ("wires may touch at their coated
-            // envelopes, never interpenetrate"). Nothing global enters: not the conductor's own
-            // whole-winding envelope (windingTop/windingBot — azimuth-blind, they priced the
-            // secondary's exit for a dragback on the far side of the ring), and not the tallest
-            // foreign turn in the toroid (the first attempt, which hoisted the SP secondary's
-            // thin lead to 9.558 mm for a primary sitting 18 degrees away from its run).
-            //
-            // The run is a radial ray at the attach crossing's azimuth. What can lie under it:
-            //   - the CORE FACE, always (every run crosses the annulus);
-            //   - the conductor's OWN face chords — top chords pin_i -> pout_i on the exit side,
-            //     bottom return chords pout_i -> pin_{i+1} (dragback depths included) on the
-            //     entrance side;
-            //   - OTHER windings' top chords, in their own wire radius.
-            // Each contributes only if the ray passes within the sum of half-widths of its
-            // segment in the horizontal plane.
-            auto clearanceAt = [&](const gp_XY& leadPin, bool topSide) -> double {
-                double magnitude = halfD + wireRadius;   // the bare core face, exact touch
-                if (leadPin.Modulus() < 1e-12) return magnitude;
-                const gp_XY leadDir = leadPin / leadPin.Modulus();
-                const gp_XY leadFar = leadDir * 0.050;   // well past every real tip radius
-                auto pointToSegment = [](const gp_XY& p, const gp_XY& s0, const gp_XY& s1) {
-                    const gp_XY d = s1 - s0;
-                    const double len2 = d.Dot(d);
-                    const double u =
-                        len2 < 1e-24 ? 0.0 : std::clamp((p - s0).Dot(d) / len2, 0.0, 1.0);
-                    return (p - (s0 + d * u)).Modulus();
-                };
-                auto segmentDistance = [&](const gp_XY& a0, const gp_XY& a1, const gp_XY& b0,
-                                           const gp_XY& b1) {
-                    return std::min(
-                        std::min(pointToSegment(a0, b0, b1), pointToSegment(a1, b0, b1)),
-                        std::min(pointToSegment(b0, a0, a1), pointToSegment(b1, a0, a1)));
-                };
-                auto rayCrosses = [&](const gp_XY& s0, const gp_XY& s1, double halfWidthSum) {
-                    return segmentDistance(leadPin, leadFar, s0, s1) < halfWidthSum;
-                };
-                // The conductor's own chords on THIS side of the core.
-                for (size_t i = 0; i + 1 < turns.size(); ++i) {
-                    const ToroCross c0 = toroCross(turns[i]), c1 = toroCross(turns[i + 1]);
-                    if (!c0.hasOuter) continue;
-                    if (topSide) {
-                        if (rayCrosses(c0.pin, c0.pout, od)) {
-                            magnitude = std::max(magnitude, c0.tube + chordReach + od);
-                        }
-                    } else {
-                        if (rayCrosses(c0.pout, c1.pin, od)) {
-                            magnitude = std::max(magnitude, toroWrapDepth(c0, c1, wireRadius) +
-                                                                wrapDepthOds(i) * od + chordReach +
-                                                                od);
-                        }
-                    }
-                }
-                // Other windings' copper under the run, in their own radius. Their top chords
-                // stand for both faces — a foreign bottom dragback can run deeper than its tube,
-                // and where one truly crosses this run the collision gate still arbitrates.
-                for (const auto& other : conductors) {
-                    if (other.winding == ct.winding && other.parallel == ct.parallel) continue;
-                    if (other.turns.empty()) continue;
-                    const MAS::Wire& otherWire = wireMap.at(other.winding);
-                    auto [otherW, otherH] = TurnBuilder::wireDimensions(
-                        otherWire, *other.turns.front(), opts.paintCoating);
-                    const double otherRadius = std::min(otherW, otherH) / 2.0;
-                    for (const MAS::Turn* t : other.turns) {
-                        const auto& c = t->get_coordinates();
-                        if (c.size() < 2) continue;
-                        const gp_XY pin(c[0], c[1]);
-                        gp_XY pout = pin;
-                        auto add = t->get_additional_coordinates();
-                        if (add && !add->empty() && (*add)[0].size() >= 2) {
-                            pout = gp_XY((*add)[0][0], (*add)[0][1]);
-                        }
-                        if (!rayCrosses(pin, pout, wireRadius + otherRadius)) continue;
-                        const double otherTube =
-                            halfD +
-                            std::max(0.0, (wwRadialHeight - pin.Modulus()) - otherRadius);
-                        magnitude = std::max(magnitude,
-                                             otherTube + kRoundCornerBendFactor * otherRadius +
-                                                 otherRadius + wireRadius);
-                    }
-                }
-                // EACH TERMINAL AT A DIFFERENT HEIGHT where the runs overlap: stack one exact
-                // contact above any already-placed lead on the same side whose run this one
-                // crosses. First come, lowest placed; the registry keeps the order deterministic
-                // (conductor emission order).
-                for (const auto& placed : placedToroLeads) {
-                    if (placed.topSide != topSide) continue;
-                    if (placed.pin.Modulus() < 1e-12) continue;
-                    const gp_XY placedFar = placed.pin / placed.pin.Modulus() * 0.050;
-                    if (segmentDistance(leadPin, leadFar, placed.pin, placedFar) <
-                        wireRadius + placed.wireRadius) {
-                        magnitude = std::max(magnitude,
-                                             placed.magnitude + placed.wireRadius + wireRadius);
-                    }
-                }
-                placedToroLeads.push_back({leadPin, wireRadius, magnitude, topSide});
-                return magnitude;
-            };
+            // Terminal levels come from the layer-height bookkeeping declared at build scope
+            // (toroLeadEnvelopeTop/Bot) — see there.
+
 
             // Toroidal terminal lead: the standard 90-degree terminal. From the crossing
             // (where the turn starts) the wire continues AXIALLY out of the hole in the
@@ -8847,11 +8790,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                     const std::string& who) {
                 double crossR = cross.pin.Modulus();
                 if (crossR < 1e-9) return;
-                // ABT #885: the minimum height that clears THIS lead's own run (see
-                // clearanceAt above) — nothing global, exact touch, stacked apart from any
-                // earlier lead its run overlaps.
-                double level = isExit ? clearanceAt(cross.pin, true)
-                                      : -clearanceAt(cross.pin, false);
+                // ABT #885 (Alf): layer-height bookkeeping. Take the face's current height,
+                // sit one exact touch above it, and raise the face to this lead's top surface
+                // so the next terminal lands above this one.
+                double level;
+                if (isExit) {
+                    level = toroLeadEnvelopeTop + wireRadius;
+                    toroLeadEnvelopeTop = level + wireRadius;
+                } else {
+                    level = -(toroLeadEnvelopeBot + wireRadius);
+                    toroLeadEnvelopeBot = -level + wireRadius;
+                }
                 double beyondR = maxOuterR + 3.0 * od;
                 gp_XY dir = cross.pin;
                 dir.Divide(crossR);
