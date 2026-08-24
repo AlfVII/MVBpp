@@ -321,6 +321,9 @@ target_link_libraries(mvbpp_fitprobe PRIVATE mvb++)
 add_executable(mvbpp_pathprobe tools/mvbpp_pathprobe.cpp)
 target_link_libraries(mvbpp_pathprobe PRIVATE mvb++)
 
+add_executable(mvbpp_paint2d tools/mvbpp_paint2d.cpp)
+target_link_libraries(mvbpp_paint2d PRIVATE mvb++)
+
 add_executable(mvbpp_generate_bobbins tools/generate_mvbpp_bobbins.cpp)
 target_link_libraries(mvbpp_generate_bobbins PRIVATE occt)
 
