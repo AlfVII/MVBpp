@@ -7036,7 +7036,23 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // is still the collision gate's to report.
                 if (A.wname != B.wname || A.entrance != B.entrance) {
                     const double dRoute = routeDist(A.segs, B.segs);
-                    if (dRoute > dSep - 1e-6) return 0.0;
+                    // ABT #882: the early-out must not be COARSER THAN THE GATE. This slack was
+                    // 1 um, which is 196x the deficit that refused 11_pushpull_etd49_tp4a: its
+                    // Primary 2 and Secondary 1 entrance rows are stacked at EXACTLY one coated
+                    // envelope (0.9585 mm), and because the drawn routes run out at a 0.19 deg
+                    // tilt, the measured route distance is envelope*cos(tilt) = 0.958495 mm --
+                    // 5.1 nm short. The fan read that as healthy, bought no azimuth, and the
+                    // collision gate (which allows contact and nothing past it) refused the
+                    // design. A deficit invisible here and fatal there is the one thing this
+                    // model may not do: "what the fan reserves must be what the emitter draws".
+                    //
+                    // So the only pairs that cost nothing are the ones with no deficit at all.
+                    // The buy stays exactly what it always was -- sqrt(env^2 - d_route^2) of X,
+                    // and no more -- and it is CONTINUOUS in the deficit, so a healthy row still
+                    // costs ~0 and nothing scatters: 11_pushpull's 5.1 nm buys 3.1 um of x, i.e.
+                    // 0.015 deg. It is a genuine MKF row deficit that buys a visible spread, and
+                    // that stays the gate's to report.
+                    if (dRoute >= dSep) return 0.0;
                     const double dxNeed =
                         std::sqrt(std::max(0.0, dSep * dSep - dRoute * dRoute));
                     const double rrX = std::max(std::min(A.r, B.r), dSep);
