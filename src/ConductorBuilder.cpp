@@ -8671,6 +8671,27 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // the lead radial's vertical clearance over the chords: measured 0.6620 mm against
             // the 0.679 mm coated envelope, the exact difference.
             const double chordReach = kRoundCornerBendFactor * wireRadius;
+            // ABT #885: seed both envelopes from EVERY station's own tube, not only from the
+            // stations that open a wrap. The pair loop below runs over consecutive turns, so it
+            // covers stations 0..n-2 and — decisively — does not run AT ALL for a conductor with
+            // a single turn. A one-turn winding therefore left windingTop and windingBot at 0,
+            // and its terminal level came out `0 + od`, i.e. one bare wire diameter off the hole
+            // plane, with nothing in it about how far the turn actually reaches over the core.
+            //
+            // Measured on current_transformer_complete's 1-turn Round 6.0 primary (OD 4.186 mm):
+            // both radial leads ran at y = +-4.186 mm and struck out to r = 17.865 mm, straight
+            // through the T 25.3/14.8/10 core, whose annulus is r 7.40..12.65 mm and whose faces
+            // are at y = +-5.0 mm. The lead crossed the ferrite for 5.25 mm of its run.
+            //
+            // A station's own tube is how far its wire rises before turning over the core face,
+            // so seeding from it gives the lead the clearance it always meant to have. Monotone:
+            // this can only RAISE the envelope, never lower it, and for a multi-turn conductor it
+            // adds only the last station, which the pair loop skipped.
+            for (const MAS::Turn* t : turns) {
+                const double tube = toroCross(t).tube;
+                windingTop = std::max(windingTop, tube + chordReach);
+                windingBot = std::max(windingBot, tube + chordReach);
+            }
             for (size_t i = 0; i + 1 < turns.size(); ++i) {
                 ToroCross c0 = toroCross(turns[i]), c1 = toroCross(turns[i + 1]);
                 windingTop = std::max(windingTop, c0.tube + chordReach);
