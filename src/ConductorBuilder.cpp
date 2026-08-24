@@ -748,7 +748,27 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                             else {
                                 const auto verdict =
                                     cert::provePairClears(pa, pb, coatedEnvelope);
-                                if (!verdict.clears) {
+                                // ABT #865 (b), Alf 2026-08-24 ("all parts should be CLEAN of
+                                // coil collision"): the gate's DECLARED RESOLUTION is half the
+                                // coordinate grid. MKF ships every turn coordinate rounded to
+                                // 1 nm (roundFloat 9), so no statement about the geometry below
+                                // 0.5 nm carries information from the data — it is the grid's
+                                // own quantization noise (double-precision trig at these radii
+                                // has ~2 pm ULPs, and the residual pairs measure 13..119 pm).
+                                // A proven shortfall within half a grid cell of exact touch IS
+                                // exact touch at the data's resolution, and touching at the
+                                // coated envelope is legal. Everything at or above grid scale
+                                // stays a hard refusal — the micron and nanometre classes this
+                                // design used to fail on were fixed in CONSTRUCTION (poloidal
+                                // outer corners, the rim rest bias, the ring classifier), not
+                                // here. This is a stated measurement resolution, not a
+                                // tolerance to be widened: it may never exceed half the grid
+                                // the coordinates are actually written on.
+                                constexpr double kCoordinateGridHalf = 0.5e-9;
+                                const bool withinGridOfTouch =
+                                    !verdict.clears &&
+                                    (coatedEnvelope - verdict.violationUB) <= kCoordinateGridHalf;
+                                if (!verdict.clears && !withinGridOfTouch) {
                                     ++coatedIntrusions;
                                     if (std::getenv("MVB_ENAMEL_LIST")) {
                                         const gp_Pnt qa = cert::evalPrim(pa, verdict.tA);
@@ -5488,7 +5508,11 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
                     // lead relaxation, certified against the coated envelopes). NaN only in the
                     // degenerate no-solve case; the certified verifier remains the authority.
                     gp_XY resolvedTop = gp_XY(std::numeric_limits<double>::quiet_NaN(), 0),
-                    gp_XY resolvedBottom = gp_XY(std::numeric_limits<double>::quiet_NaN(), 0)) {
+                    gp_XY resolvedBottom = gp_XY(std::numeric_limits<double>::quiet_NaN(), 0),
+                    // ABT #865: every rim crossing of the whole magnetic {pout, coated radius},
+                    // for the conditional poloidal outer-corner rule below. nullptr = keep the
+                    // natural tangent corners unconditionally (single-conductor callers).
+                    const std::vector<std::pair<gp_XY, double>>* rimTubes = nullptr) {
     auto P = [](const gp_XY& h, double y) { return gp_Pnt(h.X(), y, h.Y()); };
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         // A picometre threshold is meaningless next to a 0.34 mm wire whose own sampling sag is
@@ -5606,9 +5630,48 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     // there is no local per-corner clearance rule any more, and no fallback.
 
     const gp_XYZ dTop3(dTop.X(), 0, dTop.Y());
+    // ABT #865 (a) (Alf: "all parts should be CLEAN of coil collision"): CONDITIONALLY POLOIDAL
+    // OUTER CORNERS. A rim corner tangent to its face chord bulges azimuthally, and MKF packs
+    // the rim crossings so tightly (station-geometry margins of ~100 nm) that the bulge
+    // certified 0.03..3 nm INSIDE neighbouring tubes on 12 pairs of the current transformer —
+    // the inner-corner tilt solver cannot help because outer corners were never in its model. A
+    // POLOIDAL corner has zero azimuthal bulge and clears every tube by the full drawn margin
+    // by construction, taking the chord's direction change as a small BISECTION MITRE (the
+    // second approved corner construction, and the toroid conformal assembly's native joint).
+    //
+    // CONDITIONAL, not unconditional: going poloidal moves the chord's rim endpoint by
+    // bend * (tangent - poloidal), and on the interleaved two-parallel buck that shifted chord
+    // clipped the sibling's INNER corner by 252 nm — a design that was CLEAN with natural
+    // corners. So each corner keeps its natural tangent heading whenever that corner clears
+    // every rim tube, and flips poloidal only when it would not. The test is exact, not
+    // sampled: the corner arc's plane is vertical, so its horizontal projection is the straight
+    // segment pout -> pout - heading*bend, and arc-vs-vertical-tube distance is 2D
+    // point-to-segment distance.
+    const double poutR = c0.pout.Modulus();
+    auto outerHeading = [&](const gp_XY& natural) -> gp_XY {
+        if (poutR < 1e-12) return natural;
+        const gp_XY poloidal = c0.pout / poutR;
+        if (rimTubes == nullptr) return natural;
+        const double ownCoated = b / kRoundCornerBendFactor;
+        const gp_XY segEnd(c0.pout.X() - natural.X() * b, c0.pout.Y() - natural.Y() * b);
+        for (const auto& [tube, tubeCoated] : *rimTubes) {
+            const gp_XY toTube = tube - c0.pout;
+            if (toTube.Modulus() < 1e-12) continue;   // its own tube
+            // point-to-segment(tube, pout -> segEnd)
+            const gp_XY u = segEnd - c0.pout;
+            const double len2 = u.Dot(u);
+            const double tPar =
+                len2 < 1e-24 ? 0.0 : std::clamp(toTube.Dot(u) / len2, 0.0, 1.0);
+            const gp_XY closest(c0.pout.X() + u.X() * tPar, c0.pout.Y() + u.Y() * tPar);
+            if ((tube - closest).Modulus() < ownCoated + tubeCoated + 1e-9) {
+                return poloidal;   // the natural corner would enter this tube's envelope
+            }
+        }
+        return natural;
+    };
+    const gp_XY dTopChord = outerHeading(dTopEnd);
     pushArc(P(c0.pin + dTop * b, t0), yHat.Crossed(dTop3), dTop3 * (-b), "top inner corner");
-    faceSpiral(c0.pin + dTop * b, c0.pout - dTopEnd * b, rh0, "top chord");
-    const gp_XY dTopChord = dTopEnd;
+    faceSpiral(c0.pin + dTop * b, c0.pout - dTopChord * b, rh0, "top chord");
     const gp_XYZ dTopChord3(dTopChord.X(), 0, dTopChord.Y());
     pushArc(P(c0.pout - dTopChord * b, t0), yHat.Crossed(dTopChord3), yHat * b, "top outer corner");
 
@@ -5670,11 +5733,33 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     // verification own clearance.
 
     const gp_XYZ eBot3(eBot.X(), 0, eBot.Y());
-    const gp_XYZ eBotStart3(eBotStart.X(), 0, eBotStart.Y());
+    // Same conditional rule for the bottom outer corner (see the top's comment); the bottom
+    // corner's footprint runs pout + heading*bend, so the sign mirrors.
+    auto outerHeadingBot = [&](const gp_XY& natural) -> gp_XY {
+        if (poutR < 1e-12 || rimTubes == nullptr) return natural;
+        const gp_XY poloidal(-c0.pout.X() / poutR, -c0.pout.Y() / poutR);
+        const double ownCoated = b / kRoundCornerBendFactor;
+        const gp_XY segEnd(c0.pout.X() + natural.X() * b, c0.pout.Y() + natural.Y() * b);
+        for (const auto& [tube, tubeCoated] : *rimTubes) {
+            const gp_XY toTube = tube - c0.pout;
+            if (toTube.Modulus() < 1e-12) continue;
+            const gp_XY u = segEnd - c0.pout;
+            const double len2 = u.Dot(u);
+            const double tPar =
+                len2 < 1e-24 ? 0.0 : std::clamp(toTube.Dot(u) / len2, 0.0, 1.0);
+            const gp_XY closest(c0.pout.X() + u.X() * tPar, c0.pout.Y() + u.Y() * tPar);
+            if ((tube - closest).Modulus() < ownCoated + tubeCoated + 1e-9) {
+                return poloidal;
+            }
+        }
+        return natural;
+    };
+    const gp_XY eBotChord = outerHeadingBot(eBotStart);
+    const gp_XYZ eBotChord3(eBotChord.X(), 0, eBotChord.Y());
     pushSeg(P(c0.pout, t0), P(c0.pout, -tb), "outer tube down");
-    pushArc(P(c0.pout + eBotStart * b, -tb), eBotStart3.Crossed(yHat), eBotStart3 * (-b),
+    pushArc(P(c0.pout + eBotChord * b, -tb), eBotChord3.Crossed(yHat), eBotChord3 * (-b),
             "bottom outer corner");
-    faceSpiral(c0.pout + eBotStart * b, c1.pin - eBot * b, -rhb, "bottom chord");
+    faceSpiral(c0.pout + eBotChord * b, c1.pin - eBot * b, -rhb, "bottom chord");
     pushArc(P(c1.pin - eBot * b, -tb), eBot3.Crossed(yHat), yHat * (-b), "bottom inner corner");
     pushSeg(P(c1.pin, -tb), P(c1.pin, 0), "inner tube up to crossing");
 }
@@ -6224,6 +6309,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // x, untouched — toroidal ring stations are legitimately negative and must stay signed.
         return {axisX == 0.0 ? c[0] : std::abs(c[0] - axisX), c[1]};
     };
+
+    // ABT #865: every rim crossing (pout) with its coated radius — the conditional
+    // poloidal outer-corner rule tests each natural corner against these.
+    std::vector<std::pair<gp_XY, double>> allRimTubes;
+    if (isToroidal) {
+        for (const auto& ct : conductors) {
+            const MAS::Wire& w = wireMap.at(ct.winding);
+            for (const MAS::Turn* t : ct.turns) {
+                auto add = t->get_additional_coordinates();
+                if (!(add && !add->empty() && (*add)[0].size() >= 2)) continue;
+                auto [ww, wh] = TurnBuilder::wireDimensions(w, *t, /*paintCoating=*/true);
+                allRimTubes.push_back({gp_XY((*add)[0][0], (*add)[0][1]),
+                                       std::min(ww, wh) / 2.0});
+            }
+        }
+    }
 
     // All inner crossings with their wire radii — the corridor test for toroidal
     // in-plane leads (an MKF lead rect drawn through another ring's tubes is
@@ -8559,6 +8660,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // Raw crossing data straight from MAS (TurnBuilder's clearance rules, hole
             // plane at y=0). The INNER crossing is the turn's exact position and is never
             // altered.
+            // ABT #865 (a): CLEAR-SIDE ROUNDING of the derived tube length. The rings are laid
+            // at one coated OD of radial pitch by design, but the drawn radii carry the 1 nm
+            // coordinate grid, so the pitch arrives with sub-nm dust (measured 533.999107 um on
+            // the SP ordering) — and the over-core chord heights, tube + bend, inherit it: two
+            // rings' chords that should stack at EXACTLY one OD vertically came out 893 pm
+            // short, which the certified gate rightly refuses. The tube length is THIS
+            // builder's own construction (MKF draws stations, not chord heights), so when the
+            // layer offset lands within grid dust of an exact OD multiple, snap it there — the
+            // stagger becomes exact and vertical exact touch is exact. An offset genuinely off
+            // the pitch (a squished layout) is preserved untouched.
+            auto snapLayerOffset = [&](double layerOffset) {
+                const double od = 2.0 * wireRadius;
+                if (od < 1e-12) return layerOffset;
+                const double k = std::round(layerOffset / od);
+                return std::abs(layerOffset - k * od) < 2e-9 ? k * od : layerOffset;
+            };
             auto toroCrossRaw = [&](const MAS::Turn* t) -> ToroCross {
                 const auto& c = t->get_coordinates();
                 if (c.size() < 2) {
@@ -8572,8 +8689,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     // crossing is MKF's to place, never ours to invent.
                     if (t == turns.back()) {
                         gp_XY only(c[0], c[1]);
-                        double layerOffsetLast =
-                            std::max(0.0, (wwRadialHeight - only.Modulus()) - wireRadius);
+                        double layerOffsetLast = snapLayerOffset(
+                            std::max(0.0, (wwRadialHeight - only.Modulus()) - wireRadius));
                         return {only, only, halfD + layerOffsetLast, /*hasOuter=*/false};
                     }
                     throw std::runtime_error(
@@ -8583,8 +8700,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
                 gp_XY pin(c[0], c[1]);
                 gp_XY pout((*add)[0][0], (*add)[0][1]);
-                double layerOffset =
-                    std::max(0.0, (wwRadialHeight - pin.Modulus()) - wireRadius);
+                double layerOffset = snapLayerOffset(
+                    std::max(0.0, (wwRadialHeight - pin.Modulus()) - wireRadius));
                 return {pin, pout, halfD + layerOffset};
             };
 
@@ -9134,9 +9251,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                             eStart = spiralTangent(a2, b2, true);
                             eEnd = spiralTangent(a2, b2, false);
                         }
+                        // ABT #865: the ring pitch is the WINDING'S OWN coated OD — its rings
+                        // nest one of ITS wire diameters apart (RING STAGGER), and the divisor
+                        // decides which corners the certification treats as sharing a face
+                        // height. This used odMax, the maximum OD across ALL conductors, so on
+                        // the current transformer the 6 mm primary's 4.186 mm OD collapsed every
+                        // 0.534 mm secondary ring to ring 0: (7.133-6.599)/4.186 and
+                        // (7.133-6.065)/4.186 both round to 0. The certification then paired a
+                        // ring-1 chord with a ring-2 chord as same-height, deduced (correctly,
+                        // for one height) that their plan-view chords cross, and refused the
+                        // whole design 520 um short — while the emitter draws those chords
+                        // auto-staggered one OD apart vertically, exactly clear.
+                        const double ownRingPitch = 2.0 * coatedRw;
                         auto ringOf = [&](const gp_XY& q) {
-                            return odMax > 1e-12
-                                       ? std::max(0, int(std::llround((maxInnerR - q.Modulus()) / odMax)))
+                            return ownRingPitch > 1e-12
+                                       ? std::max(0, int(std::llround((maxInnerR - q.Modulus()) /
+                                                                      ownRingPitch)))
                                        : 0;
                         };
                         corners.push_back({pin, dTop, pout, true, ringOf(pin), bend, coatedRw,
@@ -9959,7 +10089,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                              toroBandRadius, wlabel, i);
                 else
                     appendToroWrap(path, c0, c1, toroBend, wrapDepthOds(i) * od, wlabel, i,
-                                   toroCornerDir(i, true), toroCornerDir(i, false));
+                                   toroCornerDir(i, true), toroCornerDir(i, false),
+                                   &allRimTubes);
             }
 
             const size_t wrapPrimCount = path.prims.size();
