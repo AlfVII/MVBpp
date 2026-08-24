@@ -4,14 +4,22 @@
 // step-generator path (which paints alongside the STEP) never gets to show them. This tool paints
 // MKF's own 2D winding-window cross-section for a design that does NOT fit, in two states:
 //
-//   <out>.refused.svg   real winding on, coilWindEvenIfNotFit on, NO squish -- the layout the fit
-//                       gate actually rejects. This is the picture the #869 diagnosis is about:
-//                       the winding that was given one layer and had every turn stuffed into it,
-//                       with the overflow running out of the window.
-//   <out>.relaxed.svg   real winding on, coating squish and horizontal overflow allowed -- what
-//                       try_rewind() settles on once it is permitted to overflow the window
-//                       sideways. Useful next to the first: the re-proportioned layout is the one
-//                       MKF would build if the window edge were not in the way.
+//   <out>.refused.svg    the layout the fit gate actually rejects: real winding on,
+//                        coilWindEvenIfNotFit on, nothing relaxed. Turns are placed but the
+//                        packer was free to overstuff a layer, so the picture shows one column
+//                        of turns running out of the window rather than the layers the design
+//                        really needs.
+//   <out>.overflow.svg   WHY IT DOES NOT FIT, for the user to act on (Alf, 2026-08-24: "when the
+//                        coil won't fit, I want the user to have a visual image of why, which are
+//                        the turns overflowing, so they can fix it"). coilWindEvenIfNotFit +
+//                        coilAllowHorizontalOverflow, and coating squish deliberately OFF.
+//
+//                        That combination is the honest one: with horizontal overflow allowed the
+//                        SECTION may run past the window edge, but every LAYER still has to be a
+//                        real layer (filling factor <= 1.0, no squish allowance). So try_rewind
+//                        keeps adding layers until each one holds only what it can, and the
+//                        copper the window cannot take ends up DRAWN OUTSIDE IT -- exactly the
+//                        turns the user has to remove, in the place they would sit.
 //
 // Painted from the SAME enriched magnetic in each case, so what is drawn is what MKF laid out.
 #include "mvb/Utils.h"
@@ -39,7 +47,7 @@ namespace {
 // magnetic_autocomplete_safe: the safe wrapper REFUSES a layout whose blocking was declined
 // (that is its job), and refusing is precisely the case being drawn here.
 void paintOne(const json& magneticJson, const fs::path& svgPath, bool windEvenIfNotFit,
-              bool squish, const std::string& label) {
+              bool squish, bool horizontalOverflowAllowed, const std::string& label) {
     OpenMagnetics::SettingsGuard<bool> realWinding(
         OpenMagnetics::Settings::GetInstance(),
         &OpenMagnetics::Settings::get_coil_use_real_winding_geometry,
@@ -55,7 +63,7 @@ void paintOne(const json& magneticJson, const fs::path& svgPath, bool windEvenIf
     OpenMagnetics::SettingsGuard<bool> horizontalOverflow(
         OpenMagnetics::Settings::GetInstance(),
         &OpenMagnetics::Settings::get_coil_allow_horizontal_overflow,
-        &OpenMagnetics::Settings::set_coil_allow_horizontal_overflow, squish);
+        &OpenMagnetics::Settings::set_coil_allow_horizontal_overflow, horizontalOverflowAllowed);
 
     OpenMagnetics::Core core(magneticJson.at("core"));
     OpenMagnetics::Coil coil(magneticJson.at("coil"), /*windInConstructor=*/false);
@@ -115,7 +123,9 @@ int main(int argc, char** argv) {
 
     const fs::path stem = argv[2];
     std::cout << fs::path(argv[1]).stem().string() << ":\n";
-    paintOne(magneticJson, fs::path(stem.string() + ".refused.svg"), true, false, "refused");
-    paintOne(magneticJson, fs::path(stem.string() + ".relaxed.svg"), false, true, "relaxed");
+    paintOne(magneticJson, fs::path(stem.string() + ".refused.svg"), /*windEvenIfNotFit=*/true,
+             /*squish=*/false, /*horizontalOverflowAllowed=*/false, "refused");
+    paintOne(magneticJson, fs::path(stem.string() + ".overflow.svg"), /*windEvenIfNotFit=*/true,
+             /*squish=*/false, /*horizontalOverflowAllowed=*/true, "overflow");
     return 0;
 }
