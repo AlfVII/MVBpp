@@ -340,6 +340,21 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
     // real reason instead (no-fallbacks rule: the broken thing is named, not routed around).
     if (useRealWindingGeometry &&
         !enriched.get_coil().is_real_winding_blocking_applied()) {
+        // ABT #869: blocking is also absent for a reason that has nothing to do with fit. Real
+        // winding is not implemented for PLANAR (PCB) constructions — MKF's own ruling (ABT
+        // #492): magnetic_autocomplete deliberately does not re-wind a planar coil when the flag
+        // is on, so the flag simply never gets set and the design arrives here indistinguishable
+        // from an over-full one. Saying "the ideal wind does not fit its window" about a planar
+        // transformer sends the reader hunting a fit problem that does not exist (it cost
+        // 09_planar_xfmr_er2510_3c94 a slot in the #869 fit class). Name the real reason.
+        if (enriched.get_mutable_coil().is_planar()) {
+            throw std::runtime_error(
+                "magnetic_autocomplete_safe: real winding geometry was requested for a PLANAR "
+                "(PCB) construction, which MKF does not implement (ABT #492: leads, connection "
+                "blocking and lead routing are for wound magnetics only). This is not a fit "
+                "problem — the layout is fine; there is no real-winding model for it. Build it "
+                "without --real, or implement planar real winding in MKF first.");
+        }
         throw std::runtime_error(
             "magnetic_autocomplete_safe: real winding geometry was requested but MKF did NOT "
             "apply connection blocking (the ideal wind does not fit its window — see MKF's "
