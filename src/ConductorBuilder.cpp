@@ -574,6 +574,32 @@ std::size_t dropRedundantExcursions(ConductorPath& path) {
     return dropped;
 }
 
+// ABT #871: slide a finished path along X. Used to place a conductor built in a lateral leg's
+// own frame onto that leg. Every primitive kind carries its positions as points or as a spiral
+// axis; the direction members (an arc's rotation axis and start vector, a blend's tangent) are
+// free vectors and a translation leaves them alone.
+void translatePathX(ConductorPath& path, double dx) {
+    auto move = [dx](gp_Pnt& p) { p.SetX(p.X() + dx); };
+    for (auto& primitive : path.prims) {
+        switch (primitive.kind) {
+            case Primitive::SEG:
+                move(primitive.seg.a);
+                move(primitive.seg.b);
+                break;
+            case Primitive::ARC3:
+                move(primitive.arc.c);
+                break;
+            case Primitive::SPIRAL:
+                primitive.spiral.cx += dx;
+                break;
+            case Primitive::BLEND:
+                move(primitive.blendc.a);
+                move(primitive.blendc.b);
+                break;
+        }
+    }
+}
+
 void checkCollisions(const std::vector<ConductorPath>& paths) {
     if (std::getenv("MVB_PATH_DUMP")) {
         for (size_t ci = 0; ci < paths.size(); ++ci) {
@@ -5942,6 +5968,35 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
     }
 
+    // ---- ABT #871: MULTI-COLUMN PLACEMENT --------------------------------------------------
+    // A section may wrap a LATERAL leg instead of the main column (MAS placement chain
+    // section -> windingWindow -> column; the caller resolves it into
+    // opts.woundColumnPerSection). Its turns are then drawn at their real x, which for a leg
+    // on the negative-x side is NEGATIVE — and every radial in this builder is measured from
+    // the main column at the origin. Reading those coordinates as main-column radials is what
+    // made multicolumn_e42's Secondary (drawn at x = -13.62 mm around the leg at x = -18.06 mm)
+    // report "crossing radial position lies inside the column", blaming MKF for data that is
+    // exactly right.
+    //
+    // The fix is a per-conductor FRAME: a conductor that wraps a leg is built entirely in that
+    // leg's own frame — radials measured from the leg axis, the racetrack laid on the leg's
+    // half-width — and the finished path is translated onto the leg at the end. Conductors on
+    // the main column keep axisX = 0, so a single-window design walks the identical code with
+    // identical numbers.
+    std::map<std::string, double> sectionAxisX;   // section -> wound leg axis (absent = origin)
+    bool anyLateralColumn = false;
+    for (const auto& [sectionName, spec] : opts.woundColumnPerSection) {
+        sectionAxisX[sectionName] = spec.axisX;
+    }
+    auto sectionOfTurn = [](const MAS::Turn* t) -> std::string {
+        return t->get_section() ? t->get_section().value() : std::string();
+    };
+    // The axis of the column a turn wraps; 0 (the main column) for everything not placed on a leg.
+    auto turnAxisX = [&](const MAS::Turn* t) -> double {
+        auto found = sectionAxisX.find(sectionOfTurn(t));
+        return found == sectionAxisX.end() ? 0.0 : found->second;
+    };
+
     // Column geometry (concentric) / toroidal window data.
     MAS::ColumnShape columnShape = bobbinPd.get_column_shape();
     // IRREGULAR columns (EFD / EPX-style poles: flat-sided profiles that are none of the three
@@ -6007,6 +6062,105 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     const double zoff =
         (isToroidal || effectivelyRound) ? 0.0 : (halfD - halfW);
 
+    // ABT #871: the per-conductor leg frame. Only the RADIAL half-dimension and the axis move
+    // between the main column and a lateral leg — the DEPTH half-dimension is the same slab of
+    // core (both legs of an E are as deep as the centre post), and the column SHAPE family is
+    // what selects the wrap machinery below (round sweep vs rect racetrack vs stadium). A design
+    // whose legs disagree on either is refused rather than silently built on the wrong recipe.
+    std::vector<double> conductorAxisX(conductors.size(), 0.0);
+    std::vector<double> conductorHalfW(conductors.size(), halfW);
+    for (size_t ci = 0; ci < conductors.size(); ++ci) {
+        const auto& ct = conductors[ci];
+        bool first = true;
+        double axisX = 0.0;
+        double legHalfW = halfW;
+        for (const MAS::Turn* t : ct.turns) {
+            const std::string sectionName = sectionOfTurn(t);
+            auto found = opts.woundColumnPerSection.find(sectionName);
+            const double thisAxisX = found == opts.woundColumnPerSection.end() ? 0.0 : found->second.axisX;
+            const double thisHalfW =
+                found == opts.woundColumnPerSection.end() ? halfW : found->second.halfWidth;
+            if (!first && (thisAxisX != axisX || thisHalfW != legHalfW)) {
+                throw std::runtime_error(
+                    "ConductorBuilder: '" + ct.winding + " parallel " + std::to_string(ct.parallel) +
+                    "' has turns wrapping different core columns (axes " + std::to_string(axisX) +
+                    " and " + std::to_string(thisAxisX) +
+                    " m) — one conductor cannot be wound around two legs");
+            }
+            axisX = thisAxisX;
+            legHalfW = thisHalfW;
+            first = false;
+            if (found != opts.woundColumnPerSection.end()) {
+                if (isToroidal) {
+                    throw std::runtime_error(
+                        "ConductorBuilder: section '" + sectionName +
+                        "' carries multi-column placement on a toroidal core — a toroid has one "
+                        "column, so this is inconsistent MAS placement data");
+                }
+                if (found->second.shape != columnShape) {
+                    throw std::runtime_error(
+                        "ConductorBuilder: section '" + sectionName + "' wraps a core column of "
+                        "shape " + std::to_string(int(found->second.shape)) +
+                        " while the bobbin's column is shape " + std::to_string(int(columnShape)) +
+                        " — real winding builds every conductor of a magnetic with one wrap "
+                        "recipe, so mixed column shapes are not supported yet");
+                }
+                if (std::abs(found->second.halfDepth - halfD) > 1e-9) {
+                    throw std::runtime_error(
+                        "ConductorBuilder: section '" + sectionName + "' wraps a core column "
+                        "of half-depth " + std::to_string(found->second.halfDepth) +
+                        " m while the bobbin's column is " + std::to_string(halfD) +
+                        " m deep — legs of differing depth are not supported yet");
+                }
+                anyLateralColumn = true;
+            }
+        }
+        conductorAxisX[ci] = axisX;
+        conductorHalfW[ci] = legHalfW;
+    }
+    // A frame radial is a MAGNITUDE — the 3D placement is cylindrical about the wound column's
+    // axis and the azimuth, not the sign of x, decides which way a crossing faces. So a
+    // conductor whose drawn crossings straddle its own leg axis would fold two different turns
+    // onto the same station; refuse it rather than build the collapse. Every conductor of a
+    // real layout has all its crossings in one winding window, so this never fires on data MKF
+    // drew for a leg it actually placed the section in.
+    for (size_t ci = 0; ci < conductors.size(); ++ci) {
+        if (conductorAxisX[ci] == 0.0) continue;
+        bool first = true;
+        bool sideIsNegative = false;
+        for (const MAS::Turn* t : conductors[ci].turns) {
+            const bool thisSide = t->get_coordinates()[0] - conductorAxisX[ci] < 0;
+            if (!first && thisSide != sideIsNegative) {
+                throw std::runtime_error(
+                    "ConductorBuilder: '" + conductors[ci].winding + " parallel " +
+                    std::to_string(conductors[ci].parallel) +
+                    "' has turns drawn on BOTH sides of the core column it wraps (axis x = " +
+                    std::to_string(conductorAxisX[ci]) +
+                    " m) — a conductor's crossings all lie in one winding window");
+            }
+            sideIsNegative = thisSide;
+            first = false;
+        }
+    }
+    // Per-conductor counterparts of rectHalfW / zoff (see their main-column definitions above).
+    std::vector<double> conductorRectHalfW(conductors.size(), rectHalfW);
+    std::vector<double> conductorZoff(conductors.size(), zoff);
+    for (size_t ci = 0; ci < conductors.size(); ++ci) {
+        conductorRectHalfW[ci] = stadiumColumn ? 0.0 : conductorHalfW[ci];
+        conductorZoff[ci] = (isToroidal || effectivelyRound) ? 0.0 : (halfD - conductorHalfW[ci]);
+    }
+    // MKF draws the terminal/connection rectangles in the same absolute frame as the turns, so a
+    // lateral-leg section's routes carry that leg's x too. Move them into the leg frame exactly as
+    // station() moves the crossings, so the lead replay reads the same numbers the wrap does.
+    if (anyLateralColumn) {
+        for (auto& space : drawn) {
+            auto found = sectionAxisX.find(space.section);
+            if (found == sectionAxisX.end() || found->second == 0.0) continue;
+            if (space.coordinates.empty()) continue;
+            space.coordinates[0] = std::abs(space.coordinates[0] - found->second);
+        }
+    }
+
     double wwRadialHeight = 0.0;
     if (isToroidal) {
         const auto& wws = bobbinPd.get_winding_windows();
@@ -6018,13 +6172,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         wwRadialHeight = wws[0].get_radial_height().value();
     }
 
-    auto station = [](const MAS::Turn* t) -> PlanePt {
+    // ABT #871: the station is the turn's crossing in ITS OWN leg's frame — x measured from the
+    // leg axis, positive towards the winding window the section was placed in. For the main
+    // column (axisX = 0) that is the turn's own x, unchanged. For a leg the winding hugs from
+    // the window side, x - axisX comes out positive on the -x legs (the drawn turn sits between
+    // the leg and the centre post) and negative on the +x ones; the magnitude is the radial and
+    // the sign is which side the crossing is on, which the final placement re-applies.
+    auto station = [&](const MAS::Turn* t) -> PlanePt {
         const auto& c = t->get_coordinates();
         if (c.size() < 2) {
             throw std::runtime_error("ConductorBuilder: turn '" + t->get_name() +
                                      "' has fewer than 2 coordinates");
         }
-        return {c[0], c[1]};
+        const double axisX = turnAxisX(t);
+        // Main column (the only case before #871, and every single-window design): the turn's own
+        // x, untouched — toroidal ring stations are legitimately negative and must stay signed.
+        return {axisX == 0.0 ? c[0] : std::abs(c[0] - axisX), c[1]};
     };
 
     // All inner crossings with their wire radii — the corridor test for toroidal
@@ -6236,6 +6399,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         double maxDiam = 0.0;
         for (size_t cv = 0; cv < conductors.size(); ++cv) {
             const auto& ct = conductors[cv];
+            const double rectHalfW = conductorRectHalfW[cv];   // ABT #871: this conductor's leg
             const MAS::Wire& w = wireMap.at(ct.winding);
             auto [cw2, ch2] =
                 TurnBuilder::wireDimensions(w, *ct.turns.front(), /*paintCoating=*/true);
@@ -8239,6 +8403,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     for (size_t ci = 0; ci < conductors.size(); ++ci) {
         const auto& ct = conductors[ci];
+        // ABT #871: everything below runs in THIS conductor's leg frame (see conductorAxisX).
+        // For a main-column conductor these are the magnetic-wide values computed above.
+        const double rectHalfW = conductorRectHalfW[ci];
+        const double zoff = conductorZoff[ci];
         const MAS::Wire& wire = wireMap.at(ct.winding);
         const MAS::WireType wireType = wire.get_type();
         const bool rectWire = wireType == MAS::WireType::RECTANGULAR ||
@@ -9730,11 +9898,30 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // radial coordinate maps to 3D depth with the same zoff the leads use, so the
         // comparison is exact in this frame. Clearing it by one wire OD puts the tip face
         // outside the flange rather than flush with it.
+        // ABT #871: measured in THIS conductor's frame. For a main-column conductor the frame
+        // axis is the origin and this is the bobbin's own outer edge, unchanged. For a lateral
+        // leg the bobbin describes no flange at all (its columnWidth/thickness are the main
+        // column's), so the reach that stands in for one is the far edge of the winding window
+        // the conductor is actually wound in, measured from the leg axis.
+        const double frameAxisX = conductorAxisX[ci];
         double bobbinOuterX = 0.0;
-        for (const auto& ww : bobbinPd.get_winding_windows())
-            if (ww.get_coordinates() && ww.get_width())
-                bobbinOuterX = std::max(bobbinOuterX,
-                                        (*ww.get_coordinates())[0] + *ww.get_width() / 2.0);
+        for (const auto& ww : bobbinPd.get_winding_windows()) {
+            if (!ww.get_coordinates() || !ww.get_width()) continue;
+            const double windowLow = (*ww.get_coordinates())[0] - *ww.get_width() / 2.0;
+            const double windowHigh = (*ww.get_coordinates())[0] + *ww.get_width() / 2.0;
+            if (frameAxisX == 0.0) {
+                bobbinOuterX = std::max(bobbinOuterX, windowHigh);
+                continue;
+            }
+            const bool holdsThisConductor =
+                std::any_of(ct.turns.begin(), ct.turns.end(), [&](const MAS::Turn* t) {
+                    const double turnX = t->get_coordinates()[0];
+                    return turnX >= windowLow - 1e-9 && turnX <= windowHigh + 1e-9;
+                });
+            if (!holdsThisConductor) continue;
+            bobbinOuterX = std::max({bobbinOuterX, std::abs(windowHigh - frameAxisX),
+                                     std::abs(windowLow - frameAxisX)});
+        }
         // commonTipBase / commonTipWireRadius are window-global (see above), and fanMaxRaise
         // and maxRide are too, so every conductor lands on the SAME plane.
         const double leadTipRadius =
@@ -11037,6 +11224,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                           << "," << pr.seg.b.Y() * 1e3 << ","
                           << pr.seg.b.Z() * 1e3 << ") mm\n";
             }
+        }
+        // ABT #871: the path was built in its leg's frame (axis at the origin). Slide it onto
+        // the leg. Only the X positions move — the frame's axis is parallel to the main
+        // column's, so directions (arc axes, blend tangents) are unchanged, and everything
+        // downstream (Z end-run planning, the collision gate, emission) then sees one common
+        // frame again. A no-op for main-column conductors, which is every conductor of every
+        // single-window design.
+        if (conductorAxisX[ci] != 0.0) {
+            translatePathX(path, conductorAxisX[ci]);
         }
         paths.push_back(std::move(path));
     }

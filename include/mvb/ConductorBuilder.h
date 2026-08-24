@@ -2,10 +2,13 @@
 
 #include "MAS.hpp"
 #include "mvb/NamedShape.h"
+#include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
 #include <TopoDS_Shape.hxx>
 #include <array>
 #include <limits>
+#include <map>
+#include <string>
 #include <vector>
 
 namespace OpenMagnetics { class Coil; }
@@ -71,6 +74,18 @@ public:
         // solver. Nothing in the library sets this — only the tools and tests that exist to
         // investigate a specific refusal (see the [realwinding][diagnostic] tests).
         bool diagnosticSkipCollisionCheck = false;
+        // ABT #871 — MULTI-COLUMN PLACEMENT. Section name -> the core column that section's
+        // turns wrap, for the sections that do NOT wrap the main column. Resolved by the
+        // caller (MagneticBuilder::WoundColumnResolver reads the MAS placement chain
+        // section -> windingWindow -> column), because the column geometry lives on the CORE
+        // and this builder is only handed the coil and the bobbin.
+        //
+        // A conductor whose turns wrap a lateral leg is built in that leg's own frame — turn
+        // radials measured from the leg axis, the racetrack laid on the leg's half-dims —
+        // and the finished path is translated onto the leg. Sections absent from this map
+        // wrap the main column at the origin, which is every single-window design, so an
+        // empty map is byte-identical to the pre-#871 builder.
+        std::map<std::string, TurnBuilder::WoundColumnSpec> woundColumnPerSection;
     };
 
     // REAL-PATH POLYLINES: the fully-assembled, collision-checked conductor centrelines

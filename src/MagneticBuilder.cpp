@@ -513,6 +513,27 @@ private:
     std::map<std::string, int64_t> _sectionWindow;
 };
 
+// ABT #871: the same placement resolution, keyed by SECTION, for the real-winding conductor
+// builder. It works per (winding, parallel) rather than per turn, and needs the answer before
+// it starts, so it takes the whole map up front; sections wrapping the main column are left out
+// (the builder's own default), which makes the map empty for every single-window design.
+template<typename CoilT>
+std::map<std::string, TurnBuilder::WoundColumnSpec> resolveWoundColumnsPerSection(
+    const CoilT& coil, const MAS::MagneticCore& core,
+    const MAS::CoreBobbinProcessedDescription& bobbinPd) {
+    std::map<std::string, TurnBuilder::WoundColumnSpec> out;
+    auto sectionsOpt = coil.get_sections_description();
+    if (!sectionsOpt) return out;
+    const WoundColumnResolver resolver(coil, core, bobbinPd);
+    const auto sections = *sectionsOpt;
+    for (const auto& section : sections) {
+        if (auto spec = resolver.resolve(section.get_name(), "", section.get_name())) {
+            out[section.get_name()] = *spec;
+        }
+    }
+    return out;
+}
+
 // Internal turns builder. Public surface goes through buildTurnsNamed() or
 // buildTurnsNamedFromTurns(). The template covers both the MAS and the
 // OpenMagnetics coil/wire variants used internally by buildAllNamed.
@@ -1009,6 +1030,11 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
     // azimuths).
     if (!toroidalCore)
         for (const auto& ns : coreShapes) copts.coreObstacles.push_back(ns.shape);
+    // ABT #871: which core column each section wraps. The conductor builder is handed the coil
+    // and the bobbin only, and the leg geometry lives on the CORE — so the placement chain is
+    // resolved here, with the same resolver the ideal turn path already uses.
+    copts.woundColumnPerSection =
+        resolveWoundColumnsPerSection(magnetic.get_coil(), magnetic.get_core(), bobbinPd);
 
     std::vector<NamedShape> out;
     auto emitConductors = [&](bool coat, const std::string& suffix) {
@@ -1079,6 +1105,8 @@ std::vector<ConductorBuilder::PathPolyline> MagneticBuilder::buildRealWindingPat
         auto cores = buildCoreNamed(magnetic.get_core(), DEFAULT_CORE_POLYGON_SEGMENTS);
         for (const auto& ns : cores) copts.coreObstacles.push_back(ns.shape);
     }
+    copts.woundColumnPerSection =
+        resolveWoundColumnsPerSection(magnetic.get_coil(), magnetic.get_core(), bobbinPd);
     return ConductorBuilder::buildAllPaths(magnetic.get_coil(), bobbinPd, toroidalCore, copts);
 }
 
