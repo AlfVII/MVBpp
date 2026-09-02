@@ -34,7 +34,7 @@
                 "cti": "groupIIIA"
             },
             "maximumDimensions": {
-                "width": 0.035,
+                "width": 0.042,
                 "height": 0.03,
                 "depth": 0.028
             }
@@ -96,7 +96,7 @@
             "functionalDescription": {
                 "type": "twoPieceSet",
                 "material": "N97",
-                "shape": "RM 14/20",
+                "shape": "RM 14",
                 "gapping": [
                     {
                         "type": "subtractive",

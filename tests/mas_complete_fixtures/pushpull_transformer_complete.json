@@ -35,8 +35,8 @@
                 "pollutionDegree": "PD2"
             },
             "maximumDimensions": {
-                "width": 0.045,
-                "height": 0.04,
+                "width": 0.05,
+                "height": 0.05,
                 "depth": 0.035
             }
         },
@@ -137,13 +137,13 @@
             "functionalDescription": {
                 "type": "twoPieceSet",
                 "material": "3C95",
-                "shape": "ETD 44/22/15",
+                "shape": "ETD 49/25/16",
                 "gapping": [],
                 "numberStacks": 1
             }
         },
         "coil": {
-            "bobbin": "Bobbin ETD 44",
+            "bobbin": "Bobbin ETD 49",
             "functionalDescription": [
                 {
                     "name": "Primary 1",
@@ -162,14 +162,14 @@
                 {
                     "name": "Secondary 1",
                     "numberTurns": 4,
-                    "numberParallels": 4,
+                    "numberParallels": 2,
                     "isolationSide": "secondary",
                     "wire": "Litz 100x0.14 - Grade 1 - Single Served"
                 },
                 {
                     "name": "Secondary 2",
                     "numberTurns": 4,
-                    "numberParallels": 4,
+                    "numberParallels": 2,
                     "isolationSide": "secondary",
                     "wire": "Litz 100x0.14 - Grade 1 - Single Served"
                 }

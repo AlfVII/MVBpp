@@ -59,12 +59,21 @@ double flatten_dimension(const MAS::Dimension& dim);
 std::map<std::string, double> flatten_dimensions(const std::map<std::string, MAS::Dimension>& dims);
 
 // Build a polygon-approximated circle wire in the XY plane centered at origin
-// segments = 0 yields a perfect BRep circle edge
-TopoDS_Wire build_polygon_circle(double radius, int segments);
+// segments = 0 yields a perfect BRep circle edge.
+//
+// Faceting direction rule: a faceted solid must be a SUBSET of its nominal solid so
+// faceting can never create a collision the true geometry does not have. Boundaries
+// that ADD material (outer walls, posts, columns) use the default INSCRIBED polygon
+// (vertices on the circle, chords inside). Boundaries that CARVE a void another part
+// lives in (a toroid bore, a winding-window tool, a gap-cutting tool) must pass
+// circumscribed = true: the polygon's apothem equals the radius (vertices at
+// r / cos(pi/N)), so the carved void contains the nominal void.
+TopoDS_Wire build_polygon_circle(double radius, int segments, bool circumscribed = false);
 
 // Build a polygon-approximated cylinder solid along Z axis
-// segments = 0 yields exact revolved circle
-TopoDS_Shape build_polygon_cylinder(double height, double radius, int segments);
+// segments = 0 yields exact revolved circle; circumscribed as build_polygon_circle
+TopoDS_Shape build_polygon_cylinder(double height, double radius, int segments,
+                                    bool circumscribed = false);
 
 // Build a ring (torus approximation) as a solid by lofting a polygonal
 // circular cross-section (cross_segments sides) at `revolution_segments`

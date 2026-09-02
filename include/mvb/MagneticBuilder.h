@@ -36,6 +36,9 @@ struct DrawConfig {
     // true (FEM export) → the slow one-piece/conformal machinery: single body per parallel where a
     // sweep closes, a mitre-jointed conformal compound for dense toroids. Meshable but far slower.
     bool        femReady               = false;
+    // Minimum radius for ANY drawn corner/fillet, metres; 0 = each site's policy radius.
+    // Floors, never tightens (see ConductorBuilder::Options::minBendRadius).
+    double      minBendRadius          = 0.0;
 };
 
 class MagneticBuilder {

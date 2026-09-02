@@ -7,6 +7,7 @@
 #include <Bnd_Box.hxx>
 #include <gp_Trsf.hxx>
 #include <IFSelect_ReturnStatus.hxx>
+#include <Interface_Static.hxx>
 #include <STEPCAFControl_Reader.hxx>
 #include <STEPCAFControl_Writer.hxx>
 #include <StlAPI_Writer.hxx>
@@ -75,10 +76,45 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
     gp_Trsf metresToMillimetres;
     metresToMillimetres.SetScale(gp_Pnt(0, 0, 0), 1000.0);
 
+    // MVB_EXPORT_VALIDITY_DIAG: report per-solid B-Rep validity IMMEDIATELY BEFORE and
+    // IMMEDIATELY AFTER the metres->millimetres scale. The assembler's own exit gate proves
+    // every solid leaves construction valid, yet 06_llc reads back from STEP with one invalid
+    // solid; the scale is the only geometric operation in between, and ABT #860 already
+    // records that BRepBuilderAPI_Transform carries tolerances through the same factor.
+    const bool validityDiag = std::getenv("MVB_EXPORT_VALIDITY_DIAG") != nullptr;
+
     for (const auto& ns : shapes) {
         if (ns.shape.IsNull()) continue;
+        if (validityDiag) {
+            int idx = 0, badBefore = 0;
+            for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next(), ++idx) {
+                if (!BRepCheck_Analyzer(e.Current()).IsValid()) {
+                    ++badBefore;
+                    std::fprintf(stderr,
+                                 "[export-diag] PRE-SCALE invalid: '%s' solid %d\n",
+                                 ns.name.c_str(), idx);
+                }
+            }
+            if (badBefore == 0)
+                std::fprintf(stderr, "[export-diag] PRE-SCALE all %d solid(s) valid: '%s'\n",
+                             idx, ns.name.c_str());
+        }
         const TopoDS_Shape shapeMm =
             BRepBuilderAPI_Transform(ns.shape, metresToMillimetres).Shape();
+        if (validityDiag) {
+            int idx = 0, badAfter = 0;
+            for (TopExp_Explorer e(shapeMm, TopAbs_SOLID); e.More(); e.Next(), ++idx) {
+                if (!BRepCheck_Analyzer(e.Current()).IsValid()) {
+                    ++badAfter;
+                    std::fprintf(stderr,
+                                 "[export-diag] POST-SCALE invalid: '%s' solid %d\n",
+                                 ns.name.c_str(), idx);
+                }
+            }
+            if (badAfter == 0)
+                std::fprintf(stderr, "[export-diag] POST-SCALE all %d solid(s) valid: '%s'\n",
+                             idx, ns.name.c_str());
+        }
         // ABT #685: with per-solid names supplied, the shape goes in as an ASSEMBLY so every solid
         // becomes its own named product. Without them a multi-solid conductor arrives as one
         // unnamed-parts product and the viewer invents the numbering ("Primary parallel 001"),
@@ -120,6 +156,49 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
                 }
             }
         }
+    }
+
+    // MVB_STEP_WRITER_SWEEP: the geometry is provably valid in memory at this point (see the
+    // validity diag above), so any invalid solid read back from the file is introduced by the
+    // WRITE/READ round-trip. Writing and re-reading costs seconds against a ~25 min geometry
+    // build, so try the candidate writer settings here, in one run, and report which of them
+    // survives a round-trip. write.precision.mode: 0=average tolerance of the shape (OCC's
+    // default, and the suspect -- an average UNDER-states the tolerance of the loosest face,
+    // so on re-read that face violates its own written tolerance), 2=maximum tolerance,
+    // 1=explicit value. write.surfacecurve.mode 0 drops pcurves so the reader recomputes them.
+    if (std::getenv("MVB_STEP_WRITER_SWEEP")) {
+        struct Cfg { const char* name; int precMode; double precVal; int curveMode; };
+        const Cfg cfgs[] = {
+            {"default(prec=0,pcurves=1)", 0, 0.0, 1},
+            {"prec=2(max)", 2, 0.0, 1},
+            {"prec=1(val=1e-5)", 1, 1e-5, 1},
+            {"prec=2,nopcurves", 2, 0.0, 0},
+        };
+        for (const Cfg& c : cfgs) {
+            Interface_Static::SetIVal("write.precision.mode", c.precMode);
+            if (c.precMode == 1) Interface_Static::SetRVal("write.precision.val", c.precVal);
+            Interface_Static::SetIVal("write.surfacecurve.mode", c.curveMode);
+            const std::string tmp = filepath + ".sweep.step";
+            STEPCAFControl_Writer w;
+            if (!w.Transfer(doc) || w.Write(tmp.c_str()) != IFSelect_RetDone) {
+                std::fprintf(stderr, "[writer-sweep] %-28s WRITE FAILED\n", c.name);
+                continue;
+            }
+            int bad = 0, total = 0;
+            for (const auto& rs : importSTEP(tmp)) {
+                for (TopExp_Explorer e(rs.shape, TopAbs_SOLID); e.More(); e.Next()) {
+                    ++total;
+                    if (!BRepCheck_Analyzer(e.Current()).IsValid()) ++bad;
+                }
+            }
+            std::fprintf(stderr, "[writer-sweep] %-28s invalid=%d of %d solids\n",
+                         c.name, bad, total);
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+        }
+        // Leave the writer on OCC's defaults; the chosen setting is applied below.
+        Interface_Static::SetIVal("write.precision.mode", 0);
+        Interface_Static::SetIVal("write.surfacecurve.mode", 1);
     }
 
     STEPCAFControl_Writer writer;

@@ -14,6 +14,7 @@
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <BRep_Tool.hxx>
+#include <BOPAlgo_ArgumentAnalyzer.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepCheck_Result.hxx>
 #include <BRepCheck_ListOfStatus.hxx>
@@ -22,6 +23,7 @@
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
+#include <BRepTools_WireExplorer.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <cstdio>
 #include <BRepAlgoAPI_Cut.hxx>
@@ -35,6 +37,15 @@
 #include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepPrimAPI_MakeHalfSpace.hxx>
+#include <ShapeUpgrade_ShapeDivideClosed.hxx>
+#include <gp_Pln.hxx>
+#include <Geom_Ellipse.hxx>
+#include <Geom_TrimmedCurve.hxx>
+#include <gp_Elips.hxx>
+#include <Precision.hxx>
+#include <BRepBuilderAPI_Sewing.hxx>
+#include <BRepBuilderAPI_MakeSolid.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepOffsetAPI_MakePipeShell.hxx>
 #include <BRepLib.hxx>
@@ -227,19 +238,25 @@ std::pair<gp_Pnt, gp_Pnt> primEndpoints(const Primitive& p) {
 }
 
 // --- geometry emission ------------------------------------------------------------------
-TopoDS_Wire wireProfileWire(const gp_Pnt& center, const gp_Dir& normal, double radius,
-                            int segments) {
-    // DETERMINISTIC section orientation. gp_Ax2(center, normal) lets OCC choose the X
-    // direction, so two primitives meeting with the SAME tangent could still get n-gons rotated
-    // relative to each other: their abutting faces then only partially coincide, and at a mitre
-    // junction the pieces can miss entirely (measured: a 56-primitive rect-column conductor fell
-    // into 7 components with no endpoint gaps and nothing dropped). Deriving X from a fixed world
-    // reference makes the orientation a pure function of the tangent, so tangent neighbours share
-    // an exactly coincident section -- which is what conformal abutment requires.
+// The section frame every round profile must share. gp_Ax2(center, normal) lets OCC pick the X
+// direction, so two primitives meeting with the SAME tangent can still get sections rotated
+// relative to each other; their abutting faces then only partially coincide. Deriving X from a
+// fixed world reference makes the orientation a pure function of the tangent, so tangent
+// neighbours share an EXACTLY coincident section -- which is what conformal abutment requires.
+static gp_Ax2 deterministicSectionFrame(const gp_Pnt& center, const gp_Dir& normal) {
     gp_XYZ ref(0, 1, 0);
     if (std::abs(normal.XYZ().Dot(ref)) > 0.9) ref = gp_XYZ(1, 0, 0);
-    gp_XYZ xdir = ref - normal.XYZ() * normal.XYZ().Dot(ref);
-    gp_Ax2 plane(center, normal, gp_Dir(xdir));
+    const gp_XYZ xdir = ref - normal.XYZ() * normal.XYZ().Dot(ref);
+    return gp_Ax2(center, normal, gp_Dir(xdir));
+}
+
+TopoDS_Wire wireProfileWire(const gp_Pnt& center, const gp_Dir& normal, double radius,
+                            int segments) {
+    // Deterministic frame (see deterministicSectionFrame): a mitre junction whose two sides
+    // disagree on the section's X direction leaves faces that only partially coincide -- measured
+    // as a 56-primitive rect-column conductor falling into 7 components with no endpoint gaps and
+    // nothing dropped.
+    gp_Ax2 plane = deterministicSectionFrame(center, normal);
     if (segments <= 0) {
         gp_Circ circ(plane, radius);
         return BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circ).Edge()).Wire();
@@ -267,6 +284,83 @@ TopoDS_Face wireProfile(const gp_Pnt& center, const gp_Dir& normal, double radiu
     return BRepBuilderAPI_MakeFace(wireProfileWire(center, normal, radius, segments)).Face();
 }
 
+// wireProfileWire with an explicit phase: the polygon rotated by `phase0` about the axis.
+// Used to CONTINUE a neighbour's section phase through a junction: the sweep keeps its exact
+// nominal on-plane profile (feeding an off-plane neighbour wire to MakePipeShell re-anchors
+// the sweep and corrupts it -- measured: an invalid 121-face solid and -0.22 mm^3 of copper
+// on 10_emi), while the vertex azimuths line up with the section the copper actually arrives
+// with, which is what removes the phase-mismatch lens at the junction.
+static TopoDS_Wire wireProfileWirePhased(const gp_Pnt& center, const gp_Dir& normal,
+                                         double radius, int segments, double phase0) {
+    gp_Ax2 plane = deterministicSectionFrame(center, normal);
+    BRepBuilderAPI_MakePolygon poly;
+    gp_Dir dx = plane.XDirection();
+    gp_Dir dy = plane.YDirection();
+    const double offset = kPi / segments;
+    for (int i = 0; i < segments; ++i) {
+        const double ang = kTwoPi * i / segments + offset + phase0;
+        gp_XYZ p = center.XYZ() + dx.XYZ() * (radius * std::cos(ang)) +
+                   dy.XYZ() * (radius * std::sin(ang));
+        poly.Add(gp_Pnt(p));
+    }
+    poly.Close();
+    return poly.Wire();
+}
+
+// The neighbour section's phase in this piece's own deterministic frame at (center, normal):
+// the angle of its first vertex, minus the polygon's base offset. Returns false when the wire
+// is unusable (wrong vertex count, vertex on the axis).
+// Kill-switches for the section handoff, for bisecting a mesh regression against a build that
+// predates it: MVB_NO_SECTION_HANDOFF disables both halves, MVB_NO_CAP_POSITIONS keeps the
+// phase continuation but never adopts a neighbour's vertex POSITIONS.
+static bool handoffDisabled() {
+    static const bool off = std::getenv("MVB_NO_SECTION_HANDOFF") != nullptr;
+    return off;
+}
+static bool capPositionsDisabled() {
+    static const bool off = std::getenv("MVB_NO_CAP_POSITIONS") != nullptr ||
+                            std::getenv("MVB_NO_SECTION_HANDOFF") != nullptr;
+    return off;
+}
+// PHASE CONTINUATION IS OFF BY DEFAULT. The 2026-08-30 control matrix separated the handoff's
+// two halves and they behave oppositely: adopting a neighbour's vertex POSITIONS is what makes
+// 12_boost mesh (262/262; without it 1/262), while ROTATING a piece's own section to a
+// neighbour's phase is what breaks 04_forward (5/418 with phase continuation in ANY gating,
+// 418/418 with the whole handoff off). A position adoption is exact -- the two pieces then own
+// literally the same cap polygon -- whereas a phase rotation re-generates a DIFFERENT polygon
+// that only agrees with the neighbour at one vertex when the junction is oblique. So: adopt
+// positions where they fit, and never fall back to a rotation. MVB_PHASE_CONTINUATION=1
+// restores it for A/B measurement.
+static bool phaseContinuationEnabled() {
+    // ON by default: this is part of the configuration measured green on 10_emi (45/45),
+    // 12_boost (262/262) and 02_flyback (588/588). The 2026-08-30 attempt to default it off
+    // ("positions only") was validated on 04 only -- 04 stayed red regardless -- and 10's
+    // riser junctions were never re-tested under it. MVB_NO_PHASE_CONTINUATION=1 for A/B.
+    static const bool on = std::getenv("MVB_NO_PHASE_CONTINUATION") == nullptr &&
+                           std::getenv("MVB_NO_SECTION_HANDOFF") == nullptr;
+    return on;
+}
+
+static bool sectionPhaseOf(const TopoDS_Wire& w, const gp_Pnt& center, const gp_Dir& normal,
+                           double r, int segments, double& phase0) {
+    if (handoffDisabled() || !phaseContinuationEnabled()) return false;
+    int n = 0;
+    gp_Pnt v0;
+    bool got = false;
+    for (BRepTools_WireExplorer we(w); we.More(); we.Next()) {
+        if (!got) { v0 = BRep_Tool::Pnt(we.CurrentVertex()); got = true; }
+        ++n;
+    }
+    if (!got || n != segments) return false;
+    const gp_Ax2 fr = deterministicSectionFrame(center, normal);
+    const gp_XYZ d = v0.XYZ() - center.XYZ();
+    const double x = d.Dot(fr.XDirection().XYZ());
+    const double y = d.Dot(fr.YDirection().XYZ());
+    if (x * x + y * y < 0.25 * r * r) return false;
+    phase0 = std::atan2(y, x) - kPi / segments;
+    return true;
+}
+
 // The same round profile, but as TWO half-circle edges instead of one closed circle.
 // Sweeping a CLOSED circular edge produces a single PERIODIC B-spline surface carrying a seam
 // curve, and gmsh cannot order the boundary loop of such a face -- it aborts the 2D stage with
@@ -277,7 +371,13 @@ TopoDS_Face wireProfile(const gp_Pnt& center, const gp_Dir& normal, double radiu
 // identical solid, now meshable. (ABT #332)
 TopoDS_Wire wireProfileWireSplit(const gp_Pnt& center, const gp_Dir& normal, double radius,
                                  int pieces = 2) {
-    gp_Circ circ(gp_Ax2(center, normal), radius);
+    // The SAME deterministic frame as wireProfileWire. This used to be a bare
+    // gp_Ax2(center, normal), so a SEG built with the split profile and a tangent neighbour
+    // built with the polygon/circle profile started their sections at different angles: the
+    // abutting faces then coincide only partially, which is precisely the "co-located but not
+    // bit-coincident" junction that survives OCCBooleanGlue and reaches gmsh as overlapping
+    // facets (RC2 of the 2026-08-24 corpus audit).
+    gp_Circ circ(deterministicSectionFrame(center, normal), radius);
     BRepBuilderAPI_MakeWire w;
     for (int i = 0; i < pieces; ++i)
         w.Add(BRepBuilderAPI_MakeEdge(circ, kTwoPi * i / pieces, kTwoPi * (i + 1) / pieces).Edge());
@@ -349,6 +449,22 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
             return TopoDS_Edge();
         }
     }
+    // THE SPINE'S 3D CURVE IS AN APPROXIMATION OF THE PCURVE, AND ITS TOLERANCE IS THE
+    // COPPER'S (2026-09-02, flyback_transformer_complete ride-over). BRepLib::BuildCurves3d's
+    // default tolerance is 1e-5 in the edge's own unit -- these edges are in METRES, so the
+    // helix reaches MakePipeShell as a 5-pole B-spline up to 10 um off the true helix.
+    // Measured on the flyback's 'Secondary parallel 0' raised wrap: spine 2.39 um off, swept
+    // tube radius about the exact helix 0.5553..0.5601 mm for a 0.55771 mm wire. The
+    // centreline model is exact (the ride-over sits 1.115499990 mm from the dragback run, one
+    // coated OD to the bit), and the bare-to-bare gap that leaves is 80 nm -- so the
+    // approximation alone puts the swept wrap 1.50 um INSIDE the exact cylinder of the run
+    // (omfem_step_intersect: OVERLAP on 8 ride-over pairs; every helix-vs-straight pair in the
+    // corpus is exposed to it, helix-vs-helix neighbours only hide it because they share the
+    // error). MakePipeShell's own surface fit (mm frame, 1e-4 mm) is within 1 nm and is not
+    // the deficit. 1e-8 m = 10 nm: the linear helix and cone fit to <= 1 nm with 8 and 6 poles
+    // (5 and 4 before), the cosine blends to <= 7 nm with ~50 poles, and the sweep time is
+    // unchanged (measured standalone, scratchpad/ride/helix_sweep_exp*.log).
+    constexpr double kSpine3dTol = 1e-8;   // metres
     if (pr.kind == Primitive::SPIRAL) {
         // Every spiral lives on an ANALYTIC surface of revolution about its vertical
         // axis: a cylinder when the radius is constant, a cone otherwise (radius and
@@ -425,7 +541,7 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                         return TopoDS_Edge();
                     e = BRepBuilderAPI_MakeEdge(interp.Curve(), surf).Edge();
                 }
-                BRepLib::BuildCurves3d(e);
+                BRepLib::BuildCurves3d(e, kSpine3dTol);
                 return e;
             } catch (const Standard_Failure&) {
                 return TopoDS_Edge();
@@ -488,7 +604,7 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                 interp.Perform();
                 if (!interp.IsDone() || interp.Curve().IsNull()) return TopoDS_Edge();
                 TopoDS_Edge e = BRepBuilderAPI_MakeEdge(interp.Curve(), plane).Edge();
-                BRepLib::BuildCurves3d(e);
+                BRepLib::BuildCurves3d(e, kSpine3dTol);
                 return e;
             } catch (const Standard_Failure&) {
                 return TopoDS_Edge();
@@ -526,7 +642,7 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
             interp.Perform();
             if (!interp.IsDone() || interp.Curve().IsNull()) return TopoDS_Edge();
             TopoDS_Edge e = BRepBuilderAPI_MakeEdge(interp.Curve(), plane).Edge();
-            BRepLib::BuildCurves3d(e);
+            BRepLib::BuildCurves3d(e, kSpine3dTol);
             return e;
         } catch (const Standard_Failure&) {
             return TopoDS_Edge();
@@ -702,6 +818,71 @@ gp_Dir primFwdEnd(const Primitive& p, double r) {
     return gp_Dir(1, 0, 0);
 }
 
+
+// ---- CHUNK 7: THE JOINT SPHERE (Alf, 2026-08-25) -----------------------------------------
+// A wire IS the set of points within r of its centreline -- nothing else is copper. Two tubes
+// meeting at a corner cover all of that except the notch on the OUTSIDE of the bend, and the
+// exact shape filling that notch is a SPHERE of radius r at the corner point. That is why this
+// is the physically right fill and the axial "bridge growth" it replaces was not: growing a tube
+// by r*tan(theta) past the joint puts copper up to r*tan(theta)*sin(theta) OUTSIDE the envelope,
+// copper the real wire does not have. Measured on 14_dab: an ~8.6 deg bridged junction poked out
+// 9.67 um and interpenetrated the sibling parallel by 9.6 um, while MKF's stations were correctly
+// spaced (0.855247 mm against a 0.855 mm insulated envelope) and the analytic centrelines cleared.
+// A sphere of radius r is within r of the centreline everywhere, so it CANNOT reach a foreign
+// conductor whose centreline is rA + rB away. No margin, no tolerance, no chosen constant.
+//
+// FACETED, and INSCRIBED like wireProfileWire, for two reasons: the drawn copper must never
+// protrude past the real envelope, and a quadric sphere is closed in BOTH parameters, so it stays
+// periodic even after the NURBS pass and would land straight back on gmsh's fragile periodic
+// mesher (OCCFace.cpp:142). Planar facets are never periodic.
+static TopoDS_Shape jointSphere(const gp_Pnt& c, double r, int segments) {
+    if (r <= 0.0) return {};
+    if (segments <= 0) return BRepPrimAPI_MakeSphere(c, r).Shape();
+    const int nu = std::max(4, segments);          // divisions around the equator
+    const int nv = std::max(2, segments / 2);      // divisions pole to pole
+    const gp_Pnt north(c.X(), c.Y(), c.Z() + r);
+    const gp_Pnt south(c.X(), c.Y(), c.Z() - r);
+    std::vector<std::vector<gp_Pnt>> ring(nv);     // latitudes j = 1 .. nv-1 (index j-1)
+    for (int j = 1; j < nv; ++j) {
+        const double phi = kPi * j / nv;
+        const double z = r * std::cos(phi), rr = r * std::sin(phi);
+        std::vector<gp_Pnt> row;
+        row.reserve(nu);
+        for (int i = 0; i < nu; ++i) {
+            const double th = kTwoPi * i / nu;
+            row.emplace_back(c.X() + rr * std::cos(th), c.Y() + rr * std::sin(th), c.Z() + z);
+        }
+        ring[j - 1] = std::move(row);
+    }
+    BRepBuilderAPI_Sewing sew(1e-9);
+    auto addFace = [&](std::initializer_list<gp_Pnt> pts) {
+        BRepBuilderAPI_MakePolygon poly;
+        for (const auto& p : pts) poly.Add(p);
+        poly.Close();
+        if (!poly.IsDone()) return;
+        BRepBuilderAPI_MakeFace f(poly.Wire());
+        if (f.IsDone()) sew.Add(f.Face());
+    };
+    for (int i = 0; i < nu; ++i) {
+        const int i2 = (i + 1) % nu;
+        addFace({north, ring[0][i], ring[0][i2]});
+        addFace({south, ring[nv - 2][i2], ring[nv - 2][i]});
+    }
+    for (int j = 0; j + 1 < nv - 1; ++j)
+        for (int i = 0; i < nu; ++i) {
+            const int i2 = (i + 1) % nu;
+            addFace({ring[j][i], ring[j][i2], ring[j + 1][i2], ring[j + 1][i]});
+        }
+    sew.Perform();
+    const TopoDS_Shape shell = sew.SewedShape();
+    if (shell.IsNull()) return {};
+    for (TopExp_Explorer ex(shell, TopAbs_SHELL); ex.More(); ex.Next()) {
+        BRepBuilderAPI_MakeSolid mk(TopoDS::Shell(ex.Current()));
+        if (mk.IsDone() && !mk.Shape().IsNull()) return mk.Shape();
+    }
+    return {};
+}
+
 // A round solid for one primitive, grown by overA/overB past its start/end so a tilted bisector
 // plane fully crosses the tube there (SEG -> longer cylinder, ARC3 -> wider revolve, else pipe).
 // A tangent junction passes 0 -> the tube ends flush on a perpendicular cap, no growth, no cut.
@@ -711,8 +892,40 @@ gp_Dir primFwdEnd(const Primitive& p, double r) {
 // known failure cluster on them -- the faceted section has no seam at all, which is why the
 // pipeline has always meshed with segments=12. The conformal assembler must honour the same
 // knob the retired sweep path did.
+// startProfileOverride / endCapOut: SECTION-WIRE HANDOFF ACROSS TANGENT JUNCTIONS. At
+// segments > 0 a prism's polygon phase comes from deterministicSectionFrame while a pipe's
+// end phase is whatever MakePipeShell's transport produced -- two 16-gons in the same plane
+// with different phases, which is the measured source of the ride-chain junction lenses
+// (7.2e-5 mm^3) and of the imprint shards their trims leave (ABT #935: a 30 um grazing band
+// whose 2D mesh folds). Handing the ACTUAL end-section wire to the next piece as its start
+// profile makes every tangent junction bit-identical by construction. The override is only
+// adopted after a geometric sanity check (vertices in the start plane, at the wire radius);
+// anything else falls back to the piece's own profile.
+static bool sectionWireFits(const TopoDS_Wire& w, const gp_Pnt& a, const gp_Dir& dir, double r,
+                            int segments) {
+    int n = 0;
+    for (TopExp_Explorer vx(w, TopAbs_VERTEX); vx.More(); vx.Next()) ++n;
+    if (segments > 0 && n != 2 * segments) return false;  // closed wire: each vertex twice
+    // Same plane tolerance as the prism-side adoption (0.25 r): a neighbour's real end
+    // section sits where its sweep put it, measured 0.13 r off the nominal plane on 10_emi,
+    // while genuine endpoint mismatches are 1.5 r. Refusing the real cap left an
+    // audit-visible 3.9e-5 mm^3 lens at exactly the riser->pipe junctions.
+    const double planeTol = std::max(2e-6, 0.25 * r);
+    for (TopExp_Explorer vx(w, TopAbs_VERTEX); vx.More(); vx.Next()) {
+        const gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(vx.Current()));
+        const gp_Vec d(a, p);
+        if (std::abs(d.Dot(gp_Vec(dir))) > planeTol) return false;  // out of the start plane
+        const double rad = d.Magnitude();
+        if (rad < 0.8 * r || rad > 1.6 * r) return false;           // not this wire's section
+    }
+    return true;
+}
+
 static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, double overB,
-                                  int segments) {
+                                  int segments,
+                                  const TopoDS_Wire* startProfileOverride = nullptr,
+                                  TopoDS_Wire* endCapOut = nullptr,
+                                  bool* startPhasedOut = nullptr) {
     if (pr.kind == Primitive::SEG) {
         gp_Vec d(pr.seg.a, pr.seg.b);
         double len = d.Magnitude();
@@ -720,14 +933,48 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         gp_Dir dir(d);
         gp_Pnt a = pr.seg.a.Translated(gp_Vec(dir) * (-overA));
         const double total = len + overA + overB;
-        if (segments <= 0)
-            return BRepPrimAPI_MakeCylinder(gp_Ax2(a, dir), r, total).Shape();
-        TopoDS_Face prof = wireProfile(a, dir, r, segments);
+        // Never a quadric MakeCylinder: its side is ONE closed periodic face, which gmsh sends
+        // to its fragile periodic mesher (OCCFace.cpp:142). A prism over the SPLIT profile is the
+        // identical solid built from ordinary patches -- the ABT #332 remedy, applied here too.
+        TopoDS_Wire segProfWire;
+        double segPhase = 0.0;
+        if (startProfileOverride && !startProfileOverride->IsNull() && segments > 0 &&
+            overA <= 0.0 && sectionPhaseOf(*startProfileOverride, a, dir, r, segments, segPhase)) {
+            segProfWire = wireProfileWirePhased(a, dir, r, segments, segPhase);
+            if (startPhasedOut) *startPhasedOut = true;
+        } else if (segments > 0) {
+            segProfWire = wireProfileWire(a, dir, r, segments);
+        }
+        TopoDS_Face prof =
+            !segProfWire.IsNull()
+                ? BRepBuilderAPI_MakeFace(segProfWire).Face()
+                : BRepBuilderAPI_MakeFace(wireProfileWireSplit(a, dir, r, 2)).Face();
+        if (endCapOut && !segProfWire.IsNull()) {
+            gp_Trsf tr;
+            tr.SetTranslation(gp_Vec(dir) * total);
+            *endCapOut =
+                TopoDS::Wire(BRepBuilderAPI_Transform(segProfWire, tr, Standard_True).Shape());
+        }
         return BRepPrimAPI_MakePrism(prof, gp_Vec(dir) * total).Shape();
     }
     if (pr.kind == Primitive::ARC3) {
         double radius = pr.arc.v0.Modulus();
         if (radius < 1e-12 || std::abs(pr.arc.sweep) < 1e-12) return {};
+        // TIGHT-ARC REPORT (diagnostic only -- changes no geometry). This ARC3 is built by
+        // REVOLVING the wire profile about an axis at distance `radius`. That revolve
+        // self-intersects when radius <= r, because the profile then sweeps THROUGH the axis;
+        // it is marginal for radius only slightly above r, where the inner facets converge on
+        // the axis. Nothing here checked it, and the result is copper that is BRepCheck-VALID,
+        // watertight and overlap-clean while being BOPAlgo SELF-INTERSECTING (ABT #958:
+        // 02_flyback ships 42 such chunks, exactly one per turn of Primary parallel 0).
+        if (std::getenv("MVB_TIGHTARC_DIAG") && radius <= r * 2.0) {
+            std::fprintf(stderr,
+                "[tight-arc] '%s' radius=%.6f mm wireR=%.6f mm ratio=%.3f sweep=%.4f deg "
+                "arclen=%.6f mm%s\n",
+                pr.label.c_str(), radius * 1e3, r * 1e3, radius / r,
+                pr.arc.sweep * 180.0 / kPi, std::abs(pr.arc.sweep) * radius * 1e3,
+                radius <= r ? "  <-- REVOLVE CROSSES THE AXIS" : "");
+        }
         double sgn = pr.arc.sweep < 0 ? -1.0 : 1.0;
         double ddA = (overA / radius) * sgn, ddB = (overB / radius) * sgn;
         double total = pr.arc.sweep + ddA + ddB;
@@ -745,8 +992,60 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         gp_XYZ v0e = rotateXYZ(pr.arc.v0, pr.arc.axis, -ddA);
         gp_Pnt start(pr.arc.c.XYZ() + v0e);
         gp_XYZ tangent = pr.arc.axis.Crossed(v0e);
-        TopoDS_Face prof = wireProfile(start, gp_Dir(tangent), r, segments);
+        // Same for the arc: revolving a CLOSED circle makes a torus face that wraps in the
+        // profile direction. The split profile revolves to ordinary patches instead.
+        TopoDS_Wire profWire;
+        double arcPhase = 0.0;
+        // TRIED AND REVERTED (2026-08-30): phase-adopting GROWN arcs at mitred junctions
+        // (reading the phase at the ungrown junction and rotating the profile back by -ddA),
+        // on the theory that canonical arcs between phase-adopted prisms create the measured
+        // 1.6 um rim mismatches. Measured: the rotation SPREAD into the corner pieces (run
+        // rotation doubled to +-3.2 um, corners left canonical positions entirely) and 04
+        // stayed 5/418. Arcs adopt only at ungrown tangent junctions, as before.
+        if (startProfileOverride && !startProfileOverride->IsNull() && segments > 0 &&
+            overA <= 0.0 &&
+            sectionPhaseOf(*startProfileOverride, start, gp_Dir(tangent), r, segments,
+                           arcPhase)) {
+            profWire = wireProfileWirePhased(start, gp_Dir(tangent), r, segments, arcPhase);
+            if (startPhasedOut) *startPhasedOut = true;
+        } else if (segments > 0) {
+            profWire = wireProfileWire(start, gp_Dir(tangent), r, segments);
+        }
+        TopoDS_Face prof =
+            !profWire.IsNull()
+                ? BRepBuilderAPI_MakeFace(profWire).Face()
+                : BRepBuilderAPI_MakeFace(wireProfileWireSplit(start, gp_Dir(tangent), r, 2)).Face();
         BRepPrimAPI_MakeRevol rev(prof, gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)), total);
+        if (rev.IsDone() && std::getenv("MVB_CAP_DEBUG")) {
+            // Where the revolve's PLANAR caps land against the arc's analytic ends (the same
+            // question [pipe-cap] asks of a sweep): centre offset and normal tilt at each end.
+            const gp_Pnt endPt(pr.arc.c.XYZ() + rotateXYZ(pr.arc.v0, pr.arc.axis, pr.arc.sweep));
+            const gp_Dir tStart = primFwdStart(pr, r), tEnd = primFwdEnd(pr, r);
+            for (TopExp_Explorer fe(rev.Shape(), TopAbs_FACE); fe.More(); fe.Next()) {
+                BRepAdaptor_Surface sf(TopoDS::Face(fe.Current()));
+                if (sf.GetType() != GeomAbs_Plane) continue;
+                GProp_GProps fg;
+                BRepGProp::SurfaceProperties(fe.Current(), fg);
+                const gp_Pnt c = fg.CentreOfMass();
+                const gp_Dir n = sf.Plane().Axis().Direction();
+                const double dS = c.Distance(start), dE = c.Distance(endPt);
+                const bool isStart = dS < dE;
+                const gp_Dir want = isStart ? tStart : tEnd;
+                std::cerr << "[revolve-cap] '" << pr.label << "' " << (isStart ? "start" : "end")
+                          << " cap: centre off nominal " << (isStart ? dS : dE) * 1e6
+                          << " um, normal off analytic tangent "
+                          << std::min(n.Angle(want), n.Angle(want.Reversed())) * 180.0 / kPi
+                          << " deg, area " << fg.Mass() * 1e6 << " mm2 vs pi r^2 "
+                          << kPi * r * r * 1e6 << "\n";
+            }
+        }
+        if (rev.IsDone() && endCapOut && !profWire.IsNull()) {
+            // A revolve's end section is EXACTLY the start profile rotated by the sweep.
+            gp_Trsf rot;
+            rot.SetRotation(gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)), total);
+            *endCapOut = TopoDS::Wire(
+                BRepBuilderAPI_Transform(profWire, rot, Standard_True).Shape());
+        }
         return rev.IsDone() ? rev.Shape() : TopoDS_Shape();
     }
     // BLEND / SPIRAL: swept as exact pipes. A pipe has no revolve/extrude axis to overhang
@@ -757,6 +1056,28 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
     // (measured: every lead<->wrap corner on PQ33 left a gap -> 5 disconnected components).
     auto pts = samplePrim(pr, r);
     if (pts.size() < 2) return {};
+    // SHORT-SPINE REPORT (diagnostic only -- changes no geometry). MakePipeShell sweeps the
+    // profile along this spine; the only guard above is "at least two points". A spine whose
+    // LENGTH is at or below the profile DIAMETER cannot be swept cleanly -- the inner laterals
+    // converge and cross, giving a solid that is BRepCheck-VALID, watertight and overlap-clean
+    // while being BOPAlgo SELF-INTERSECTING. That is ABT #958: 02_flyback ships 42 such chunks,
+    // exactly one per turn of Primary parallel 0, each 18 faces [bspline:16, plane:2] and each
+    // ~0.42 mm across against a 0.3923 mm wire. Measured here rather than assumed: the ARC3
+    // revolve was cleared first (zero tight-arc reports on 02), so the fold is on THIS path.
+    if (std::getenv("MVB_SHORTSPINE_DIAG")) {
+        double spineLen = 0.0;
+        for (size_t i = 1; i < pts.size(); ++i) spineLen += pts[i - 1].Distance(pts[i]);
+        if (spineLen <= 4.0 * r) {
+            std::fprintf(stderr,
+                "[short-spine] '%s' kind=%s spineLen=%.6f mm wireR=%.6f mm ratio(len/diam)=%.3f "
+                "pts=%zu%s\n",
+                pr.label.c_str(),
+                pr.kind == Primitive::SPIRAL ? "SPIRAL" :
+                pr.kind == Primitive::BLEND  ? "BLEND"  : "other",
+                spineLen * 1e3, r * 1e3, spineLen / (2.0 * r), pts.size(),
+                spineLen <= 2.0 * r ? "  <-- SHORTER THAN THE WIRE IS THICK" : "");
+        }
+    }
     // Where the growth can live INSIDE the curve (spirals on an analytic surface), put it there:
     // the spine is then a single edge and the pipe a single lateral face, with no seam for the
     // mitre plane to land on. See primEdgeGrowsAnalytically.
@@ -806,7 +1127,33 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         // EXACT affine map both ways, so this is a numerical frame choice, not an
         // approximation. TODO: migrate the other MakePipeShell sites to the same frame as
         // they are touched.
-        TopoDS_Wire prof = wireProfileWire(spineStart, spineDir, r, segments);
+        // A CLOSED circular profile sweeps into ONE periodic B-spline carrying a seam, which
+        // gmsh refuses (ABT #332, and confirmed 2026-08-25: gmsh dispatches on the SURFACE's
+        // periodicity, OCCFace.cpp:142). Measured on 14_dab at segments=0: 246 of its 453 faces
+        // were full-period wraps from exactly this sweep. The split profile yields ordinary
+        // patches with real boundaries -- the IDENTICAL solid, no extra boolean, no geometry
+        // change -- and the NURBS pass then clears the residual periodicity. Faceted profiles
+        // (segments > 0) are already non-periodic, so they keep the polygon.
+        // PHASE-ONLY continuation (see wireProfileWirePhased): never hand a neighbour's raw
+        // wire to MakePipeShell -- take its section phase, keep the exact nominal profile.
+        TopoDS_Wire prof;
+        double phase0 = 0.0;
+        if (startProfileOverride && !startProfileOverride->IsNull() && segments > 0 &&
+            overA <= 0.0 &&
+            sectionPhaseOf(*startProfileOverride, spineStart, spineDir, r, segments, phase0)) {
+            // EXACT phase continuation (the v18-green behaviour for 10_emi's pipes). The
+            // half-facet stagger belongs only at tangent junctions with a STRAIGHT source --
+            // see the stagger rule in the assembler loop; pipes are curved receivers and a
+            // staggered chord cuts their tightly curved strips (measured: 10_emi fell to 5/50
+            // with the stagger applied here).
+            prof = wireProfileWirePhased(spineStart, spineDir, r, segments, phase0);
+            if (startPhasedOut) *startPhasedOut = true;
+            if (std::getenv("MVB_CAP_DEBUG"))
+                std::cerr << "[cap-debug] pipe start phase continued (" << phase0 << " rad)\n";
+        } else {
+            prof = segments > 0 ? wireProfileWire(spineStart, spineDir, r, segments)
+                                : wireProfileWireSplit(spineStart, spineDir, r, 2);
+        }
         gp_Trsf up, down;
         up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
         down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
@@ -815,10 +1162,118 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         TopoDS_Wire profMm =
             TopoDS::Wire(BRepBuilderAPI_Transform(prof, up, Standard_True).Shape());
         BRepOffsetAPI_MakePipeShell ps(spineMm);
+        // MVB_PIPE_MODE: a MEASUREMENT harness for ABT #958, not a tuning knob. The sweep has
+        // always run on OCC defaults, and the default transition is BRepBuilderAPI_Transformed,
+        // which the OCC docs describe as "assuming the result is a self-intersected shell" --
+        // i.e. the default tolerates exactly the defect we are chasing. The corner that folds is
+        // geometrically VALID but marginal: R/r = 1.073, so the swept tube's inner surface
+        // passes 0.0147 mm from the corner axis on a 0.4 mm wire. Sampling is NOT the deficit
+        // (chord sag there is 0.0011 mm, a 14x margin), so the fold comes from the sweep's own
+        // approximation. Each variant below preserves the SHAPE -- none moves the spine or the
+        // profile -- so whichever removes the self-intersections does so without altering the
+        // part, which is the requirement. Unset = today's behaviour, so this is inert by default.
+        if (const char* pm = std::getenv("MVB_PIPE_MODE")) {
+            const std::string m = pm;
+            if (m == "rightcorner")      ps.SetTransitionMode(BRepBuilderAPI_RightCorner);
+            else if (m == "roundcorner") ps.SetTransitionMode(BRepBuilderAPI_RoundCorner);
+            else if (m == "frenet")      ps.SetMode(Standard_True);   // true Frenet
+            else if (m == "cfrenet")     ps.SetMode(Standard_False);  // corrected Frenet
+            else if (m == "approxc1")    ps.SetForceApproxC1(Standard_True);
+            else if (m == "tight")       ps.SetTolerance(1e-7, 1e-7, 1e-4);
+        }
         ps.Add(profMm);
         ps.Build();
-        if (ps.IsDone() && ps.MakeSolid())
-            return BRepBuilderAPI_Transform(ps.Shape(), down, Standard_True).Shape();
+        // MakeSolid() is not idempotent -- a second call returns false -- so it runs exactly
+        // once, here, and every later test reads the result.
+        const bool pipeMade = ps.IsDone() && ps.MakeSolid();
+        if (pipeMade && std::getenv("MVB_CAP_DEBUG")) {
+            // Where the sweep's PLANAR caps actually are, against the analytic ends: a pipe whose
+            // cap is tilted or displaced from its nominal section is what leaves wedges at
+            // junctions the assembler believes are tangent.
+            const gp_Pnt endNominal = ends.second;
+            for (TopExp_Explorer fe(ps.Shape(), TopAbs_FACE); fe.More(); fe.Next()) {
+                BRepAdaptor_Surface sf(TopoDS::Face(fe.Current()));
+                if (sf.GetType() != GeomAbs_Plane) continue;
+                GProp_GProps fg;
+                BRepGProp::SurfaceProperties(fe.Current(), fg);
+                gp_Pnt c = fg.CentreOfMass().Transformed(down);
+                gp_Dir n = sf.Plane().Axis().Direction();
+                const double dStart = c.Distance(spineStart), dEnd = c.Distance(endNominal);
+                const bool isStart = dStart < dEnd;
+                const gp_Dir want = isStart ? spineDir : tB;
+                std::cerr << "[pipe-cap] '" << pr.label << "' " << (isStart ? "start" : "end")
+                          << " cap: centre off nominal " << (isStart ? dStart : dEnd) * 1e6
+                          << " um, normal off analytic tangent "
+                          << std::min(n.Angle(want), n.Angle(want.Reversed())) * 180.0 / kPi
+                          << " deg\n";
+            }
+        }
+        if (pipeMade) {
+            if (endCapOut) {
+                // The sweep's own final section, downscaled -- the truth of what the next
+                // piece must start from.
+                try {
+                    const TopoDS_Shape last = ps.LastShape();
+                    // LastShape hands back the swept END SECTION but not always as a bare
+                    // wire (measured: 90x "not a wire" on 10_emi) -- unwrap whatever it is.
+                    TopoDS_Wire lastWire;
+                    if (!last.IsNull()) {
+                        if (last.ShapeType() == TopAbs_WIRE) {
+                            lastWire = TopoDS::Wire(last);
+                        } else {
+                            TopExp_Explorer wx(last, TopAbs_WIRE);
+                            if (wx.More()) lastWire = TopoDS::Wire(wx.Current());
+                        }
+                    }
+                    if (!lastWire.IsNull())
+                        *endCapOut = TopoDS::Wire(
+                            BRepBuilderAPI_Transform(lastWire, down, Standard_True).Shape());
+                    else if (std::getenv("MVB_CAP_DEBUG"))
+                        std::cerr << "[cap-debug] pipe LastShape "
+                                  << (last.IsNull() ? "NULL" : "carries no wire") << " for '"
+                                  << pr.label << "'\n";
+                } catch (const Standard_Failure& f) {
+                    if (std::getenv("MVB_CAP_DEBUG"))
+                        std::cerr << "[cap-debug] pipe LastShape threw ("
+                                  << (f.GetMessageString() ? f.GetMessageString() : "?")
+                                  << ") for '" << pr.label << "'\n";
+                }
+            }
+            // VALIDATE THE SWEEP. MakePipeShell reports IsDone/MakeSolid without guaranteeing
+            // a valid B-Rep, and this branch used to ship whatever it produced: measured on
+            // 06_llc, 'Primary parallel 0 [solid 25]' (3.65 mm3, 80 faces) reached the STEP
+            // BRepCheck-invalid, which is what made the whole design CAD DEFECTIVE. Repair it
+            // with OCC's own ShapeFix and re-check; a sweep that stays invalid returns null so
+            // the caller THROWS naming the primitive, rather than shipping bad copper.
+            TopoDS_Shape swept = BRepBuilderAPI_Transform(ps.Shape(), down, Standard_True).Shape();
+            if (!swept.IsNull() && !BRepCheck_Analyzer(swept).IsValid()) {
+                GProp_GProps gs0;
+                BRepGProp::VolumeProperties(swept, gs0);
+                try {
+                    Handle(ShapeFix_Shape) fix = new ShapeFix_Shape(swept);
+                    fix->Perform();
+                    const TopoDS_Shape fixed = fix->Shape();
+                    if (!fixed.IsNull() && BRepCheck_Analyzer(fixed).IsValid()) {
+                        GProp_GProps gs1;
+                        BRepGProp::VolumeProperties(fixed, gs1);
+                        // The repair may only clean the representation, never move copper.
+                        if (gs0.Mass() > 0 &&
+                            std::abs(gs1.Mass() - gs0.Mass()) <= 1e-3 * gs0.Mass()) {
+                            std::cerr << "[sweep-fix] '" << pr.label
+                                      << "' swept solid was invalid; ShapeFix repaired it"
+                                      << std::endl;
+                            return fixed;
+                        }
+                    }
+                } catch (const Standard_Failure&) {
+                }
+                std::cerr << "[sweep-fail] '" << pr.label
+                          << "' swept solid is an invalid B-Rep and could not be repaired"
+                          << std::endl;
+                return {};
+            }
+            return swept;
+        }
         if (std::getenv("MVB_DIAG"))
             std::cerr << "[sweep-fail] MakePipeShell status=" << (int)ps.GetStatus()
                       << " isDone=" << ps.IsDone() << " segments=" << segments
@@ -932,6 +1387,354 @@ static double overhangBeyondPlane(const TopoDS_Shape& trimmed, const gp_Pnt& stu
 // MVB_MITRE_KEEP=1 is the DEBUGGING escape: the same complaint goes to stderr, in full, and the
 // untrimmed solid is handed back so the geometry reaches disk and the fault can be LOOKED AT.
 // Never a quiet fallback -- it shouts either way, and the loud path is opt-in.
+
+// MITRED FACETED PRISM, built exactly -- no boolean. A faceted SEG tube with bisector-cut ends
+// does not need the knife at all: every vertex of the section polygon travels along the tube
+// axis, so its start/end are the LINE-PLANE intersections with the two end planes. Caps are
+// planar polygons IN those planes; sides are planar quads ON the original facet planes. Sew,
+// solid, done. This exists because the knife route is structurally unsafe exactly here: a
+// 16-gon's facet normals include the knife-box axes, so knife faces land COPLANAR with facet
+// planes and OCC's cut leaves self-intersecting trims -- measured on 05_pfc seg=16: the two
+// straight tubes of EVERY turn (~40 pieces) carried 2-3 self-intersections each and 9/399
+// meshed, while the same cuts on seg=0 arc-panel tubes were clean. Boolean-free construction
+// is the codebase's own doctrine (conformal-by-construction); this applies it to the one
+// primitive kind where the knife is provably the wrong tool.
+// startCapShared / endCapOut: BIT-IDENTICAL JUNCTION CAPS. Adjacent prisms each project their
+// own polygon onto the shared bisector plane, and the two projections agree only to fp
+// precision -- the fragment then imprints nm slivers and micro-edges at every such junction
+// (measured on 12_boost: the raw STEP has 0 sliver faces and 0 micro-edges, the fragmented
+// model has 2 and 32, and one cap face degenerates outright -> "overlapping facets", 167/206
+// volumes lost). When the previous piece hands its exact end-cap vertices in and they agree
+// with this piece's own projection to 100 nm, ADOPT them verbatim: the two solids then share
+// bit-identical vertices and the glue merges the caps exactly. A mismatch beyond 100 nm means
+// the frames' phases differ at this corner -- adopting would twist the prism, so fall back to
+// the own projection (today's behaviour).
+static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double r, int segments,
+                                     const gp_Pnt& Ps, const gp_XYZ& ns,
+                                     const gp_Pnt& Pe, const gp_XYZ& ne,
+                                     const std::vector<gp_Pnt>* startCapShared = nullptr,
+                                     std::vector<gp_Pnt>* endCapOut = nullptr,
+                                     bool sharedTrusted = false,
+                                     bool* startAdoptedOut = nullptr,
+                                     bool staggerAdopt = false) {
+    if (segments <= 0) return {};
+    const double dS = dir.XYZ().Dot(ns), dE = dir.XYZ().Dot(ne);
+    // The upstream bisector guarantee is tilt <= ~50 deg; below 0.2 the plane is close to
+    // parallel to the axis and the projection blows up -- refuse and let the knife path run.
+    if (std::abs(dS) < 0.2 || std::abs(dE) < 0.2) return {};
+    gp_Ax2 plane = deterministicSectionFrame(a, dir);
+    const gp_Dir dx = plane.XDirection(), dy = plane.YDirection();
+    const double offset = kPi / segments;
+    std::vector<gp_Pnt> vs(segments);
+    for (int i = 0; i < segments; ++i) {
+        const double ang = kTwoPi * i / segments + offset;
+        const gp_XYZ v = a.XYZ() + dx.XYZ() * (r * std::cos(ang)) + dy.XYZ() * (r * std::sin(ang));
+        const double ts = (Ps.XYZ() - v).Dot(ns) / dS;
+        vs[i] = gp_Pnt(v + dir.XYZ() * ts);
+    }
+    if (startCapShared && !handoffDisabled() && (int)startCapShared->size() == segments) {
+        // The neighbour's ACTUAL end section, at ANY junction. The two pieces' deterministic
+        // frames differ per axis, so their projections onto the shared plane are ROTATED
+        // polygons -- measured on 12_boost: mitre-corner cap mismatches of 18 um..1.4 mm, only
+        // ~50 of ~240 junctions coincidentally aligned. Adoption gates on GEOMETRY only:
+        // vertices in the start plane, at the section's projected radius (up to r/cos(tilt),
+        // tilt <= ~50 deg upstream => 1.6 r). The wire's facet phase then rotates continuously
+        // through the chain -- physically arbitrary for copper, and every junction is exact.
+        (void)sharedTrusted;
+        {
+            bool fits = true;
+            double worstPlane = 0.0, worstRad = 0.0;
+            const gp_Dir nsd(ns);
+            // Plane tolerance 25% of the wire radius, from the two measured populations on
+            // 10_emi (r = 0.1 mm): construction offsets -- where the sweep ACTUALLY ended --
+            // are 12-13 um (0.13 r), genuine endpoint mismatches are 0.14-0.15 mm (1.5 r).
+            // 0.25 r sits between them with a >5x margin each way. The cap IS the copper's
+            // real end face; the next piece must start there, not at the nominal plane.
+            const double planeTol = std::max(2e-6, 0.25 * r);
+            // THE CAP MUST BELONG TO THIS PIECE'S OWN CYLINDER. Project every adopted vertex
+            // onto the plane PERPENDICULAR to this piece's axis and require its distance from
+            // the axis to be exactly the wire radius. This is analytic, not a fit: at a clean
+            // symmetric corner the mitre plane's normal is n ~ dA + dB, and reflection through
+            // it maps dA -> -dB, so it carries the neighbour's regular section onto a regular
+            // section of THIS piece -- every projected vertex lands at exactly r. It fails in
+            // exactly one case, which is the one that broke 04_forward: where an ENDPOINT
+            // MISMATCH moved the plane off the true bisector (Ps = midpoint of the two
+            // endpoints), the corner is no longer symmetric, the reflection no longer maps one
+            // cylinder onto the other, and sweeping the adopted cap bulges the piece OUTSIDE
+            // the nominal wire -- measured 24 um proud (solid 8 reached x=5.994 where the run's
+            // surface is at 6.018), which is what grazed the neighbouring run's side facet and
+            // cost 413 of 418 volumes. The old 0.8r..1.6r band could not see it: an oblique cap
+            // legitimately spans r..r/cos(tilt), so a 1.10 r bulge passed.
+            // BASELINE GATE -- the configuration measured green on 10/12/02. TRIED AND
+            // REVERTED (2026-08-30): a Newell-normal tilt test (1e-3 rad) plus a strict
+            // projected-radius shape test (|rad - r| <= 0.01 r perpendicular to this axis).
+            // Both passed every one of 04's 464 adoptions -- the caps ARE geometrically exact
+            // -- so they discriminate nothing there, and they were never validated on 10_emi.
+            for (const auto& p : *startCapShared) {
+                const gp_Vec d(Ps, p);
+                worstPlane = std::max(worstPlane, std::abs(d.Dot(gp_Vec(nsd))));
+                const gp_XYZ axisFoot = a.XYZ() + dir.XYZ() * gp_Vec(a, p).Dot(gp_Vec(dir));
+                const double rad = (p.XYZ() - axisFoot).Modulus();
+                worstRad = std::max(worstRad, std::abs(rad - r));
+                if (std::abs(d.Dot(gp_Vec(nsd))) > planeTol || rad < 0.8 * r || rad > 1.6 * r)
+                    fits = false;
+            }
+            if (std::getenv("MVB_CAP_DEBUG"))
+                std::cerr << "[cap-debug] neighbour cap "
+                          << (fits ? "ADOPTED" : "phase-only") << " planeOff=" << worstPlane
+                          << " radOff=" << worstRad << "\n";
+            if (fits && !capPositionsDisabled() && staggerAdopt) {
+                // PIPE/REVOLVE -> PRISM: STAGGERED CONTINUATION, NOT VERBATIM ADOPTION
+                // (2026-08-30, the 04_forward osculation class). Verbatim adoption aligns this
+                // prism's facets with the neighbouring sweep's strips, and at a G1 fillet
+                // junction the two surfaces then OSCULATE -- gmsh meshes both faces
+                // independently into overlapping triangles (04: turn-0 entrance junction, PLC
+                // "two facets intersect"). Keep what exactness is FOR -- the junction PLANE
+                // (the mean axial offset mu, which is what killed 10_emi's 3.9e-5 mm^3 volume
+                // lenses) -- and rotate the polygon a half facet, so the caps are two coplanar
+                // 16-gons whose rim wedges are FLAT (zero volume, audit-clean) and the side
+                // facets cross transversally, the configuration every control meshes.
+                double mu = 0.0;
+                for (const auto& p : *startCapShared) mu += gp_Vec(Ps, p).Dot(gp_Vec(nsd));
+                mu /= static_cast<double>(startCapShared->size());
+                const gp_XYZ d0 = startCapShared->front().XYZ() -
+                                  (a.XYZ() + dir.XYZ() *
+                                             gp_Vec(a, startCapShared->front()).Dot(gp_Vec(dir)));
+                const double px = d0.Dot(dx.XYZ()), py = d0.Dot(dy.XYZ());
+                const double phi = std::atan2(py, px) - offset + kPi / segments;
+                for (int i = 0; i < segments; ++i) {
+                    const double ang = kTwoPi * i / segments + offset + phi;
+                    const gp_XYZ v =
+                        a.XYZ() + dx.XYZ() * (r * std::cos(ang)) + dy.XYZ() * (r * std::sin(ang));
+                    const double ts = (Ps.XYZ() + nsd.XYZ() * mu - v).Dot(ns) / dS;
+                    vs[i] = gp_Pnt(v + dir.XYZ() * ts);
+                }
+                if (std::getenv("MVB_CAP_DEBUG"))
+                    std::cerr << "[cap-debug]   staggered continuation (mu=" << mu
+                              << " phi=" << phi << ")\n";
+            } else if (fits && !capPositionsDisabled()) {
+                vs = *startCapShared;
+                // PRISM -> PRISM (mitred or collinear): verbatim adoption stays -- both sides
+                // are planar-faceted and meet at a dihedral or as a straight continuation, so
+                // there is no osculation, and 12_boost REQUIRES the exactly shared face
+                // (262/262 with it, 1/262 without).
+                if (startAdoptedOut) *startAdoptedOut = true;
+            } else {
+                // POSITIONS REJECTED. Phase may continue ONLY at a TANGENT junction, where the
+                // neighbour's section projects into this piece's start plane as a rigid
+                // rotation and its vertex azimuths are the copper's real facet azimuths. At a
+                // MITRED junction the projection is oblique (the section becomes an ellipse in
+                // the bisector plane), so a phase read off one vertex aligns that vertex and
+                // leaves the rest off -- measured on 04_forward: 413 of 418 volumes lost to a
+                // 50x95 um sliver facet and a 30 um-wide split side strip at a corner
+                // (surfaces 220/237). There the deterministic frame is already shared by both
+                // sides, so it stays the right answer.
+                // TRIED AND REVERTED (2026-08-31, 20_iso_buckboost_epc25_3c91): continuing the
+                // phase here through the BISECTOR REFLECTION of the neighbour's cap (an
+                // isometry that maps its end tangent onto this piece's axis, so its azimuths
+                // ARE this cylinder's facet azimuths -- checked by requiring every reflected
+                // vertex to land at radius r, measured 0.016-0.023 r on 20's six mitred pipe
+                // corners). It did what it claimed -- the junction 16-gons' 0.0516 rad relative
+                // rotation, 9.0 um at the rim, collapsed to a 3.8 um offset -- and 20 STAYED
+                // RED, because the phase was never the defect: the WORKING mirror-image
+                // entrance corner has a 14.5 um worst vertex mismatch, larger than either. The
+                // defect was the neighbour's knifed face being NON-PLANAR (see curveGrow).
+                const bool tangentStart = std::abs(dS) > 1.0 - 1e-6 && phaseContinuationEnabled();
+                const gp_XYZ d0 = startCapShared->front().XYZ() -
+                                  (a.XYZ() + dir.XYZ() *
+                                             gp_Vec(a, startCapShared->front()).Dot(gp_Vec(dir)));
+                const double px = d0.Dot(dx.XYZ()), py = d0.Dot(dy.XYZ());
+                if (tangentStart && px * px + py * py > 0.25 * r * r) {
+                    const double phi = std::atan2(py, px) - offset;
+                    for (int i = 0; i < segments; ++i) {
+                        const double ang = kTwoPi * i / segments + offset + phi;
+                        const gp_XYZ v = a.XYZ() + dx.XYZ() * (r * std::cos(ang)) +
+                                         dy.XYZ() * (r * std::sin(ang));
+                        const double ts = (Ps.XYZ() - v).Dot(ns) / dS;
+                        vs[i] = gp_Pnt(v + dir.XYZ() * ts);
+                    }
+                    if (std::getenv("MVB_CAP_DEBUG"))
+                        std::cerr << "[cap-debug]   phase continued (" << phi << " rad)\n";
+                }
+            }
+        }
+    } else if (startCapShared && std::getenv("MVB_CAP_DEBUG")) {
+        std::cerr << "[cap-debug] shared start cap SIZE mismatch (" << startCapShared->size()
+                  << " vs " << segments << ")\n";
+    }
+    // The end cap is the FINAL start polygon projected to the end plane -- computed from vs
+    // so an adopted (phase-shifted) start cap yields a straight, untwisted prism.
+    std::vector<gp_Pnt> ve(segments);
+    for (int i = 0; i < segments; ++i) {
+        const double te = (Pe.XYZ() - vs[i].XYZ()).Dot(ne) / dE;
+        // The span must exceed what the B-Rep can RESOLVE, not merely zero. A cap adoption can
+        // rotate the polygon so one vertex lands within nanometres of where the two end planes
+        // cross; a 1 nm-tall side quad then collapses to coincident mesh nodes and gmsh emits
+        // one exactly-degenerate tet (measured on 04_forward: SICN -2.2e-14 at
+        // (6.0034, -8.2317, 5.9955) mm INSIDE the piece, the whole design's NOT_MESHABLE).
+        // Refusing here falls back to the knife path, whose trimmed piece is transversal at
+        // that corner -- exactly the configuration the handoff-off control meshes green.
+        if (!(te > Precision::Confusion())) return {};
+        ve[i] = gp_Pnt(vs[i].XYZ() + dir.XYZ() * te);
+    }
+    // ThruSections between the two cap polygons, RULED: OCC's own constructor for exactly this
+    // ruled prism, with face orientations it manages itself. The first implementation hand-sewed
+    // caps and side quads from MakeFace defaults, which enforces nothing about a consistently
+    // outward shell -- and every prism came back FAULTY from BOPAlgo_ArgumentAnalyzer (88
+    // "self-intersections" on 05_pfc that were really orientation conflicts). Build the two
+    // wires in the SAME vertex order; ruled lofting connects vertex i to vertex i.
+    try {
+        BRepBuilderAPI_MakePolygon ws, we;
+        for (const auto& q : vs) ws.Add(q);
+        ws.Close();
+        for (const auto& q : ve) we.Add(q);
+        we.Close();
+        if (!ws.IsDone() || !we.IsDone()) return {};
+        BRepOffsetAPI_ThruSections loft(Standard_True /*solid*/, Standard_True /*ruled*/);
+        loft.AddWire(ws.Wire());
+        loft.AddWire(we.Wire());
+        loft.Build();
+        if (!loft.IsDone() || loft.Shape().IsNull()) return {};
+        const TopoDS_Shape out = loft.Shape();
+        if (!BRepCheck_Analyzer(out).IsValid()) return {};
+        // SUB-RESOLUTION SLIVER GUARD. "> 0" let through prisms whose two end planes almost
+        // coincide: positive volume below what the B-Rep can represent (measured on the
+        // mitre-corner toroid: 18-face solids at 0.000000 mm3, flagged DEFECTIVE by stage A).
+        // Both bounds are DERIVED: the mean plane-to-plane span along the axis must exceed the
+        // model's own length resolution, and the volume must be at least half of
+        // section-area x span -- a true prism is exactly area x span, so half catches any
+        // degenerate or folded loft without a tuned constant.
+        double spanSum = 0;
+        for (int i = 0; i < segments; ++i)
+            spanSum += (ve[i].XYZ() - vs[i].XYZ()).Dot(dir.XYZ());
+        const double span = spanSum / segments;
+        if (span <= Precision::Confusion()) return {};
+        // Inscribed polygon area: n/2 * r^2 * sin(2 pi / n).
+        const double area = 0.5 * segments * r * r * std::sin(kTwoPi / segments);
+        GProp_GProps g;
+        BRepGProp::VolumeProperties(out, g);
+        if (g.Mass() < 0.5 * area * span) return {};
+        if (endCapOut) *endCapOut = ve;
+        return out;
+    } catch (const Standard_Failure&) {
+        return {};
+    }
+}
+
+// MITRED ROUND PRISM, on analytic geometry only (ABT #961, the round twin of the facet prism
+// above). A round SEG with a mitred end used to be a SPLIT-PROFILE cylinder sliced by a box
+// knife, and the knife is structurally unsafe there: the bisector plane's intersection ellipse
+// crosses the profile's seam, and OCC's cut then leaves a sliver -- measured on 11_pushpull's
+// exit lead seg 1: a 13.7 um edge whose two vertices carry 33 um and 15 um tolerances, which
+// BOPAlgo (correctly) reports as a self-intersecting solid; 14_dab's entrance lead seg 1 on both
+// parallels is the same defect. There is nothing to approximate here: the piece is an analytic
+// cylinder between two planes. So it is built as exactly that -- the split-profile prism (two
+// exact half-cylinder faces, never a periodic surface) sliced by HALF-SPACES. Plane against an
+// analytic cylinder is the well-conditioned boolean -- every knife failure in this file is a
+// BOX against a swept B-spline, or a box face landing on a seam -- and a half-space has no box
+// faces to land anywhere.
+// TRIED FIRST (2026-09-02): a ruled ThruSections loft between the two elliptical sections. Its
+// rulings are the cylinder's generators only if the two sections share their parametrisation,
+// and OCC re-approximates the conics on the way in: the loft came out 2 % short in volume on a
+// 45-degree mitre. The analytic route has nothing to re-approximate.
+//   Ps/ns, Pe/ne: the start/end cut planes (a point and a normal each). A flush end passes its
+//   own perpendicular plane.
+// Every check is exact-or-refuse: an invalid result, or a volume off the analytic pi r^2 L by
+// more than the boolean's own precision, returns null and the caller falls back to the knife,
+// saying so.
+static TopoDS_Shape mitredRoundPrism(const gp_Pnt& a, const gp_Dir& dir, double r,
+                                     const gp_Pnt& Ps, const gp_XYZ& ns,
+                                     const gp_Pnt& Pe, const gp_XYZ& ne,
+                                     std::string* why = nullptr) {
+    auto refuse = [&](const std::string& reason) {
+        if (why) *why = reason;
+        return TopoDS_Shape();
+    };
+    const gp_XYZ d = dir.XYZ();
+    const double dS = d.Dot(ns), dE = d.Dot(ne);
+    if (std::abs(dS) < 0.2 || std::abs(dE) < 0.2) return refuse("cut plane too oblique");
+    // Axial stations of the two cut planes on the axis, and the true truncated-cylinder volume.
+    const double tS = (Ps.XYZ() - a.XYZ()).Dot(ns) / dS;
+    const double tE = (Pe.XYZ() - a.XYZ()).Dot(ne) / dE;
+    const double span = tE - tS;
+    if (span <= Precision::Confusion()) return refuse("non-positive axial span");
+    const double expect = kPi * r * r * span;
+    try {
+        // Work in the millimetre frame, like every boolean in this file.
+        gp_Trsf up, down;
+        up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+        down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
+        // A cylinder long enough to contain both cut ellipses (each reaches r*tan(tilt) past its
+        // plane's axial station; tilt <= ~78 deg from the 0.2 guard, so 5 r covers it).
+        const double reach = 5.0 * r;
+        const gp_Pnt base(a.XYZ() + d * (tS - reach));
+        // The SPLIT-profile prism the flush segments already use: two exact half-cylinder faces,
+        // no periodic surface, and -- unlike the box knife -- a half-space plane meets the seam
+        // lines transversally, so there is nothing for the cut to graze.
+        TopoDS_Face profile =
+            BRepBuilderAPI_MakeFace(wireProfileWireSplit(base, dir, r, 2)).Face();
+        TopoDS_Shape cyl = BRepPrimAPI_MakePrism(profile, gp_Vec(d * (span + 2.0 * reach))).Shape();
+        cyl = BRepBuilderAPI_Transform(cyl, up, Standard_True).Shape();
+        // Keep the side of each plane that contains the axis midpoint between the planes.
+        const gp_Pnt mid(a.XYZ() + d * (0.5 * (tS + tE)));
+        auto slice = [&](const TopoDS_Shape& body, const gp_Pnt& P, const gp_XYZ& n) {
+            gp_Pln pln(P, gp_Dir(n));
+            TopoDS_Face f = BRepBuilderAPI_MakeFace(pln).Face();
+            f = TopoDS::Face(BRepBuilderAPI_Transform(f, up, Standard_True).Shape());
+            const gp_Pnt midMm = mid.Transformed(up);
+            // MakeHalfSpace keeps the side containing the reference point, so this is the
+            // half-space to REMOVE: build it about the point mirrored through the plane.
+            const gp_XYZ nn = gp_Dir(n).XYZ();
+            const double h = (midMm.XYZ() - P.Transformed(up).XYZ()).Dot(nn);
+            const gp_Pnt away(midMm.XYZ() - nn * (2.0 * h));
+            TopoDS_Solid half = BRepPrimAPI_MakeHalfSpace(f, away).Solid();
+            BRepAlgoAPI_Cut cut(body, half);
+            if (!cut.IsDone() || cut.Shape().IsNull()) return TopoDS_Shape();
+            return cut.Shape();
+        };
+        TopoDS_Shape s1 = slice(cyl, Ps, ns);
+        if (s1.IsNull()) return refuse("start-plane cut failed");
+        TopoDS_Shape s2 = slice(s1, Pe, ne);
+        if (s2.IsNull()) return refuse("end-plane cut failed");
+        // One solid expected.
+        TopoDS_Shape out;
+        int nSolids = 0;
+        for (TopExp_Explorer ex(s2, TopAbs_SOLID); ex.More(); ex.Next(), ++nSolids) out = ex.Current();
+        if (nSolids != 1) return refuse("cut produced " + std::to_string(nSolids) + " solids");
+        if (!BRepCheck_Analyzer(out).IsValid()) return refuse("cut result invalid (BRepCheck, mm frame)");
+        out = BRepBuilderAPI_Transform(out, down, Standard_True).Shape();
+        if (!BRepCheck_Analyzer(out).IsValid()) return refuse("result invalid after downscale (BRepCheck)");
+        GProp_GProps g;
+        BRepGProp::VolumeProperties(out, g);
+        // The half-space cut works in the mm frame at OCC's default tolerance: measured 1.2e-4
+        // relative on 10_emi's 0.007 mm3 risers (nanometres of length), so the gate sits at 1e-3
+        // -- against a collapsed or doubled result, not against the boolean's own precision.
+        if (std::abs(g.Mass() - expect) > 1e-3 * expect)
+            return refuse("volume " + std::to_string(g.Mass() * 1e9) + " mm3 vs exact " +
+                          std::to_string(expect * 1e9) + " mm3");
+        return out;
+    } catch (const Standard_Failure&) {
+        return refuse("OCCT exception");
+    }
+}
+
+// Ordered polygon vertices of a closed wire (edge order), and back. The section-wire handoff
+// moves junction sections between the prism path (points) and the pipe/revolve path (wires).
+static std::vector<gp_Pnt> wireToPoints(const TopoDS_Wire& w) {
+    std::vector<gp_Pnt> pts;
+    for (BRepTools_WireExplorer we(w); we.More(); we.Next())
+        pts.push_back(BRep_Tool::Pnt(we.CurrentVertex()));
+    return pts;
+}
+static TopoDS_Wire pointsToWire(const std::vector<gp_Pnt>& pts) {
+    if (pts.size() < 3) return {};
+    BRepBuilderAPI_MakePolygon poly;
+    for (const auto& p : pts) poly.Add(p);
+    poly.Close();
+    if (!poly.IsDone()) return {};
+    return BRepBuilderAPI_MakeWire(poly.Wire()).Wire();
+}
+
 static TopoDS_Shape refuseTrim(const std::string& why, const TopoDS_Shape& untrimmed) {
     if (std::getenv("MVB_MITRE_KEEP")) {
         std::cerr << "\n*** MITRE REFUSED (MVB_MITRE_KEEP set -- geometry is NOT valid) ***\n"
@@ -1053,6 +1856,14 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
     gp_Pnt corner(P.XYZ() - u * uNeg - v * vHalf);
     TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Ax2(corner, gp_Dir(w), gp_Dir(u)),
                                            uNeg + uPos, 2.0 * vHalf, depth).Shape();
+    if (std::getenv("MVB_KNIFE_DIAG"))
+        std::cerr << "[knife] " << what << " r=" << r * 1e3 << " grow=" << grow * 1e3
+                  << " cosT=" << cosT << " ell=" << ell * 1e3 << " drift=" << drift * 1e3
+                  << " uNeg=" << uNeg * 1e3 << " uPos=" << uPos * 1e3
+                  << " vHalf=" << vHalf * 1e3 << " depth=" << depth * 1e3
+                  << " nstep=" << neighbourStep * 1e3 << " gap=" << neighbourGap * 1e3
+                  << " limU=" << axisLimit(u) * 1e3 << " limV=" << axisLimit(v) * 1e3
+                  << " limW=" << axisLimit(w) * 1e3 << " mm" << std::endl;
     // ZERO REMOVAL = FAILED CUT (ABT #685, 2026-08-20). A mitred end always carries growth
     // (overS/overE >= mitreGrow > 0), so its knife must always remove material; OCC's Cut on
     // one steep spiral pipe (14_dab's steep-exit stub) returned the solid unchanged while
@@ -1294,7 +2105,45 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // Growth that fills the wedge at a bridged (un-mitred) joint. Clamped well inside the range
     // where bridging is ever chosen, so tan() cannot run away.
     auto bridgeGrow = [&](double ang) { return wireRadius * std::tan(std::min(ang, 0.5)); };
-    auto worthMitring = [&](double ang) { return bridgeGrow(ang) * std::sin(ang) > sag; };
+    // A bridged joint fills its wedge by growing the earlier piece PAST the joint, so it pokes
+    // into the neighbour: real copper inside copper. Alf, 2026-08-25: "no overlap must be
+    // allowed in copper copper". The sag test alone is no longer sufficient -- it asks only
+    // whether the mitre is BELOW THE MODEL'S RESOLUTION, not whether the overlap it leaves is
+    // acceptable, and it is not (measured 0.0031 mm3, 1.26% of the smaller piece, at a 1.44 deg
+    // SEG->SEG lead joint on 16_coupled).
+    //
+    // Mitre whenever the joint actually bends, EXCEPT where the cut is known to be unsafe. The
+    // documented failure (10_emi, 3.47 deg) was OCC refusing to slice a SPIRAL PIPE surface --
+    // a swept BSpline -- at a shallow angle. Analytic SEG/ARC3 solids slice cleanly at the same
+    // angle, so the exemption belongs to the PIPE KINDS, not to the angle.
+    // MVB_MITRE_PIPES=1: treat SPIRAL/BLEND pipe ends as cuttable too, i.e. mitre EVERY bend.
+    // The pipe exemption rests on a 2026-08 measurement (10_emi, 3.47 deg) taken before the
+    // polygon-profile rebuild, the ShapeFix pass and the flush-tube repair fallback existed, so
+    // it is worth re-measuring rather than assuming. Any slice that still fails is caught by the
+    // existing validity check and rebuilt as a flush tube -- loudly, never silently.
+    const bool mitrePipes = std::getenv("MVB_MITRE_PIPES") != nullptr;
+    auto cuttableKind = [mitrePipes](int k) {
+        return mitrePipes || k == Primitive::SEG || k == Primitive::ARC3;
+    };
+    auto worthMitring = [&](double ang, int ka, int kb) {
+        if (ang <= 1e-9) return false;                       // truly tangent: caps already coincide
+        if (cuttableKind(ka) && cuttableKind(kb)) return true;
+        // PIPE END (ABT #961). The sag rule measured the WRONG quantity. It compared the bridged
+        // stub's lateral poke-out, r*tan(ang)*sin(ang) -- quadratic in the angle -- against the
+        // model's chordal sag, and so called a 3.47 deg riser/wrap joint "beneath resolution"
+        // (0.37 um on 10_emi) and bridged it. But a bridge grows the earlier piece r*tan(ang)
+        // = 6 um straight into its neighbour: a full-section overlap of 0.00019 mm3, forty times
+        // per design, which the weld then has to hide and cannot when the fused body
+        // self-intersects. What a flush, un-mitred joint actually leaves is a WEDGE: each
+        // piece's perpendicular cap misses the shared bisector by r*tan(ang/2) at its rim,
+        // LINEAR in the angle -- 3.0 um at 3.47 deg, above the 2.2 um sag, so the wedge is real
+        // and the joint must be mitred (measured: NO OVERLAPS, watertight, same copper to
+        // 0.004 mm3). At 2.8e-5 deg (00_debug's closing wrap) the same quantity is 2.5e-8 mm,
+        // nothing the model can represent, and mitring THERE is what let a half-space knife
+        // bite a closed revolution's other end (REMOVED 89.2 mm3 against a 27.2 mm3 bound) --
+        // so those joints stay bridged, with a growth of a fraction of a nanometre.
+        return wireRadius * std::tan(0.5 * ang) > sag;
+    };
     // |unit + unit| = 2 cos(angle/2): 0.2 admits joints up to ~168 degrees and rejects the folds
     // beyond, whose bisector carries no usable direction (ABT #685).
     const double kMinBisector = 0.2;
@@ -1314,6 +2163,36 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     const double kMaxMitreAngle = 2.0 * std::acos(0.5 * kMinBisector);
     auto mitreGrow = [&](double ang) {
         return wireRadius * std::tan(0.5 * std::min(ang, kMaxMitreAngle));
+    };
+    // A PIECE GROWN ALONG ITS OWN CURVE FALLS SHORT OF ITS OWN TANGENT (2026-08-31,
+    // 20_iso_buckboost_epc25_3c91). r*tan(theta/2) is the exact overhang a STRAIGHT piece needs
+    // for the extreme point of its tilted section to cross the bisector plane. But an ARC3
+    // (revolved: ddA/ddB = over/radius) and an analytically grown SPIRAL travel that distance
+    // ON THE ARC, not on the tangent, so the grown tip lands R*(1 - cos(g/R)) short of where
+    // the straight formula puts it. The mitre plane then cuts a face that is part plane and
+    // part TUBE -- non-planar, with an extra vertex where the two surfaces meet -- and OCC's
+    // glue can no longer identify it with the neighbouring prism's planar mitre face, so the
+    // fragment FUSES the two bodies instead of imprinting a shared one. Measured on 20's exit
+    // lead corner: the stub's knifed face carried a 4.54 um dent on two of its 17 vertices
+    // (against 0.00 um on all 16 of the mirror-image entrance corner, whose knife extents are
+    // bit-identical: r=0.1775 grow=0.1775 ell=0.295398 uNeg=0.295398 uPos=0.546421 vHalf=0.284
+    // depth=0.355 mm, nothing clamped on either side). The fragment then returned ONE solid of
+    // 3.42834 mm3 instead of two (3.42262 + 0.29981), and gmsh reported "3D Meshing 2 volumes
+    // with 1 connected component / Found volume 26" -> "No elements in volume 27". The
+    // entrance corner's fragment produced the shared PLANE face (0.1351735 mm2 on both solids)
+    // and meshed.
+    // The correction is the arc's own departure from its tangent, R*(1 - cos(g/R)) -- exact for
+    // the ARC3 revolve, and for a SPIRAL the wrap radius at the grown end (a helix's radius of
+    // curvature is R + b^2/R >= R, so using R over-grows rather than under-grows). It is never
+    // shipped copper: everything past the bisector is what the knife removes.
+    auto curveGrow = [&](const Primitive& pr, double g, bool atStart) {
+        if (!(g > 0.0)) return 0.0;
+        double R = 0.0;
+        if (pr.kind == Primitive::ARC3) R = pr.arc.v0.Modulus();
+        else if (pr.kind == Primitive::SPIRAL && primEdgeGrowsAnalytically(pr))
+            R = atStart ? pr.spiral.r0 : pr.spiral.r1;
+        if (!(R > 1e-12)) return 0.0;   // straight, or grown along a straight spine extension
+        return R * (1.0 - std::cos(std::min(g / R, kPi)));
     };
     const bool diag = std::getenv("MVB_MITRE_DIAG") != nullptr;
     BRep_Builder builder;
@@ -1337,6 +2216,16 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // The floor is a (10 um)^3 cube in the mm frame: orders of magnitude above the boolean's
     // face-coincidence noise and orders below any real un-bisected corner.
     TopoDS_Shape prevBuilt;
+    // Pieces grouped per primitive + whether each primitive is BRIDGED onto its predecessor.
+    std::vector<std::vector<TopoDS_Shape>> perPrimSolids;
+    std::vector<bool> bridgedToPrev;
+    // A joint sphere spans the junction it fills: half of it lies in the piece it is fused into
+    // and half in the NEXT piece. Those two must therefore end up as ONE solid, or the sphere
+    // simply becomes copper overlapping its own neighbour -- which is exactly what chunk 7
+    // measured before this (28 self-overlaps against 19 without it, with weldfail=0, i.e. the
+    // weld never even attempted those junctions). Set when a sphere is emitted at the junction
+    // leaving piece i; consumed when piece i+1 decides whether it is welded onto its predecessor.
+    bool sphereAtPrevJunction = false;
     std::vector<std::string> overlappingJoints;
     // ABT #685: a silent check is worth nothing -- "no overlap reported" must not be able to mean
     // "the boolean never answered". Count the joints that got a real verdict against the ones that
@@ -1408,6 +2297,27 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             overlappingJoints.push_back(where.str());
         }
     };
+    // The previous SEG prism's exact end-cap vertices, handed to the next prism so mitre
+    // junction caps are BIT-IDENTICAL (see mitredFacetPrism). Valid only across a directly
+    // consecutive prism pair; anything else (sweep piece, refused prism) breaks the chain.
+    std::vector<gp_Pnt> prevEndCap;
+    bool prevEndCapValid = false;
+    // Whether prevEndCap came from a pipe/revolve's ACTUAL end section (trusted geometric
+    // adoption) rather than a prism's deterministic-frame projection (identity adoption).
+    bool prevEndCapTrusted = false;
+    // Whether the piece that PRODUCED prevEndCap is straight at its end (a SEG). A straight
+    // source's facets stay coplanar with an aligned receiver indefinitely (osculation, the
+    // 04_forward killer); a curved source separates quadratically within a facet length and
+    // NEEDS the exact shared face (10_emi's ride stack). See the stagger rule in
+    // mitredFacetPrism.
+    bool prevEndCapSourceStraight = false;
+    // The straight source's LENGTH decides the stagger (two measured populations, a decade
+    // apart): 04_forward's 12 mm runs (48 r) produce coplanar overlap bands no local mesh can
+    // resolve -- stagger required (verbatim kept it at 5/418; full stagger 418/418) -- while
+    // 10_emi's 0.9 mm risers (3.6 r) need the verbatim shared face (stagger broke them to
+    // 5/50). The boundary is one section circumference, 2*pi*r: a coplanar band longer than
+    // the full perimeter cannot cross transversally anywhere.
+    double prevSourceLen = 0.0;
     for (size_t i = 0; i < n; ++i) {
         // Bend at each end: a tangent joint (wrap SEG<->ARC) needs no growth and no boolean; only a
         // real corner (the entrance/exit leads) is grown and sliced on its angle-bisector plane.
@@ -1427,7 +2337,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                       << "   |   " << ptrs[i]->label << "  dy/ds=" << fs[i].Y() << "\n";
             std::cerr << "[mitre]   junction " << i - 1 << "->" << i << " " << kn[ptrs[i - 1]->kind]
                       << "->" << kn[ptrs[i]->kind] << " angle=" << fe[i - 1].Angle(fs[i]) * 180.0 / kPi
-                      << " deg" << (worthMitring(fe[i - 1].Angle(fs[i])) ? " CORNER" : " bridged")
+                      << " deg" << (worthMitring(fe[i - 1].Angle(fs[i]), ptrs[i - 1]->kind, ptrs[i]->kind) ? " CORNER" : " bridged")
                       << " ['" << ptrs[i - 1]->label << "' -> '" << ptrs[i]->label << "']\n";
         }
         // ABT #685 (Alf, 2026-08-14): a lead/turn corner is mitred exactly like the elbow between
@@ -1436,7 +2346,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // the two pieces share the face. Tried and rejected on the way here: slicing on the LEAD's
         // face, and leaving both flush with a wire-radius overshoot — the first is a long slanted
         // ellipse, the second leaves the corner's outer side notched.
-        if (i > 0 && worthMitring(fe[i - 1].Angle(fs[i]))) {
+        if (i > 0 && worthMitring(fe[i - 1].Angle(fs[i]), ptrs[i - 1]->kind, ptrs[i]->kind)) {
             gp_Vec s(fe[i - 1].XYZ());
             s += gp_Vec(fs[i].XYZ());
             // ABT #685 (Alf, 2026-08-18): the bisector must be WELL CONDITIONED. Two unit
@@ -1451,7 +2361,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         }
         bool bentE = false;
         gp_Dir nE = fe[i];
-        if (i + 1 < n && worthMitring(fe[i].Angle(fs[i + 1]))) {
+        if (i + 1 < n && worthMitring(fe[i].Angle(fs[i + 1]), ptrs[i]->kind, ptrs[i + 1]->kind)) {
             gp_Vec s(fe[i].XYZ());
             s += gp_Vec(fs[i + 1].XYZ());
             if (s.Magnitude() > kMinBisector) { nE = gp_Dir(s); bentE = true; }   // see above
@@ -1461,12 +2371,21 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // flush forward (no cut) -- one side only, so the bridge is never doubled.
         const double angS = (i > 0) ? fe[i - 1].Angle(fs[i]) : 0.0;
         const double angE = (i + 1 < n) ? fe[i].Angle(fs[i + 1]) : 0.0;
-        const double overS = bentS ? mitreGrow(angS) + dpS : 0.0;
+        const double growS0 = mitreGrow(angS) + dpS;
+        const double overS = bentS ? growS0 + curveGrow(*ptrs[i], growS0, true) : 0.0;
         // A bridged end grows by the WEDGE the bend opens (r*tan(theta)) as well as any endpoint
         // mismatch -- growing only by dpE left a wedge gap of up to r*tan(theta) on the outer side
         // of every near-tangent joint, open copper-to-copper. One side only, so it is never doubled.
-        const double overE = bentE ? mitreGrow(angE) + dpE
-                                   : dpE + (angE > 1e-12 ? bridgeGrow(angE) : 0.0);
+        // A bridged end no longer grows by the wedge r*tan(theta): that growth left copper
+        // OUTSIDE the wire's envelope (see jointSphere). It still closes any endpoint MISMATCH
+        // (dpE), which is real centreline, and the joint sphere fills the wedge.
+        // The wedge is filled by EITHER the joint sphere (physically exact) or, while that is
+        // gated off, the old axial growth. Never neither: dropping both would leave open
+        // copper-to-copper wedges on every near-tangent joint.
+        const bool sphereFill = std::getenv("MVB_JOINT_SPHERE") != nullptr;
+        const double growE0 = mitreGrow(angE) + dpE;
+        const double overE = bentE ? growE0 + curveGrow(*ptrs[i], growE0, false)
+                                   : dpE + ((!sphereFill && angE > 1e-12) ? bridgeGrow(angE) : 0.0);
         // SPLIT A CLOSED REVOLUTION. ABT #685 (Alf, 2026-08-18): a SPIRAL that closes a full
         // turn has its own other end one pitch away ALONG THE COLUMN AXIS -- and a coil wound
         // with touching turns puts that end's copper exactly one wire radius from this one's
@@ -1510,24 +2429,249 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             out.push_back(b);
             return out;
         };
+        // Set by whichever build path starts this piece on its predecessor's EXACT section
+        // (prism cap adoption, or pipe/arc phase continuation). An exactly shared cap is an
+        // internal face -- see the weld gate below.
+        bool startCapAdopted = false;
         std::vector<Primitive> pieces = revolutionHalves(*ptrs[i]);
+        // The section-wire handoff (see rawGrownSolid): the previous piece's ACTUAL end
+        // section enters this piece as its start profile when the junction is tangent and
+        // exact, and this piece's own end section is captured for the next.
+        //
+        // TRIED AND REVERTED (2026-08-30): restricting the continuation to ANALYTICALLY tangent
+        // junctions (angS <= 1e-12) on the theory that a bend makes the two sections coplanar
+        // and their side facets graze. Measured: 12_boost fell from 262/262 to 1/262 -- its
+        // toroid chain NEEDS the section continued across its mitred corners -- and 04_forward
+        // did not recover. The junction gate is not what 04 is about.
+        // THE GATE IS ENDPOINT SHARING, NOT TANGENCY (2026-08-30, derived then measured).
+        // At a corner with directions dA, dB the mitre plane normal is n proportional to
+        // dA + dB, and reflection through that plane maps dA -> -dB while FIXING every point
+        // lying in the plane. So a neighbour's cap polygon is a valid section of THIS piece's
+        // cylinder -- adoption is exact and undistorted -- precisely when the plane is the true
+        // angular bisector through the shared corner point. That holds however sharp the bend
+        // is, which is why gating on tangency destroyed 12_boost (its toroid corners are
+        // mitred but endpoint-exact: 262/262 -> 1/262).
+        // It FAILS when the two pieces do not share an endpoint: this code then puts the plane
+        // through the MIDPOINT of the two endpoints (see Ps below), the corner is no longer
+        // symmetric, the reflection no longer maps one cylinder onto the other, and the adopted
+        // cap is not a section of the receiving piece -- it sweeps into a solid that bulges
+        // outside the nominal wire (measured 24 um on 04_forward's lead corner) and grazes its
+        // neighbour's side facet, which is what cost 04 413 of its 418 volumes.
+        // Endpoint mismatches are a real datum from the layout (up to a wire radius, 0.36 mm
+        // measured on PQ33), so this gate is physical, not a tuned threshold.
+        // A SHARED SECTION NEEDS A SHARED CUTTING PLANE. There are exactly three kinds of
+        // junction, and only two of them have one:
+        //   MITRED (bentS): both pieces are cut by the SAME bisector plane, so a shared cap is
+        //     exact and both pieces' facets terminate on that plane -- 12_boost's toroid
+        //     corners, which need this (without it: 262/262 -> 1/262).
+        //   COLLINEAR (angS ~ 0): one axis, so the shared cap is a plain continuation.
+        //   BRIDGED WITH A BEND (not mitred, angS > 0): NO common plane -- each piece keeps its
+        //     own perpendicular cap, tilted from the other by the bend angle. Sharing the
+        //     section here makes the two pieces' side facets NEARLY parallel instead of skew,
+        //     so they graze over a strip rather than crossing at a line, and gmsh meshes the
+        //     two faces independently into overlapping triangles. That is 04_forward's lead
+        //     junction: 413 of 418 volumes lost to surfaces 220/237, unchanged by every gate
+        //     that varied HOW MUCH is adopted (the caps themselves are geometrically exact --
+        //     parallel planes, projected radius exactly r -- so no cap-quality test can see it).
+        // Endpoint sharing is still required: without it the plane is a fabricated midpoint,
+        // not a bisector (see the reflection argument below).
+        // TRIED AND REVERTED (2026-08-30): gating the handoff offer on endpoint sharing
+        // (dpS <= 1e-9) and on shared-cutting-plane junction kinds (bentS || collinear). Both
+        // kept 12_boost green but left 04 red -- and neither was ever validated on 10_emi,
+        // whose green state was measured with the offer UNCONDITIONAL. The receiving piece's
+        // own geometric fit check remains the only gate.
+        const bool junctionEndpointExact = i > 0;
+
+        // Pipes/revolves receiving from a LONG STRAIGHT source get the staggered offer (the
+        // cap rotated half a facet about the source axis): 04_forward's corner pipes receive
+        // from its 12 mm runs and were the remaining osculation sites (prism-side-only stagger
+        // left 04 at 5/418; all-pipe stagger fixed 04 but broke 10's dragbacks, whose source
+        // is the 0.9 mm riser -- under the 2*pi*r length boundary those stay verbatim).
+        TopoDS_Wire startCapWire;
+        if (junctionEndpointExact && prevEndCapValid) {
+            const bool staggerPipeOffer =
+                i > 0 && !bentS && dpS <= 1e-9 && ptrs[i]->kind != Primitive::SEG &&
+                ptrs[i - 1]->kind == Primitive::SEG &&
+                ptrs[i - 1]->seg.a.Distance(ptrs[i - 1]->seg.b) > kTwoPi * wireRadius;
+            if (staggerPipeOffer) {
+                gp_Vec pd(ptrs[i - 1]->seg.a, ptrs[i - 1]->seg.b);
+                if (pd.Magnitude() > 1e-12) {
+                    gp_Trsf rot;
+                    rot.SetRotation(gp_Ax1(primEndpoints(*ptrs[i - 1]).second, gp_Dir(pd)),
+                                    kPi / segments);
+                    std::vector<gp_Pnt> rotated = prevEndCap;
+                    for (auto& p : rotated) p = p.Transformed(rot);
+                    startCapWire = pointsToWire(rotated);
+                    if (std::getenv("MVB_CAP_DEBUG"))
+                        std::cerr << "[cap-debug] staggered pipe offer at '" << ptrs[i]->label
+                                  << "'\n";
+                }
+            }
+            if (startCapWire.IsNull()) startCapWire = pointsToWire(prevEndCap);
+        }
+        TopoDS_Wire pieceEndCapWire;
         auto sweepPieces = [&](double a0, double b0) {
             std::vector<TopoDS_Shape> got;
             for (size_t q = 0; q < pieces.size(); ++q) {
-                TopoDS_Shape sp = rawGrownSolid(pieces[q], wireRadius,
-                                                q == 0 ? a0 : 0.0,
-                                                q + 1 == pieces.size() ? b0 : 0.0, segments);
+                TopoDS_Wire endW;
+                TopoDS_Shape sp = rawGrownSolid(
+                    pieces[q], wireRadius, q == 0 ? a0 : 0.0,
+                    q + 1 == pieces.size() ? b0 : 0.0, segments,
+                    (q == 0 && a0 <= 0.0 && !startCapWire.IsNull()) ? &startCapWire : nullptr,
+                    q + 1 == pieces.size() ? &endW : nullptr,
+                    q == 0 ? &startCapAdopted : nullptr);
                 if (sp.IsNull()) return std::vector<TopoDS_Shape>{};
                 got.push_back(sp);
+                if (q + 1 == pieces.size()) pieceEndCapWire = endW;
             }
             return got;
         };
-        std::vector<TopoDS_Shape> parts = sweepPieces(overS, overE);
-        if (parts.empty()) {  // ARC clamp (near-full revolve): fall back to a flush, uncut tube
+        // FACETED SEG: build the mitred prism EXACTLY and skip both the growth and the knife
+        // (see mitredFacetPrism -- coplanar knife faces on polygon facets are what left every
+        // toroid tube self-intersecting at seg=16). End planes: the junction bisector where the
+        // end is mitred, the perpendicular cap (grown by the endpoint mismatch) where tangent.
+        bool prismDone = false;
+        TopoDS_Shape solid;
+        // ROUND SEG WITH A MITRED END: the exact elliptical-section prism, never the knife
+        // (see mitredRoundPrism). Flush-ended round segments keep today's plain cylinder.
+        if (ptrs[i]->kind == Primitive::SEG && segments <= 0 && (bentS || bentE)) {
+            const gp_Pnt& A = ptrs[i]->seg.a;
+            const gp_Pnt& B = ptrs[i]->seg.b;
+            gp_Vec dv(A, B);
+            if (dv.Magnitude() > 1e-12) {
+                const gp_Dir dir(dv);
+                gp_Pnt Ps = A; gp_XYZ nsx = dir.XYZ();
+                if (bentS) {
+                    Ps = gp_Pnt(0.5 * (primEndpoints(*ptrs[i - 1]).second.XYZ() + A.XYZ()));
+                    nsx = nS.XYZ();
+                } else if (dpS > 0) {
+                    Ps = A.Translated(gp_Vec(dir) * (-dpS));
+                }
+                gp_Pnt Pe = B; gp_XYZ nex = dir.XYZ();
+                if (bentE) {
+                    Pe = gp_Pnt(0.5 * (B.XYZ() + primEndpoints(*ptrs[i + 1]).first.XYZ()));
+                    nex = nE.XYZ();
+                } else if (dpE > 0) {
+                    Pe = B.Translated(gp_Vec(dir) * dpE);
+                }
+                std::string why;
+                TopoDS_Shape prism = mitredRoundPrism(A, dir, wireRadius, Ps, nsx, Pe, nex, &why);
+                if (!prism.IsNull()) {
+                    solid = prism;
+                    prismDone = true;
+                    if (bentS) ++nCut;
+                    if (bentE) ++nCut;
+                    // A round cap is an ellipse, not a polygon: nothing to hand on.
+                    prevEndCapValid = false;
+                    prevEndCapTrusted = false;
+                    prevEndCapSourceStraight = true;
+                    prevSourceLen = dv.Magnitude();
+                } else if (std::getenv("MVB_MITRE_DIAG")) {
+                    std::cerr << "[round-prism] '" << ptrs[i]->label
+                              << "' exact mitred cylinder refused (" << why
+                              << "); falling back to the knife\n";
+                }
+            }
+        }
+        if (!prismDone && ptrs[i]->kind == Primitive::SEG && segments > 0) {
+            const gp_Pnt& A = ptrs[i]->seg.a;
+            const gp_Pnt& B = ptrs[i]->seg.b;
+            gp_Vec dv(A, B);
+            if (dv.Magnitude() > 1e-12) {
+                const gp_Dir dir(dv);
+                gp_Pnt Ps = A; gp_XYZ nsx = dir.XYZ();
+                if (bentS) {
+                    Ps = gp_Pnt(0.5 * (primEndpoints(*ptrs[i - 1]).second.XYZ() + A.XYZ()));
+                    nsx = nS.XYZ();
+                } else if (dpS > 0) {
+                    Ps = A.Translated(gp_Vec(dir) * (-dpS));
+                }
+                gp_Pnt Pe = B; gp_XYZ nex = dir.XYZ();
+                if (bentE) {
+                    Pe = gp_Pnt(0.5 * (B.XYZ() + primEndpoints(*ptrs[i + 1]).first.XYZ()));
+                    nex = nE.XYZ();
+                } else if (dpE > 0) {
+                    Pe = B.Translated(gp_Vec(dir) * dpE);
+                }
+                // Offer the previous prism's exact end cap across EVERY junction, mitred or
+                // tangent -- a tangent junction's two caps are the same polygon projected onto
+                // essentially the same plane, and their fp-level mismatch is exactly what makes
+                // the glue-fragment prefer one welded body there (2026-08-27 measurement). The
+                // 100 nm adoption gate in mitredFacetPrism rejects any junction where the caps
+                // are not the same face (endpoint mismatches, phase changes).
+                std::vector<gp_Pnt> endCap;
+                // Trusted mode when the previous piece was a pipe/revolve at a tangent
+                // junction: its cap's phase is legitimately different from the deterministic
+                // frame (see mitredFacetPrism).
+                // THE PRISM TAKES THE NEIGHBOUR'S SECTION AT EVERY JUNCTION, mitred corners
+                // included -- gated only by the geometric plane/radius check inside
+                // mitredFacetPrism. TRIED AND REVERTED (2026-08-30): gating this on
+                // junctionTangentIn "for symmetry with the pipe path" took 12_boost from
+                // 262/262 to 1/262. A mitred corner's two prisms flank one bisector plane, and
+                // continuing the section is exactly what makes their shared faces coincide.
+                // ...but only where the two pieces actually SHARE the endpoint, so the mitre
+                // plane is the true bisector and the neighbour's cap is a real section of this
+                // cylinder (see junctionEndpointExact above).
+                // STAGGER RULE (2026-08-30, measured on the 04/10/12/02 quartet): a tangent
+                // junction whose SOURCE piece is straight (SEG) gets the staggered
+                // continuation -- verbatim adoption there leaves the two pieces' coplanar
+                // facets overlapping over the axial mismatch band, the osculation class that
+                // kept 04_forward at 5/418 through every other rule (full stagger fixed it,
+                // 418/418). Everything else -- mitred corners (12_boost requires the exact
+                // shared face) and curved sources (10_emi's ride stack, where a staggered
+                // chord cuts the neighbour's tightly curved strip) -- stays verbatim.
+                const bool tangentIn = i > 0 && !bentS && angS <= 1e-12;
+                // Qualify by the RECEIVER's length: the osculation band lives on the receiving
+                // prism's own facet (04's 12 mm runs, 48 r, adopting from corner pipes -- red
+                // verbatim at 5/418, green staggered at 418/418), while a short receiver has
+                // nothing to osculate along and NEEDS the exact face (10_emi's 0.9 mm risers,
+                // 3.6 r: green verbatim, 5/50 staggered). Boundary: one section circumference.
+                const bool staggerHere =
+                    tangentIn && dv.Magnitude() > kTwoPi * wireRadius;
+                TopoDS_Shape prism = mitredFacetPrism(
+                    A, dir, wireRadius, segments, Ps, nsx, Pe, nex,
+                    (junctionEndpointExact && prevEndCapValid) ? &prevEndCap : nullptr, &endCap,
+                    /*sharedTrusted=*/prevEndCapTrusted, &startCapAdopted,
+                    /*staggerAdopt=*/staggerHere);
+                if (!prism.IsNull()) {
+                    solid = prism;
+                    prismDone = true;
+                    if (bentS) ++nCut;
+                    if (bentE) ++nCut;
+                    prevEndCap = std::move(endCap);
+                    prevEndCapValid = true;
+                    prevEndCapTrusted = false;   // a prism cap follows the deterministic frame
+                    prevEndCapSourceStraight = true;   // a SEG prism is straight by definition
+                    prevSourceLen = ptrs[i]->seg.a.Distance(ptrs[i]->seg.b);
+                }
+            }
+        }
+        if (!prismDone) prevEndCapValid = false;
+        std::vector<TopoDS_Shape> parts;
+        if (!prismDone) parts = sweepPieces(overS, overE);
+        if (!prismDone && parts.empty()) {  // ARC clamp (near-full revolve): flush, uncut tube
             parts = sweepPieces(0.0, 0.0);
             bentS = bentE = false;
         }
-        TopoDS_Shape solid = parts.empty() ? TopoDS_Shape() : parts.front();
+        if (!prismDone) solid = parts.empty() ? TopoDS_Shape() : parts.front();
+        if (!prismDone && !pieceEndCapWire.IsNull()) {
+            // A pipe/revolve delivered its true end section: hand it on (trusted) so a
+            // following riser prism starts from the section the copper actually ends with.
+            auto capPts = wireToPoints(pieceEndCapWire);
+            if ((int)capPts.size() == segments) {
+                prevEndCap = std::move(capPts);
+                prevEndCapValid = true;
+                prevEndCapTrusted = true;
+                prevEndCapSourceStraight = false;   // pipes/revolves are curved at their ends
+                prevSourceLen = 0.0;
+            } else if (std::getenv("MVB_CAP_DEBUG")) {
+                std::cerr << "[cap-debug] end cap wire has " << capPts.size()
+                          << " vertices (want " << segments << ") for '" << ptrs[i]->label
+                          << "'\n";
+            }
+        } else if (!prismDone && std::getenv("MVB_CAP_DEBUG")) {
+            std::cerr << "[cap-debug] no end cap delivered by '" << ptrs[i]->label << "'\n";
+        }
         if (solid.IsNull()) {
             // Never skip silently: a missing primitive is missing copper, and its neighbours
             // may still touch each other so even the connectivity contract can stay satisfied
@@ -1580,7 +2724,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // Once split, a half's own other end is half a revolution away, so nothing of this piece
         // sits near either knife: the neighbour bound only applies to a still-closed revolution.
         const double neighbourHere = pieces.size() > 1 ? 0.0 : reachHere;
-        if (bentS) {
+        if (!prismDone && bentS) {
             const gp_Pnt J(0.5 * (primEndpoints(*ptrs[i - 1]).second.XYZ() +
                                   primEndpoints(*ptrs[i]).first.XYZ()));
             parts.front() =
@@ -1590,7 +2734,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                                neighbourHere, junctionDiag(fe[i - 1], fs[i], *ptrs[i]));
             ++nCut;
         }
-        if (bentE) {
+        if (!prismDone && bentE) {
             const gp_Pnt J(0.5 * (primEndpoints(*ptrs[i]).second.XYZ() +
                                   primEndpoints(*ptrs[i + 1]).first.XYZ()));
             parts.back() =
@@ -1600,7 +2744,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                                neighbourHere, junctionDiag(fe[i], fs[i + 1], *ptrs[i]));
             ++nCut;
         }
-        solid = parts.empty() ? TopoDS_Shape() : parts.front();
+        if (!prismDone) solid = parts.empty() ? TopoDS_Shape() : parts.front();
         if (parts.size() > 1) {
             // Fuse the halves back: both corners are cut, so the closed revolution is safe again.
             gp_Trsf up, down;
@@ -1746,18 +2890,113 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // exporter's per-solid naming, above all) is off by one from that point on, which is how
         // 'turn 15 -> turn 16' ended up naming the wrong piece of copper. One solid, one
         // component, one name.
-        if (bentS && i > 0) {
+        // A TANGENT joint (no bend, no bridging growth, no gap) must abut exactly as well: the
+        // two pieces share one end cap, so any common volume is a construction error in one of
+        // the caps, not a bridged stub. Bridged joints (angle > 1e-12, grown on purpose) stay
+        // exempt.
+        if (i > 0 && (bentS || (angS <= 1e-12 && dpS <= 1e-9))) {
             checkMitredAbutment(prevBuilt, solid,
-                                "'" + ptrs[i - 1]->label + "' -> '" + ptrs[i]->label + "'");
+                                std::string(bentS ? "" : "tangent ") + "'" + ptrs[i - 1]->label +
+                                    "' -> '" + ptrs[i]->label + "'");
         }
         prevBuilt = solid;
-        for (TopExp_Explorer solidExplorer(solid, TopAbs_SOLID); solidExplorer.More();
-             solidExplorer.Next()) {
-            builder.Add(compound, solidExplorer.Current());
-            if (primIndexPerSolid != nullptr) {
-                primIndexPerSolid->push_back(i);
+        // Collect per PRIMITIVE instead of emitting straight into the compound: bridged
+        // junctions have to be fused after the fact (see the run-fuse below), and that needs
+        // the pieces grouped, not already flattened.
+        // CHUNK 7. This primitive's END junction is BRIDGED (not mitred), so the notch on the
+        // outside of the bend is filled by a SPHERE at the corner rather than by growing this tube
+        // past it (see jointSphere). Fused into THIS piece immediately: emitting it as its own
+        // solid multiplies the assembly's solid count by the number of joints, and the bobbin cut
+        // then drowns -- OCC segfaulted in BOPAlgo_PaveFiller::PerformEF via cut_bobbin on 14_dab.
+        // The sphere overlaps the tube end substantially, so this is a well-conditioned union, not
+        // the near-tangent kind that fails.
+        // GATED OFF BY DEFAULT, and not because the geometry is wrong -- it is the physically
+        // exact fill. OCC cannot carry it at this scale on this geometry: measured on 14_dab at
+        // segments=16 the build went 37 s -> 815 s (a boolean per joint on a 112-face sphere) and
+        // then SEGFAULTED downstream of the weld, with 3 spheres refusing to fuse at all. Emitting
+        // the spheres as separate solids instead segfaulted OCC in cut_bobbin
+        // (BOPAlgo_PaveFiller::PerformEF). Turn on with MVB_JOINT_SPHERE=1; until the cost and the
+        // crash are resolved the bridged wedge is left as it was.
+        if (std::getenv("MVB_JOINT_SPHERE") && i + 1 < n && angE > 1e-12 && !bentE) {
+            const gp_Pnt jA = primEndpoints(*ptrs[i]).second;
+            const gp_Pnt jB = primEndpoints(*ptrs[i + 1]).first;
+            std::vector<gp_Pnt> corners{jA};
+            if (jA.Distance(jB) > 1e-9) corners.push_back(jB);
+            for (const auto& cpt : corners) {
+                TopoDS_Shape sph = jointSphere(cpt, wireRadius, segments);
+                if (sph.IsNull() || !BRepCheck_Analyzer(sph).IsValid()) {
+                    std::cerr << "[joint-sphere] '" << ptrs[i]->label
+                              << "': corner fill not built; the wedge stays open" << std::endl;
+                    continue;
+                }
+                bool ok = false;
+                try {
+                    BRepAlgoAPI_Fuse fu(solid, sph);
+                    fu.Build();
+                    if (fu.IsDone() && !fu.Shape().IsNull() &&
+                        BRepCheck_Analyzer(fu.Shape()).IsValid()) {
+                        GProp_GProps g0, g1;
+                        BRepGProp::VolumeProperties(solid, g0);
+                        BRepGProp::VolumeProperties(fu.Shape(), g1);
+                        // A union only adds; it must not lose the tube it started from.
+                        if (g1.Mass() >= g0.Mass() * (1.0 - 1e-9)) { solid = fu.Shape(); ok = true; }
+                    }
+                } catch (const Standard_Failure&) {
+                }
+                if (!ok)
+                    std::cerr << "[joint-sphere] '" << ptrs[i]->label
+                              << "': corner fill would not fuse; the wedge stays open" << std::endl;
+                else
+                    sphereAtPrevJunction = true;   // piece i+1 must weld onto this one
             }
         }
+        perPrimSolids.emplace_back();
+        for (TopExp_Explorer solidExplorer(solid, TopAbs_SOLID); solidExplorer.More();
+             solidExplorer.Next()) {
+            perPrimSolids.back().push_back(solidExplorer.Current());
+        }
+        // Junction (i-1 -> i) needs welding only if it was BRIDGED **and** the bridge actually
+        // grew: the wedge fill is r*tan(theta), so a junction at theta ~ 0 adds no copper and has
+        // nothing to weld away. Nearly every wrap junction is tangent to ~1e-14 deg, so welding
+        // "every bridged junction" ran a fuse per turn against an ever-growing accumulator for no
+        // benefit -- measured on 01_etd34 at segments=16: 665 s with the weld, 27 s without, with
+        // NURBS accounting for none of it. Gating on the same angle that creates the overlap is
+        // what makes the weld proportional to the defect instead of to the turn count.
+        // MVB_WELD_ALL=1 restores welding at EVERY bridged junction, tangent ones included.
+        // The angS gate cut 01_etd34's seg=16 build from 665 s to 29 s, but the resulting
+        // artifact regressed from meshable (32/32 volumes) to boundary-recovery failure: a
+        // tangent junction's two pieces abut on bit-identical 16-gon faces, and gmsh's
+        // fragment+recovery handles ONE welded body better than a glued pair there. The A/B
+        // knob exists so speed vs meshability is a measurement, not an argument.
+        const bool weldAll = std::getenv("MVB_WELD_ALL") != nullptr;
+        // Mitre corners (bentS) weld ONLY when this piece was built on its predecessor's EXACT
+        // cap polygon (startCapAdopted). Welding every mitre was tried on 2026-08-28 and made
+        // the geometry worse -- 4 non-manifold solids, 0/24 meshed -- but that was before the
+        // section handoff, when the two sides' bisector-plane faces were merely co-planar and
+        // not coincident, which is the one input class OCC's fuse cannot do. With an adopted
+        // cap the fuse is two solids sharing one identical planar face. It is still only an
+        // OFFER: the weld's own acceptance test (valid + volume within the union bounds)
+        // rejects a bad fuse, and the pieces then stay abutting exactly as before, so this can
+        // never ship a fused solid that is worse than the pair.
+        // Why it matters (04_forward): two mitred prisms flanking one bisector plane also have
+        // near-parallel SIDE facets, and with the sections aligned those facets touch over a
+        // strip instead of meeting along an edge -- COMMON = 0.000000 mm^3 over an 80 x 278 x
+        // 87 um patch between 'Primary parallel 0' solids 7 and 8, which the audit passes and
+        // gmsh then triangulates twice ("Invalid boundary mesh (overlapping facets)", 413 of
+        // 418 volumes lost). Fusing the pair makes that contact INTERNAL, which is what it
+        // physically is: one wire, not two touching bodies.
+        // TRIED AND REVERTED (2026-08-30): offering the weld at every junction whose cap was
+        // adopted (mitred ones included) to make 04_forward's grazing contact internal. It
+        // welded hard -- 418 solids down to 186 -- and did NOT fix it, because the graze was
+        // never a junction: it was a piece BULGING outside the nominal wire from a bad adopted
+        // cap (see the projected-radius test above). Fix the cap, not the topology.
+        bridgedToPrev.push_back((i > 0 && !bentS && (weldAll || angS > 1e-12)) ||
+                                sphereAtPrevJunction);
+        sphereAtPrevJunction = false;
+        if (std::getenv("MVB_CAP_DEBUG"))
+            std::cerr << "[cap-debug] junction " << i << " angS=" << angS << " bentS=" << bentS
+                      << " capAdopted=" << startCapAdopted << " welded=" << bridgedToPrev.back()
+                      << "  '" << ptrs[i]->label << "'\n";
         if (diag) {
             built.push_back(solid);
             GProp_GProps gpr;
@@ -1892,6 +3131,416 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                 }
         }
     }
+    // ---- WELD THE BRIDGED NEIGHBOURS ---------------------------------------------------------
+    // Mitred neighbours abut on a shared bisector face and stay separate solids. A BRIDGED
+    // neighbour is different: it is left un-mitred ON PURPOSE, because a SPIRAL/BLEND pipe end
+    // cannot be sliced (re-measured 2026-08-25 with MVB_MITRE_PIPES=1: on 10_emi the 3.47 deg
+    // cut reported success, removed 0.000125 of 0.205 mm3 and left the overhang standing; on
+    // 06_llc four mitred corners came out overlapping instead of abutting). So the wedge fill
+    // POKES INTO the neighbour -- real copper inside copper, 523 instances across the corpus.
+    //
+    // Alf, 2026-08-25: "no overlap must be allowed in copper copper". Two pieces of ONE
+    // conductor that overlap by construction are one piece of copper, so weld them and the
+    // overlap ceases to exist. INCREMENTAL AND PAIRWISE, never one N-way union: a single
+    // BRepAlgo fuse over a whole run is the most fragile step in this file (measured here: a
+    // 135-piece run came back with 0 mm3). Each step is guarded on validity and volume, and a
+    // step that fails simply ends the accumulation -- pieces are kept, never dropped.
+    // MVB_ALLOW_WELD_LENS=1 restores the old overlapping pieces.
+    {
+        const bool keepLens = std::getenv("MVB_ALLOW_WELD_LENS") != nullptr;
+        TopoDS_Shape acc;            // accumulated weld
+        double accVol = 0.0;
+        int accOwner = 0;
+        // The UNWELDED pieces that went into `acc`, kept so a bad accumulation can be undone.
+        std::vector<TopoDS_Shape> accPieces;
+        auto flush = [&]() {
+            if (acc.IsNull()) return;
+            // SELF-INTERSECTION GATE, ONCE PER ACCUMULATION (2026-08-31).
+            // A fuse can be BRepCheck-VALID yet BOPAlgo-SELF-INTERSECTING -- a check BRepCheck
+            // simply does not perform. Such a solid is marginal: it survives in memory and
+            // tips to invalid when the STEP round-trip reconstructs it, which is exactly how
+            // 06_llc shipped 'Primary parallel 0 [solid 25]' as CAD DEFECTIVE (measured:
+            // valid pre-scale, valid post-scale, invalid on read-back; no writer setting
+            // changes it; ShapeFix and UnifySameDomain only "repair" it by deleting copper,
+            // 3.652 -> 3.633/3.536 mm3, which the volume guards correctly reject).
+            // Checking every fuse is correct but prohibitively slow (the analyzer re-runs on a
+            // growing accumulator: ~6 turns in 25 min). Checking ONCE per flush costs one
+            // analysis per conductor run instead of hundreds, and the remedy needs no repair:
+            // fall back to the pieces we already hold, unwelded -- exactly the shape every
+            // green design's weld-refusal path produces.
+            if (accPieces.size() > 1) {
+                bool selfInt = false;
+                try {
+                    BOPAlgo_ArgumentAnalyzer an;
+                    an.SetShape1(acc);
+                    an.ArgumentTypeMode() = Standard_True;
+                    an.SelfInterMode() = Standard_True;
+                    an.Perform();
+                    selfInt = an.HasFaulty();
+                } catch (const Standard_Failure&) {
+                }
+                if (selfInt) {
+                    std::cerr << "[weld-selfint] '"
+                              << (accOwner < (int)ptrs.size() ? ptrs[accOwner]->label
+                                                              : std::string("?"))
+                              << "' welded body self-intersects (BOPAlgo); emitting its "
+                              << accPieces.size() << " pieces unwelded" << std::endl;
+                    for (const auto& pc : accPieces) {
+                        for (TopExp_Explorer px(pc, TopAbs_SOLID); px.More(); px.Next()) {
+                            builder.Add(compound, px.Current());
+                            if (primIndexPerSolid != nullptr)
+                                primIndexPerSolid->push_back(accOwner);
+                        }
+                    }
+                    acc.Nullify();
+                    accVol = 0.0;
+                    accPieces.clear();
+                    return;
+                }
+            }
+            // FINAL GATE: nothing invalid leaves the assembler. Every producer upstream
+            // validates its own result, yet 06_llc still shipped one BRepCheck-invalid solid
+            // ('Primary parallel 0 [solid 25]', 3.65 mm3, 80 faces) that was valid when swept
+            // -- so some composition step degrades it. Repair here with ShapeFix (accepted
+            // only if the volume is unchanged to 0.1%: representation may be cleaned, copper
+            // may not move) and SAY SO if it cannot be repaired, rather than emitting a solid
+            // the consumer will choke on.
+            for (TopExp_Explorer ex(acc, TopAbs_SOLID); ex.More(); ex.Next()) {
+                TopoDS_Shape out = ex.Current();
+                if (!BRepCheck_Analyzer(out).IsValid()) {
+                    GProp_GProps g0;
+                    BRepGProp::VolumeProperties(out, g0);
+                    bool repaired = false;
+                    try {
+                        Handle(ShapeFix_Shape) fix = new ShapeFix_Shape(out);
+                        fix->Perform();
+                        const TopoDS_Shape fixed = fix->Shape();
+                        if (!fixed.IsNull() && BRepCheck_Analyzer(fixed).IsValid()) {
+                            GProp_GProps g1;
+                            BRepGProp::VolumeProperties(fixed, g1);
+                            if (g0.Mass() > 0 &&
+                                std::abs(g1.Mass() - g0.Mass()) <= 1e-3 * g0.Mass()) {
+                                out = fixed;
+                                repaired = true;
+                                std::cerr << "[assembler-fix] repaired an invalid solid of '"
+                                          << (accOwner < (int)ptrs.size() ? ptrs[accOwner]->label
+                                                                          : std::string("?"))
+                                          << "' (" << g0.Mass() * 1e9 << " mm^3)" << std::endl;
+                            }
+                        }
+                    } catch (const Standard_Failure&) {
+                    }
+                    if (!repaired)
+                        std::cerr << "[assembler-invalid] '"
+                                  << (accOwner < (int)ptrs.size() ? ptrs[accOwner]->label
+                                                                  : std::string("?"))
+                                  << "' emits an INVALID solid (" << g0.Mass() * 1e9
+                                  << " mm^3) that ShapeFix could not repair" << std::endl;
+                }
+                builder.Add(compound, out);
+                if (primIndexPerSolid != nullptr) primIndexPerSolid->push_back(accOwner);
+            }
+            acc.Nullify();
+            accVol = 0.0;
+            accPieces.clear();
+        };
+        for (size_t k = 0; k < perPrimSolids.size(); ++k) {
+            // One primitive may have been fragmented into several solids by its own mitre trim;
+            // treat that group as a unit.
+            TopoDS_Shape group;
+            if (perPrimSolids[k].size() == 1) {
+                group = perPrimSolids[k].front();
+            } else {
+                TopoDS_Compound c; BRep_Builder gb; gb.MakeCompound(c);
+                for (const auto& sh : perPrimSolids[k]) gb.Add(c, sh);
+                group = c;
+            }
+            double groupVol = 0.0;
+            { GProp_GProps g; BRepGProp::VolumeProperties(group, g); groupVol = g.Mass(); }
+
+            const bool weldToPrev = !keepLens && !acc.IsNull() &&
+                                    k < bridgedToPrev.size() && bridgedToPrev[k];
+            if (!weldToPrev) {
+                flush();
+                acc = group; accVol = groupVol; accOwner = (int)k;
+                accPieces.assign(1, group);
+                continue;
+            }
+            bool welded = false;
+            // TOLERANT-IMPRINT LADDER. Standard assembly-meshing practice (Sandia/Coreform Cubit,
+            // "Resolving Problems with Conformal Assemblies") is imprint-and-merge, falling back
+            // to a TOLERANT imprint when the exact one fails on sub-tolerance discrepancies --
+            // "normal imprinting when possible, tolerant imprinting only when normal imprinting
+            // fails". A fuzzy boolean value is OCC's tolerant imprint. Exact-first, then the same
+            // 1e-7 m ConductorBuilder already uses to weld its chain primitives, then 1e-6.
+            // Each fuzzy rung is tried in BOTH operand orders. Measured on 10_emi (EP 13):
+            // fusing a 4%-of-chain bump riser as the TOOL onto the accumulated chain drops the
+            // accumulator at fuzzy=0 (result = the riser alone) and invents +0.29% volume at
+            // fuzzy=1e-7 -- an operand-order pathology in the boolean, not a geometry fault.
+            for (bool swapped : {false, true}) {
+            for (double fuzzy : {0.0, 1e-7, 1e-6}) {
+            if (welded) break;
+            try {
+                BRepAlgoAPI_Fuse fu;
+                TopTools_ListOfShape fargs, ftools;
+                if (swapped) { fargs.Append(group); ftools.Append(acc); }
+                else         { fargs.Append(acc); ftools.Append(group); }
+                fu.SetArguments(fargs); fu.SetTools(ftools);
+                if (fuzzy > 0) fu.SetFuzzyValue(fuzzy);
+                fu.Build();
+                if (std::getenv("MVB_WELD_DEBUG")) {
+                    std::cerr << "[weld-debug] '" << ptrs[k]->label << "' swapped=" << swapped
+                              << " fuzzy=" << fuzzy
+                              << " done=" << fu.IsDone()
+                              << " null=" << (fu.IsDone() ? fu.Shape().IsNull() : true);
+                    if (fu.IsDone() && !fu.Shape().IsNull()) {
+                        const bool valid = BRepCheck_Analyzer(fu.Shape()).IsValid();
+                        GProp_GProps gd; BRepGProp::VolumeProperties(fu.Shape(), gd);
+                        std::cerr << " valid=" << valid << " vol=" << gd.Mass()
+                                  << " acc=" << accVol << " group=" << groupVol
+                                  << " sum=" << (accVol + groupVol);
+                    }
+                    std::cerr << "\n";
+                }
+                if (fu.IsDone() && !fu.Shape().IsNull() &&
+                    BRepCheck_Analyzer(fu.Shape()).IsValid()) {
+                    GProp_GProps gf; BRepGProp::VolumeProperties(fu.Shape(), gf);
+                    const double sum = accVol + groupVol;
+                    // ONLY THE TWO BOUNDS THAT ARE EXACTLY TRUE OF A UNION: it cannot be smaller
+                    // than its largest input (that would mean OCC dropped an operand -- the failure
+                    // this guard exists for) and cannot exceed their sum (that would be invented
+                    // material). There used to be a third clause, >= 0.90 * sum, which was a guess
+                    // at how much overlap is plausible. It is wrong for the joint sphere: half a
+                    // ball sits inside each adjoining tube, so against a SMALL neighbour the true
+                    // union legitimately falls below 90% of the sum and a perfectly good fuse was
+                    // rejected -- leaving the sphere overlapping the next piece instead of welded
+                    // into it, which is why chunk 7 measured WORSE than the growth it replaces
+                    // (28 self-overlaps against 19 on 14_dab).
+                    // Tolerance 1e-3, MEASURED on 10_emi (EP 13): legitimate welds carry up to
+                    // +3.9e-5 relative volume noise at fuzzy=0 (quadrature on bspline junction
+                    // faces) and +0.29% at fuzzy=1e-7 (the tolerant imprint displaces the
+                    // junction boundary by <=0.1 um) -- the old 1e-6 bound refused them all,
+                    // leaving real 1.8e-4 mm^3 lens overlaps that fail the audit AND poison
+                    // tetgen (04_forward's PLC error sat exactly on a refused junction). The
+                    // failures this bound exists for -- OCC dropping an operand -- are >=2%
+                    // errors (a dropped bump riser is 4% of its chain), an order of magnitude
+                    // beyond the noise. 1e-3 sits in the gap.
+                    if (gf.Mass() <= sum * (1.0 + 1e-3) &&
+                        gf.Mass() >= std::max(accVol, groupVol) * (1.0 - 1e-3)) {
+                        // SELF-INTERSECTION ACCEPTANCE (MVB_WELD_SELFINT_CHECK, 2026-08-31).
+                        // BRepCheck_Analyzer passes a fused solid that BOPAlgo's own argument
+                        // analyzer calls self-intersecting, and such a solid is MARGINAL: it
+                        // survives in memory but the STEP round-trip tips it into
+                        // BRepCheck-invalid (measured on 06_llc: 'Primary parallel 0
+                        // [solid 25]' reads back with SelfIntersectingWire + UnorientableShape
+                        // + BadOrientationOfSubshape, while PRE- and POST-scale in memory it
+                        // is valid; no writer setting and no post-hoc repair fixes it --
+                        // ShapeFix and UnifySameDomain only "repair" it by deleting copper).
+                        // Rejecting the fuse here sends the junction to the cut/abut fallback,
+                        // which is the configuration every green design already uses.
+                        // Env-gated until measured against the green corpus: the check is not
+                        // free (BOPAlgo on a growing accumulator).
+                        static const bool selfIntCheck =
+                            std::getenv("MVB_WELD_SELFINT_CHECK") != nullptr;
+                        bool fusedSelfIntersects = false;
+                        if (selfIntCheck) {
+                            try {
+                                BOPAlgo_ArgumentAnalyzer an;
+                                an.SetShape1(fu.Shape());
+                                an.ArgumentTypeMode() = Standard_True;
+                                an.SelfInterMode() = Standard_True;
+                                an.Perform();
+                                fusedSelfIntersects = an.HasFaulty();
+                            } catch (const Standard_Failure&) {
+                                fusedSelfIntersects = true;   // cannot prove it clean: refuse
+                            }
+                            if (fusedSelfIntersects) {
+                                std::cerr << "[weld-selfint] '" << ptrs[k]->label
+                                          << "' fuse is self-intersecting; refusing it"
+                                          << std::endl;
+                            }
+                        }
+                        if (fusedSelfIntersects) break;   // fall through to the cut/abut path
+                        acc = fu.Shape(); accVol = gf.Mass(); welded = true;
+                        accPieces.push_back(group);   // undo material for the flush gate
+                    }
+                }
+            } catch (const Standard_Failure&) {
+            }
+            }
+            if (welded) break;
+            }
+            if (!welded) {
+                // FUSE-REFUSED FALLBACK: cut the junction lens off the incoming piece so it
+                // ABUTS the chain exactly. Bump-riser junctions are boolean-sick for Fuse in
+                // BOTH operand orders and at every fuzzy rung (measured on 10_emi: fuzzy=0
+                // drops the accumulator, fuzzy=1e-7 invents 0.29%, swapped collapses to 0) --
+                // but Cut(group, acc) only has to trim a <=e-4 mm^3 lens off one small piece.
+                // Exact abutment of separate solids is a shape the pipeline already proves
+                // meshable (the toroid chain is exactly that), and the audit sees no overlap.
+                // Acceptance: the cut may only REMOVE the lens -- result within [90%, 100%] of
+                // the piece (losing >10% means the junction is not a lens; refuse loudly).
+                bool trimmed = false;
+                // The lens involves only the immediately preceding primitive, so cut against
+                // THAT, not the whole accumulated chain -- a 200-solid accumulator makes the
+                // boolean as sick as the fuse it is standing in for (measured: cut-vs-acc
+                // failed on all five 10_emi bump risers, cut-vs-predecessor is two small
+                // convex-ish operands).
+                try {
+                    TopoDS_Shape prevTool;
+                    if (k > 0 && !perPrimSolids[k - 1].empty()) {
+                        if (perPrimSolids[k - 1].size() == 1) {
+                            prevTool = perPrimSolids[k - 1].front();
+                        } else {
+                            TopoDS_Compound pc; BRep_Builder pb; pb.MakeCompound(pc);
+                            for (const auto& sh : perPrimSolids[k - 1]) pb.Add(pc, sh);
+                            prevTool = pc;
+                        }
+                    }
+                    // Measure the LENS directly with a Common: its volume integrates on the
+                    // lens itself, so the error is relative to the lens -- inferring it from
+                    // groupVol - cutVol drowns a real 2.8e-5 mm^3 lens in the group's own
+                    // +-1.6e-4 mm^3 quadrature noise (measured, 10_emi turn-30).
+                    double lensVol = -1.0;
+                    if (!prevTool.IsNull()) {
+                        try {
+                            BRepAlgoAPI_Common comOp;
+                            TopTools_ListOfShape mArgs, mTools;
+                            mArgs.Append(group); mTools.Append(prevTool);
+                            comOp.SetArguments(mArgs); comOp.SetTools(mTools);
+                            comOp.Build();
+                            if (comOp.IsDone() && !comOp.Shape().IsNull()) {
+                                GProp_GProps gl; BRepGProp::VolumeProperties(comOp.Shape(), gl);
+                                lensVol = std::max(0.0, gl.Mass());
+                            }
+                        } catch (const Standard_Failure&) {
+                        }
+                    }
+                    // The Common's testimony is only trusted when it produced SOLIDS or the cut
+                    // agrees: on the boolean-sick riser junctions Common returns EMPTY for a
+                    // piece that is ENTIRELY inside its predecessor (measured on 10_emi -- the
+                    // lens-floor version shipped the risers fully overlapping). So: run the CUT
+                    // ladder first; absorb on an empty remainder; and only skip the trim when
+                    // Common POSITIVELY measured a sub-tolerance lens.
+                    if (!prevTool.IsNull()) {
+                        for (double cfuzzy : {0.0, 1e-7, 1e-6}) {
+                        if (trimmed) break;
+                        BRepAlgoAPI_Cut cutOp;
+                        TopTools_ListOfShape cargs, ctools;
+                        cargs.Append(group); ctools.Append(prevTool);
+                        cutOp.SetArguments(cargs); cutOp.SetTools(ctools);
+                        if (cfuzzy > 0) cutOp.SetFuzzyValue(cfuzzy);
+                        cutOp.Build();
+                        if (std::getenv("MVB_WELD_DEBUG")) {
+                            std::cerr << "[weld-debug] cut '" << ptrs[k]->label
+                                      << "' cfuzzy=" << cfuzzy << " done=" << cutOp.IsDone();
+                            if (cutOp.IsDone() && !cutOp.Shape().IsNull()) {
+                                GProp_GProps gd; BRepGProp::VolumeProperties(cutOp.Shape(), gd);
+                                std::cerr << " valid=" << BRepCheck_Analyzer(cutOp.Shape()).IsValid()
+                                          << " vol=" << gd.Mass() << " group=" << groupVol;
+                            }
+                            std::cerr << "\n";
+                        }
+                        if (!cutOp.IsDone() || cutOp.Shape().IsNull()) continue;
+                        GProp_GProps gc; BRepGProp::VolumeProperties(cutOp.Shape(), gc);
+                        // Piece ENTIRELY inside its predecessor (measured: 4 of 5 10_emi bump
+                        // risers cut to ~0 -- the dragback piece already covers the riser's
+                        // span). A ∪ B = A when B ⊆ A: absorbing the redundant piece IS the
+                        // weld. No validity demand on the empty remainder.
+                        if (gc.Mass() <= groupVol * 0.01) {
+                            std::cerr << "[weld-cut] '" << ptrs[k]->label
+                                      << "' lies entirely inside its predecessor; absorbed"
+                                      << std::endl;
+                            trimmed = true;   // acc unchanged: the union is the predecessor
+                            break;
+                        }
+                        // LENS FLOOR: when the Common POSITIVELY measured the lens below the
+                        // audit tolerance (1e-6 mm^3 = 1e-15 m^3), the pieces already abut --
+                        // do NOT cut. Measured on 04_forward: cutting e-14 mm^3 noise lenses
+                        // imprinted micro-edges (a 40 um boundary pocket) whose curves CROSS
+                        // after the fragment, and gmsh's 1D-intersection recovery then
+                        // retry-loops past any budget. Requires lensVol >= 0 (Common produced
+                        // a result) AND the cut to be sane (remainder ~ the whole piece), so a
+                        // lying empty Common cannot bless a real overlap.
+                        if (lensVol >= 0.0 && lensVol < 1e-15 &&
+                            gc.Mass() >= groupVol * (1.0 - 1e-3)) {
+                            std::cerr << "[weld-cut] '" << ptrs[k]->label
+                                      << "' junction lens below audit tolerance ("
+                                      << lensVol * 1e9 << " mm^3); left abutting, uncut"
+                                      << std::endl;
+                            flush();
+                            acc = group; accVol = groupVol; accOwner = (int)k;
+                            accPieces.assign(1, group);
+                            trimmed = true;
+                            break;
+                        }
+                        // Upper bound 1e-3, not 1e-9: a CUT cannot add material, so any
+                        // apparent excess is quadrature noise (measured +5e-4 relative on the
+                        // 10_emi turn-30 wrap junction, where the true lens is only -0.9e-4 --
+                        // the noise swamps the lens and a 1e-9 bound rejects a correct cut).
+                        TopoDS_Shape cutRes = cutOp.Shape();
+                        bool cutValid = BRepCheck_Analyzer(cutRes).IsValid();
+                        if (!cutValid) {
+                            // REPAIR, THEN RE-JUDGE. On 06_llc's dragback junctions the cut
+                            // completes but returns a solid BRepCheck rejects at every fuzzy
+                            // rung (measured: 7 of its 27 junctions), so the lens survived into
+                            // the STEP -- 1 invalid solid, ~100 sliver faces, CAD DEFECTIVE.
+                            // ShapeFix is OCC's own repair for exactly this (boolean debris:
+                            // wire order, tiny faces, tolerances); the result is then held to
+                            // the SAME volume bounds and validity test as an unrepaired cut, so
+                            // nothing unverified can ship.
+                            try {
+                                Handle(ShapeFix_Shape) fix = new ShapeFix_Shape(cutRes);
+                                fix->Perform();
+                                const TopoDS_Shape fixed = fix->Shape();
+                                if (!fixed.IsNull() && BRepCheck_Analyzer(fixed).IsValid()) {
+                                    GProp_GProps gf2;
+                                    BRepGProp::VolumeProperties(fixed, gf2);
+                                    if (gf2.Mass() <= groupVol * (1.0 + 1e-3) &&
+                                        gf2.Mass() >= groupVol * 0.90) {
+                                        cutRes = fixed;
+                                        gc = gf2;
+                                        cutValid = true;
+                                        std::cerr << "[weld-cut] '" << ptrs[k]->label
+                                                  << "' cut was invalid; ShapeFix repaired it"
+                                                  << std::endl;
+                                    }
+                                }
+                            } catch (const Standard_Failure&) {
+                            }
+                        }
+                        if (cutValid &&
+                            gc.Mass() <= groupVol * (1.0 + 1e-3) &&
+                            gc.Mass() >= groupVol * 0.90) {
+                            std::cerr << "[weld-cut] '" << ptrs[k]->label
+                                      << "' would not fuse; trimmed its junction lens ("
+                                      << (groupVol - gc.Mass()) * 1e9
+                                      << " mm^3) so it abuts its predecessor exactly"
+                                      << std::endl;
+                            flush();
+                            acc = cutRes; accVol = gc.Mass(); accOwner = (int)k;
+                            accPieces.assign(1, cutRes);
+                            trimmed = true;
+                        }
+                        }
+                    }
+                } catch (const Standard_Failure&) {
+                }
+                if (!trimmed) {
+                    // Keep both, unwelded, and SAY SO: this is a copper-copper overlap that
+                    // will reach the audit, not something to swallow quietly.
+                    std::cerr << "[weld-lens] '" << ptrs[k]->label
+                              << "' would not weld onto its bridged predecessor; the junction "
+                                 "overlap remains" << std::endl;
+                    flush();
+                    acc = group; accVol = groupVol; accOwner = (int)k;
+                    accPieces.assign(1, group);
+                }
+            }
+        }
+        flush();
+    }
+
     if (diag) {
         std::cerr << "[mitre] prims=" << n << " boolean-cuts=" << nCut << " repaired=" << nRepaired
                   << " dropped-invalid=" << nInvalid << "\n";

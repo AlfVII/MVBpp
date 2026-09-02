@@ -850,6 +850,14 @@ const char* realwinding_category(const std::string& msg) {
         return "no lead corridor (ABT #187)";   // MKF's chord-aware sweep exhausted in-section
     if (msg.find("FOIL wire") != std::string::npos ||
         msg.find("rectangular/planar/foil wire") != std::string::npos) return "foil wire (unsupported)";
+    // PLANAR (PCB) construction: MKF has no real-winding model for it (ABT #492 -- leads,
+    // connection blocking and lead routing are for wound magnetics only). A declared limitation
+    // like the foil case above, not an untriaged fault: refusing is the correct behaviour and the
+    // battery should categorise it rather than fail. Alf, 2026-08-26: "09_planar should be
+    // avoided, we are not implementing planar real windings YET." Drop this matcher the day
+    // planar real winding lands, so the fixture goes back to being a real failure if it breaks.
+    if (msg.find("PLANAR (PCB) construction") != std::string::npos)
+        return "planar real winding (not implemented, ABT #492)";
     if (msg.find("produced 0 turns") != std::string::npos)         return "MKF 0 turns (doesn't fit window)";
     if (msg.find("unsupported column shape") != std::string::npos) return "unsupported column shape";
     if (msg.find("single-body sweep failed") != std::string::npos) return "rect-wire sweep (unsupported)";

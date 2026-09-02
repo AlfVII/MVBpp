@@ -30,8 +30,8 @@
                 "pollutionDegree": "PD2"
             },
             "maximumDimensions": {
-                "width": 0.03,
-                "height": 0.025,
+                "width": 0.031,
+                "height": 0.031,
                 "depth": 0.022
             }
         },
@@ -92,7 +92,7 @@
             "functionalDescription": {
                 "type": "twoPieceSet",
                 "material": "N97",
-                "shape": "EFD 20/10/7",
+                "shape": "EFD 30/15/9",
                 "gapping": [
                     {
                         "type": "subtractive",

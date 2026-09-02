@@ -39,7 +39,7 @@
                 "cti": "groupIIIA"
             },
             "maximumDimensions": {
-                "width": 0.04,
+                "width": 0.042,
                 "height": 0.035,
                 "depth": 0.03
             }
@@ -121,13 +121,13 @@
             "functionalDescription": {
                 "type": "twoPieceSet",
                 "material": "N97",
-                "shape": "RM 12",
+                "shape": "RM 14",
                 "gapping": [],
                 "numberStacks": 1
             }
         },
         "coil": {
-            "bobbin": "Bobbin RM 12",
+            "bobbin": "Bobbin RM 14",
             "functionalDescription": [
                 {
                     "name": "Primary",
@@ -146,7 +146,7 @@
                 {
                     "name": "Secondary",
                     "numberTurns": 6,
-                    "numberParallels": 3,
+                    "numberParallels": 2,
                     "isolationSide": "secondary",
                     "wire": "Litz 60x0.1 - Grade 1 - Single Served"
                 }

@@ -31,7 +31,10 @@ TopoDS_Shape ShapeP::buildWindingWindow(const std::map<std::string, double>& dim
     double zCenter = b - d / 2.0;
 
     // build_polygon_cylinder creates a base-at-zero prism; shift down by d/2 to center it at zCenter
-    TopoDS_Shape outerCyl = build_polygon_cylinder(d, e / 2.0, m_corePolygonSegments);
+    // Window-carving tool: its outer boundary becomes the window wall the winding
+    // faces — circumscribe so the carved window contains the nominal window.
+    TopoDS_Shape outerCyl =
+        build_polygon_cylinder(d, e / 2.0, m_corePolygonSegments, /*circumscribed=*/true);
     outerCyl = translate_shape(outerCyl, 0.0, 0.0, zCenter - d / 2.0);
 
     TopoDS_Shape innerCyl = build_polygon_cylinder(d, f / 2.0, m_corePolygonSegments);

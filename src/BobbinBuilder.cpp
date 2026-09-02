@@ -1,4 +1,5 @@
 #include "mvb/BobbinBuilder.h"
+#include "constructive_models/Bobbin.h"
 #include "mvb/Utils.h"
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -135,8 +136,9 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
 
         // Build the cylinder along +Z then translate down by height/2 so it
         // straddles z=0 (matches the legacy MakeCylinder placement).
-        auto make_cyl = [&](double radius, double h, double zBottom) -> TopoDS_Shape {
-            TopoDS_Shape c = build_polygon_cylinder(h, radius, polygonSegments);
+        auto make_cyl = [&](double radius, double h, double zBottom,
+                            bool circumscribed = false) -> TopoDS_Shape {
+            TopoDS_Shape c = build_polygon_cylinder(h, radius, polygonSegments, circumscribed);
             return translate_shape(c, 0.0, 0.0, zBottom);
         };
 
@@ -147,7 +149,9 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             body = outerCyl;
         } else {
             double innerHeight = height * 1.1;
-            TopoDS_Shape innerCyl = make_cyl(innerR, innerHeight, -innerHeight / 2.0);
+            // The bore faces the core column: circumscribe so faceting never bites in.
+            TopoDS_Shape innerCyl =
+                make_cyl(innerR, innerHeight, -innerHeight / 2.0, /*circumscribed=*/true);
             BRepAlgoAPI_Cut cutOp(outerCyl, innerCyl);
             checkIsDone(cutOp, "round body hollow");
             body = cutOp.Shape();
@@ -159,14 +163,18 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             double holeMargin = (holeHeight - flangeThickness) / 2.0;
 
             TopoDS_Shape topFlangeDisc = make_cyl(flangeOuterR, flangeThickness, height / 2.0);
-            TopoDS_Shape topHole = make_cyl(innerR, holeHeight, height / 2.0 - holeMargin);
+            // Flange holes face the core column: circumscribe so faceting never bites in
+            // (measured on EP 13: inscribed chords cut 0.42 mm^3 into the EXACT column).
+            TopoDS_Shape topHole = make_cyl(innerR, holeHeight, height / 2.0 - holeMargin,
+                                            /*circumscribed=*/true);
             BRepAlgoAPI_Cut topCut(topFlangeDisc, topHole);
             checkIsDone(topCut, "round top flange");
 
             TopoDS_Shape bottomFlangeDisc = make_cyl(flangeOuterR, flangeThickness,
                                                      -(height / 2.0 + flangeThickness));
             TopoDS_Shape bottomHole = make_cyl(innerR, holeHeight,
-                                               -(height / 2.0 + flangeThickness) - holeMargin);
+                                               -(height / 2.0 + flangeThickness) - holeMargin,
+                                               /*circumscribed=*/true);
             BRepAlgoAPI_Cut bottomCut(bottomFlangeDisc, bottomHole);
             checkIsDone(bottomCut, "round bottom flange");
 
@@ -195,21 +203,46 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         if (holeDepth <= 0.0) holeDepth = outerDepth * 0.8;
         double eps = wallThickness > 0 ? wallThickness * 0.1 : 1e-6;
 
-        // Rounded corners (radius = 1/4 of the smaller yoke dimension): real U/E
-        // bobbins are moulded with a corner radius on the OUTER winding surface
-        // rather than a sharp 90°. The inner bore (and the flange holes) stay
-        // SQUARE so they still match the square core central column — rounding
-        // the bore would push bobbin material into the column corners and
-        // overlap it. Only for true RECTANGULAR columns; round/oblong/irregular
-        // pass r=0 (box).
+        // Rounded corners: real U/E bobbins are moulded with a corner radius on the
+        // OUTER winding surface rather than a sharp 90°. The inner bore (and the
+        // flange holes) stay SQUARE so they still match the square core central
+        // column — rounding the bore would push bobbin material into the column
+        // corners and overlap it.
+        //
+        // ABT #959: that radius is now the SAME one the winding is routed around
+        // (MKF Bobbin::get_column_corner_radius — the MAS datum, else the moulding
+        // rule), instead of the locally invented 1/4 of the smaller yoke dimension.
+        // Two different corner radii for one surface is how the copper came to be
+        // routed around a mathematically sharp column while the plastic under it was
+        // drawn with a 1.8 mm radius. IRREGULAR columns are included: their wrap path
+        // uses the bounding rectangle, and it must round the same way its former does.
         const bool roundCorners = (bobbin.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
+        const bool corneredColumn = roundCorners ||
+                                    bobbin.get_column_shape() == MAS::ColumnShape::IRREGULAR;
         // OBLONG columns get a true STADIUM tube and bore (full rounding on the short
         // axis), matching the stadium core column; rectangular keeps the moulding
         // radius on the outside and a square bore.
         const bool oblong = (bobbin.get_column_shape() == MAS::ColumnShape::OBLONG);
-        const double rOuter = oblong ? 0.5 * std::min(outerWidth, outerDepth)
-                              : roundCorners ? 0.25 * std::min(outerWidth, outerDepth)
-                                             : 0.0;
+        double rOuter = 0.0;
+        if (oblong) {
+            rOuter = 0.5 * std::min(outerWidth, outerDepth);
+        }
+        else if (roundCorners && !std::getenv("MVB_FORMER_CORNER")) {
+            rOuter = 0.25 * std::min(outerWidth, outerDepth);  // the pre-#959 invented radius
+        }
+        else if (corneredColumn && std::getenv("MVB_FORMER_CORNER")) {
+            // Paired with ConductorBuilder's switch: the plastic and the copper must always agree
+            // on the corner they share, so they are gated together, never one without the other.
+            OpenMagnetics::Bobbin bobbinForCorner;
+            bobbinForCorner.set_processed_description(bobbin);
+            rOuter = bobbinForCorner.get_column_corner_radius();
+            if (rOuter > 0.5 * std::min(outerWidth, outerDepth)) {
+                throw std::invalid_argument(
+                    "BobbinBuilder: column corner radius " + std::to_string(rOuter) +
+                    " m does not fit a " + std::to_string(outerWidth) + " x " +
+                    std::to_string(outerDepth) + " m column — inconsistent bobbin data");
+            }
+        }
         const double rInner = oblong ? 0.5 * std::min(holeWidth, holeDepth) : 0.0;
 
         TopoDS_Shape outer = makeRoundedRectPrism(outerWidth, outerDepth, height, rOuter, -height / 2.0);

@@ -68,7 +68,8 @@ TopoDS_Shape ShapeDrum::applyExtras(const std::map<std::string, double>& dims,
 
     // Bore through the whole piece.
     if (h > 0.0) {
-        TopoDS_Shape bore = build_polygon_cylinder(b, h / 2.0, m_corePolygonSegments);
+        TopoDS_Shape bore =
+            build_polygon_cylinder(b, h / 2.0, m_corePolygonSegments, /*circumscribed=*/true);
         BRepAlgoAPI_Cut cutter(result, bore);
         if (cutter.IsDone()) result = cutter.Shape();
     }

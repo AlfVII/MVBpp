@@ -69,27 +69,32 @@ std::map<std::string, double> flatten_dimensions(const std::map<std::string, MAS
     return result;
 }
 
-TopoDS_Wire build_polygon_circle(double radius, int segments) {
+TopoDS_Wire build_polygon_circle(double radius, int segments, bool circumscribed) {
     if (segments <= 0) {
         gp_Circ circ(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), radius);
         BRepBuilderAPI_MakeEdge edge(circ);
         BRepBuilderAPI_MakeWire wire(edge);
         return wire.Wire();
     }
+    // Circumscribed: apothem = radius, so every chord stays at or beyond the nominal
+    // circle and a carved void contains the nominal void (see Utils.h faceting rule).
+    double vertexRadius =
+        circumscribed ? radius / std::cos(std::numbers::pi / segments) : radius;
     BRepBuilderAPI_MakePolygon poly;
     for (int i = 0; i < segments; ++i) {
         double angle = 2.0 * std::numbers::pi * i / segments;
-        poly.Add(gp_Pnt(radius * std::cos(angle), radius * std::sin(angle), 0.0));
+        poly.Add(gp_Pnt(vertexRadius * std::cos(angle), vertexRadius * std::sin(angle), 0.0));
     }
     poly.Close();
     return BRepBuilderAPI_MakeWire(poly.Wire()).Wire();
 }
 
-TopoDS_Shape build_polygon_cylinder(double height, double radius, int segments) {
+TopoDS_Shape build_polygon_cylinder(double height, double radius, int segments,
+                                    bool circumscribed) {
     if (segments <= 0) {
         return BRepPrimAPI_MakeCylinder(radius, height).Shape();
     }
-    TopoDS_Wire wire = build_polygon_circle(radius, segments);
+    TopoDS_Wire wire = build_polygon_circle(radius, segments, circumscribed);
     BRepBuilderAPI_MakeFace face(wire);
     gp_Vec vec(0, 0, height);
     return BRepPrimAPI_MakePrism(face.Face(), vec).Shape();

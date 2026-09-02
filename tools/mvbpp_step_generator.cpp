@@ -7,6 +7,7 @@
 #include "Utils.h"
 #include "support/Painter.h"
 #include <BRepBuilderAPI_Transform.hxx>
+#include <OSD_ThreadPool.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <iostream>
@@ -28,7 +29,14 @@ static void printUsage(const char* prog) {
               << "  --real                Real winding: continuous conductor per (winding, parallel)\n"
               << "  --fem                 FEM geometry: one-piece / conformal conductors (slow); "
                  "default is the fast drawing compound\n"
-              << "  --segments <N>        Wire+core polygon segments (0 = exact analytic curves)\n"
+              << "  --segments <N>        Wire AND core polygon segments (0 = exact analytic\n"
+              << "                        curves). The two facet in LOCKSTEP: a faceted wire\n"
+              << "                        against an exact core wall touches at every polygon\n"
+              << "                        vertex (measured, 03_buck).\n"
+              << "  --core-segments <N>   Core polygon segments explicitly (overrides the above)\n"
+              << "  --min-bend-radius <m> Minimum radius for ANY drawn corner/fillet, in metres\n"
+              << "                        (also via MVB_MIN_BEND_RADIUS). Floors every corner's\n"
+              << "                        policy radius; never tightens one.\n"
               << "  -h, --help            Show this help\n";
 }
 
@@ -79,7 +87,7 @@ static void paintProjections(const MAS::Magnetic& rawMagnetic, bool useRealWindi
 }
 
 static bool processFile(const fs::path& inputPath, const fs::path& outputPath, bool useMkf,
-                        bool useRealWinding, int segments, bool copperFootprint = false,
+                        bool useRealWinding, int segments, int coreSegments, bool copperFootprint = false,
                         bool femReady = false) {
     try {
         // Read JSON
@@ -146,7 +154,25 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
             cfg.useRealWindingGeometry = true;
             cfg.paintCoating = !copperFootprint;  // --copper => bare CONDUCTING footprint (FEM)
             cfg.femReady = femReady;              // --fem => slow one-piece/conformal meshable geometry
-            if (segments >= 0) { cfg.wirePolygonSegments = segments; cfg.corePolygonSegments = segments; }
+            if (segments >= 0) cfg.wirePolygonSegments = segments;
+            // --core-segments defaults to EXACT for the FEM product. Faceting the core is not
+            // free the way faceting the wire is: a round centre column discretised to an
+            // inscribed n-gon loses 2.55% of its area at n=16, and the core's cross-section is
+            // exactly what sets reluctance -- so the mesh knob would quietly bias inductance.
+            // The winding needs faceting to stay off gmsh's periodic mesher; the core does not,
+            // because the NURBS pass in buildAllNamed already strips periodicity from its
+            // cylinders WITHOUT moving a point. Pass --core-segments explicitly to override.
+            // CORE FACETING FOLLOWS WIRE FACETING, always (Alf, 2026-08-26). The two are a
+            // phase-locked pair: a faceted wire's inner-corner vertices reach EXACTLY the radius
+            // where they meet a matching faceted wall, keeping the conducting-vs-outer gap at
+            // every azimuth. Forcing the core EXACT under --fem (the 2026-08-25 "A_e is physics"
+            // change) broke that contract: measured on 03_buck seg=16, the wire polygon's
+            // vertices landed at r=6.7255 -- the exact cylinder wall -- 50 um deeper than the
+            // intended inner face, giving zero-distance copper-core tangency that OCC's fragment
+            // then corrupts. The A_e bias of a faceted core is the FEM post-processor's business;
+            // geometry consistency is this tool's.
+            if (coreSegments >= 0)      cfg.corePolygonSegments = coreSegments;
+            else if (segments >= 0)     cfg.corePolygonSegments = segments;
             result = builder.drawMagnetic(enriched, outputPath.parent_path().string(), cfg);
         } else if (useMkf) {
             try {
@@ -185,7 +211,23 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
     }
 }
 
+// OCC runs its boolean edge/face intersections on a thread pool and each worker allocates its own
+// Extrema sampling grid, so PEAK MEMORY SCALES WITH THREAD COUNT, not just with geometry. On the
+// faceted product that is the difference between fitting a memory budget and not: 14_dab at
+// --segments 16 peaked at 15.1 GB and died against a 16 GB cap. This box is shared with other
+// agents' builds, and a job that takes the whole machine OOM-kills somebody else's work.
+// MVB_OCC_THREADS caps the pool; unset or <= 0 leaves OCC's default (all cores).
+static void applyOccThreadCap() {
+    const char* v = std::getenv("MVB_OCC_THREADS");
+    if (!v) return;
+    const int n = std::atoi(v);
+    if (n <= 0) return;
+    OSD_ThreadPool::DefaultPool()->Init(n);
+    std::cerr << "[occ] boolean thread pool capped at " << n << " thread(s)\n";
+}
+
 int main(int argc, char* argv[]) {
+    applyOccThreadCap();
     if (argc < 2) {
         printUsage(argv[0]);
         return 1;
@@ -199,6 +241,9 @@ int main(int argc, char* argv[]) {
     bool copperFootprint = false;
     bool femReady = false;
     int segments = -1;  // -1 = builder default; 0 = exact analytic curves
+    int coreSegments = -1;  // -1 = follow --segments (drawing) / stay EXACT (--fem)
+    double minBendRadius = std::getenv("MVB_MIN_BEND_RADIUS")
+                               ? std::atof(std::getenv("MVB_MIN_BEND_RADIUS")) : 0.0;
 
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
@@ -219,6 +264,16 @@ int main(int argc, char* argv[]) {
             copperFootprint = true;
         } else if (arg == "--fem") {
             femReady = true;
+        } else if (arg == "--core-segments") {
+            if (i + 1 < argc) coreSegments = std::stoi(argv[++i]);
+        } else if (arg == "--min-bend-radius") {
+            if (i + 1 < argc) {
+                minBendRadius = std::atof(argv[++i]);
+                // ConductorBuilder::Options reads MVB_MIN_BEND_RADIUS as its default, so the
+                // flag reaches every construction site without threading a parameter through
+                // four signatures. setenv BEFORE any Options is constructed.
+                setenv("MVB_MIN_BEND_RADIUS", argv[i], 1);
+            }
         } else if (arg == "--segments") {
             if (++i < argc) segments = std::stoi(argv[i]);
         } else if (arg[0] != '-') {
@@ -239,7 +294,7 @@ int main(int argc, char* argv[]) {
         outputPath = dir / (inputPath.stem().string() + "_mvbpp.step");
     }
     
-    bool success = processFile(inputPath, outputPath, useMkf, useRealWinding, segments,
+    bool success = processFile(inputPath, outputPath, useMkf, useRealWinding, segments, coreSegments,
                                copperFootprint, femReady);
     return success ? 0 : 1;
 }

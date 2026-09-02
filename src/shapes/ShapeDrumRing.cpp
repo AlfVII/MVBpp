@@ -26,7 +26,9 @@ TopoDS_Shape ShapeDrumRing::applyExtras(const std::map<std::string, double>& dim
 
     TopoDS_Shape ringOuter = build_polygon_cylinder(l, j / 2.0, m_corePolygonSegments);
     ringOuter = translate_shape(ringOuter, 0.0, 0.0, -l / 2.0);
-    TopoDS_Shape ringBore = build_polygon_cylinder(l, k / 2.0, m_corePolygonSegments);
+    // The ring bore faces the drum winding: circumscribe so faceting never bites in.
+    TopoDS_Shape ringBore =
+        build_polygon_cylinder(l, k / 2.0, m_corePolygonSegments, /*circumscribed=*/true);
     ringBore = translate_shape(ringBore, 0.0, 0.0, -l / 2.0);
 
     BRepAlgoAPI_Cut ring(ringOuter, ringBore);

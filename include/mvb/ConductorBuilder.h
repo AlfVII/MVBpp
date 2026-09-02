@@ -6,6 +6,7 @@
 #include "mvb/Utils.h"
 #include <TopoDS_Shape.hxx>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <string>
@@ -34,7 +35,13 @@ namespace mvb {
 class ConductorBuilder {
 public:
     struct Options {
-        Options() {}
+        Options() {
+            if (std::getenv("MVB_TOROID_MITRE_CORNERS")) toroidMitreCorners = true;
+            if (const char* v = std::getenv("MVB_MIN_BEND_RADIUS")) {
+                const double m = std::atof(v);
+                if (m > 0) minBendRadius = m;
+            }
+        }
         int  wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS;
         // true  -> conductor swept at the OUTER (insulation) footprint (visualisation)
         // false -> swept at the CONDUCTING (copper) footprint (FEM)
@@ -49,6 +56,26 @@ public:
         // what made 06_llc's three parallels show three different exit joints, which is why the
         // deterministic mitre is the default.
         bool roundedLeadCorners = false;
+        // TOROID turn corners: false (default) = the round tangent fillets (today's certified
+        // construction); true = sharp MITRE corners -- five straight runs per turn joined on
+        // 45-degree bisector planes (Alf, 2026-08-27). Mitres trade the fillets' osculating
+        // tangent junctions (OCC's worst contact class) for transversal plane joints, and at
+        // segments > 0 every piece becomes an exact boolean-free polygon prism. Env:
+        // MVB_TOROID_MITRE_CORNERS=1.
+        bool toroidMitreCorners = false;
+        // MINIMUM BEND RADIUS for every drawn corner/fillet, in METRES (Alf, 2026-08-27:
+        // "a setting that is the minimum radius in any turn"). 0 (default) keeps each site's
+        // own policy radius (kRoundCornerBendFactor x wire radius, 1.02 x wireRadius for rect
+        // stations, 1.5 x wireRadius for lead fillets). A positive value FLOORS every one of
+        // those choices: effectiveBend() below is the single chokepoint, so no corner anywhere
+        // can be drawn tighter than this. It can only widen a bend, never tighten one -- a
+        // radius below the wire's own is a horn torus OCC cannot build, and that guard stays.
+        // Configure via ConductorBuilder::Options, the MVB_MIN_BEND_RADIUS env (metres), or the
+        // step generator's --min-bend-radius flag.
+        double minBendRadius = 0.0;
+        double effectiveBend(double policyBend) const {
+            return policyBend < minBendRadius ? minBendRadius : policyBend;
+        }
         // false (OM / drawing) -> fast per-run compound: overlapping swept pipes, perfect for the
         //   3D viewer, seconds to build.
         // true  (FEM export)   -> the slow one-piece machinery: single continuous body per parallel

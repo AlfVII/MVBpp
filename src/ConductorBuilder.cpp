@@ -1,5 +1,6 @@
 #include "mvb/ConductorBuilder.h"
 #include "mvb/WireAssembler.h"   // ABT #685: the centreline vocabulary + THE assembler
+#include <mvb/TerminalFillet.h>
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
 #include <array>
@@ -171,6 +172,87 @@ inline gp_Pnt evalPrim(const Primitive& pr, double t) {
     }
 }
 
+// THE WINDING WINDOW'S FLANGES (boost_inductor_complete, 2026-09-02). The axial extent [lo, hi]
+// of a primitive's centreline over the part of it that lies within radial reach `outerR` of the
+// column axis (x = axisX, z = 0) -- the region the bobbin's flanges span. Exact per kind: a SEG's
+// y is linear and its in-reach part is one parameter interval (radius^2 is a quadratic in t);
+// an ARC3's y is a sinusoid in the sweep angle, so its extremes are its endpoints, its interior
+// extrema and the points where it crosses the reach; a SPIRAL's y is linear in the parameter.
+// Returns false when no part of the primitive is within reach.
+inline bool primAxialExtentInReach(const Primitive& pr, double axisX, double outerR, double& lo,
+                                   double& hi) {
+    lo = std::numeric_limits<double>::max();
+    hi = std::numeric_limits<double>::lowest();
+    auto inReach = [&](const gp_Pnt& q) {
+        return std::hypot(q.X() - axisX, q.Z()) <= outerR + 1e-15;
+    };
+    auto take = [&](double y) { lo = std::min(lo, y); hi = std::max(hi, y); };
+    switch (pr.kind) {
+        case Primitive::SEG: {
+            const gp_XYZ a = pr.seg.a.XYZ(), d = pr.seg.b.XYZ() - a;
+            const double ax = a.X() - axisX, az = a.Z();
+            const double A = d.X() * d.X() + d.Z() * d.Z(), B = 2.0 * (ax * d.X() + az * d.Z());
+            const double C = ax * ax + az * az - outerR * outerR;
+            double t0 = 0.0, t1 = 1.0;
+            if (A > 0.0) {
+                const double disc = B * B - 4.0 * A * C;
+                if (disc < 0.0) return false;
+                t0 = std::max(0.0, (-B - std::sqrt(disc)) / (2.0 * A));
+                t1 = std::min(1.0, (-B + std::sqrt(disc)) / (2.0 * A));
+                if (t0 > t1) return false;
+            }
+            else if (C > 0.0) {
+                return false;
+            }
+            take(a.Y() + d.Y() * t0);
+            take(a.Y() + d.Y() * t1);
+            return true;
+        }
+        case Primitive::ARC3: {
+            const gp_XYZ v0 = pr.arc.v0, ax = pr.arc.axis;
+            const gp_XYZ w = ax.Crossed(v0);
+            const double K = ax.Y() * ax.Dot(v0);
+            const double cA = v0.Y() - K, sA = w.Y();
+            std::vector<double> cand{0.0, pr.arc.sweep};
+            if (std::hypot(cA, sA) > 0.0) {
+                const double phi0 = std::atan2(sA, cA);
+                for (double th : {phi0, phi0 + kPi, phi0 - kPi, phi0 + 2.0 * kPi})
+                    if (th > 0.0 && th < pr.arc.sweep) cand.push_back(th);
+            }
+            std::sort(cand.begin(), cand.end());
+            auto at = [&](double th) { return cert::evalPrim(pr, th / pr.arc.sweep); };
+            bool any = false;
+            for (size_t i = 0; i < cand.size(); ++i) {
+                const gp_Pnt q = at(cand[i]);
+                if (inReach(q)) { take(q.Y()); any = true; }
+                if (i + 1 < cand.size()) {
+                    // the reach crossing between consecutive candidates, if the flag flips
+                    double a2 = cand[i], b2 = cand[i + 1];
+                    const bool ia = inReach(at(a2)), ib = inReach(at(b2));
+                    if (ia != ib) {
+                        for (int it = 0; it < 60; ++it) {
+                            const double m = 0.5 * (a2 + b2);
+                            if (inReach(at(m)) == ia) a2 = m; else b2 = m;
+                        }
+                        take(at(0.5 * (a2 + b2)).Y());
+                        any = true;
+                    }
+                }
+            }
+            return any;
+        }
+        case Primitive::SPIRAL: {
+            const gp_Pnt a = cert::evalPrim(pr, 0.0), b = cert::evalPrim(pr, 1.0);
+            bool any = false;
+            if (inReach(a)) { take(a.Y()); any = true; }
+            if (inReach(b)) { take(b.Y()); any = true; }
+            return any;
+        }
+        default:
+            return false;
+    }
+}
+
 // max |d^2 p / dt^2| over the whole primitive (t in [0,1]) -- exact per kind, never a guess.
 inline double maxSecondDerivative(const Primitive& pr) {
     switch (pr.kind) {
@@ -196,40 +278,61 @@ inline double maxSecondDerivative(const Primitive& pr) {
 inline double segSegDistance(const gp_Pnt& p1, const gp_Pnt& q1, const gp_Pnt& p2,
                              const gp_Pnt& q2, double* sOut = nullptr,
                              double* tOut = nullptr) {
-    // standard closed-form segment-segment minimum distance
+    // EXACT segment-segment minimum distance (boost_inductor_complete, 2026-09-02). The
+    // textbook closed form used here before compared its SQUARED lengths a, e (m^2) and the
+    // m^4 determinant a*e - b^2 against kCertEpsilon, a LENGTH of one picometre. Any chord
+    // shorter than a micrometre therefore collapsed to its START POINT, and any pair whose
+    // determinant fell under 1e-12 m^4 -- a 4 mm lead against a helix chord under 0.27 um --
+    // was treated as parallel, which pins the lead's closest point to ITS start (s = 0). The
+    // engine splits only the curved side, so every refined box hit exactly that regime: its
+    // "lower bound" was the distance from the lead's START to a chord endpoint, not the
+    // distance between the chords, and was no bound at all. Measured on the boost: the true
+    // minimum between Primary p0's exit lead and p1's terminal stub is 0.9429198 mm against
+    // the 0.943 envelope (80.2 nm inside), lying 12 um along the lead; the engine certified
+    // the pair CLEAR on one pass and, on the next, reported 1.3 nm with a "lower bound" of
+    // 0.942932 -- 12 nm ABOVE the true minimum.
+    // The minimum of two segments is attained at an endpoint of one against the other, or at
+    // the two lines' closest points when those fall inside both segments. Every candidate is
+    // an exact projection; the interior candidate is taken only where the determinant is
+    // well conditioned (sin^2 of the angle above 1e-16 -- below that the segments are parallel
+    // to one part in 1e8 and the endpoint candidates are exact to (theta*L)^2 / 2d).
     const gp_XYZ d1 = q1.XYZ() - p1.XYZ(), d2 = q2.XYZ() - p2.XYZ(), r = p1.XYZ() - p2.XYZ();
-    const double a = d1.Dot(d1), e = d2.Dot(d2), f = d2.Dot(r);
-    double sN, tN;
-    if (a <= kCertEpsilon && e <= kCertEpsilon) return p1.Distance(p2);
-    if (a <= kCertEpsilon) {
-        sN = 0.0;
-        tN = std::clamp(f / e, 0.0, 1.0);
-    }
-    else {
-        const double c = d1.Dot(r);
-        if (e <= kCertEpsilon) {
-            tN = 0.0;
-            sN = std::clamp(-c / a, 0.0, 1.0);
+    const double a = d1.Dot(d1), e = d2.Dot(d2), b = d1.Dot(d2);
+    const double c = d1.Dot(r), f = d2.Dot(r);
+    auto clamp01 = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
+    double bestD2 = std::numeric_limits<double>::max(), bestS = 0.0, bestT = 0.0;
+    auto consider = [&](double s, double t) {
+        const gp_XYZ diff = (p1.XYZ() + d1 * s) - (p2.XYZ() + d2 * t);
+        const double dd = diff.Dot(diff);
+        if (dd < bestD2) {
+            bestD2 = dd;
+            bestS = s;
+            bestT = t;
         }
-        else {
-            const double b = d1.Dot(d2), denom = a * e - b * b;
-            sN = denom > kCertEpsilon ? std::clamp((b * f - c * e) / denom, 0.0, 1.0) : 0.0;
-            tN = (b * sN + f) / e;
-            if (tN < 0.0) {
-                tN = 0.0;
-                sN = std::clamp(-c / a, 0.0, 1.0);
-            }
-            else if (tN > 1.0) {
-                tN = 1.0;
-                sN = std::clamp((b - c) / a, 0.0, 1.0);
-            }
-        }
+    };
+    // p1 and q1 against segment 2; p2 and q2 against segment 1.
+    consider(0.0, e > 0.0 ? clamp01(f / e) : 0.0);
+    consider(1.0, e > 0.0 ? clamp01((f + b) / e) : 0.0);
+    consider(a > 0.0 ? clamp01(-c / a) : 0.0, 0.0);
+    consider(a > 0.0 ? clamp01((b - c) / a) : 0.0, 1.0);
+    const double denom = a * e - b * b;
+    if (denom > 1e-16 * a * e && a > 0.0 && e > 0.0) {
+        const double s = (b * f - c * e) / denom;
+        const double t = (b * s + f) / e;
+        if (s > 0.0 && s < 1.0 && t > 0.0 && t < 1.0) consider(s, t);
     }
-    const gp_Pnt c1(p1.XYZ() + d1 * sN), c2(p2.XYZ() + d2 * tN);
-    if (sOut) *sOut = sN;
-    if (tOut) *tOut = tN;
-    return c1.Distance(c2);
+    if (sOut) *sOut = bestS;
+    if (tOut) *tOut = bestT;
+    return std::sqrt(bestD2);
 }
+
+// THE DECLARED RESOLUTION (ABT #865 (b), Alf 2026-08-24): half the coordinate grid. MKF ships
+// every turn coordinate rounded to 1 nm, so a proven shortfall within half a grid cell of exact
+// touch IS exact touch at the data's resolution, and touching at the coated envelope is legal.
+// A pair is therefore proven at (envelope - kCoordinateGridHalf): clear means "no point of the
+// two curves is more than half a grid cell inside the envelope", refused means a violation
+// deeper than that was exhibited. The fan plans with the same statement the gate certifies.
+constexpr double kCoordinateGridHalf = 0.5e-9;
 
 struct Verdict {
     bool clears = false;        // proven: true minimum >= threshold - kCertEpsilon
@@ -323,6 +426,7 @@ inline Verdict provePairClears(const Primitive& A, const Primitive& B, double th
 // never overstate it. Used by continuous refinement, where pass/fail alone cannot steer.
 struct Bounds {
     double lb = 0.0, ub = std::numeric_limits<double>::max();
+    double ta = 0.0, tb = 0.0;   // the parameters at which `ub` was ACHIEVED (points on the curves)
 };
 inline Bounds boundedMinDist(const Primitive& A, const Primitive& B, double tol, size_t budget) {
     const double ddA = maxSecondDerivative(A), ddB = maxSecondDerivative(B);
@@ -349,7 +453,27 @@ inline Bounds boundedMinDist(const Primitive& A, const Primitive& B, double tol,
         boxes.pop_back();
         out.lb = bx.lb;
         const double am = 0.5 * (bx.a0 + bx.a1), bm = 0.5 * (bx.b0 + bx.b1);
-        out.ub = std::min(out.ub, evalPrim(A, am).Distance(evalPrim(B, bm)));
+        if (const double dm = evalPrim(A, am).Distance(evalPrim(B, bm)); dm < out.ub) {
+            out.ub = dm;
+            out.ta = am;
+            out.tb = bm;
+        }
+        // The chords' closest pair, evaluated ON the curves: an achieved distance at the
+        // parameters where the box's chords come closest. Without it the upper bound of a
+        // never-split side (a SEG: zero sag, so the engine only ever splits the other side)
+        // was sampled at t = 1/2 alone, and "worst" could never land on a minimum interior to
+        // the segment (the boost's sits at t = 0.0033).
+        {
+            double sN = 0.0, tN = 0.0;
+            segSegDistance(evalPrim(A, bx.a0), evalPrim(A, bx.a1), evalPrim(B, bx.b0),
+                           evalPrim(B, bx.b1), &sN, &tN);
+            const double ta = bx.a0 + sN * (bx.a1 - bx.a0), tb = bx.b0 + tN * (bx.b1 - bx.b0);
+            if (const double dc = evalPrim(A, ta).Distance(evalPrim(B, tb)); dc < out.ub) {
+                out.ub = dc;
+                out.ta = ta;
+                out.tb = tb;
+            }
+        }
         if (out.ub - bx.lb < tol) break;
         const double sagA = ddA * (bx.a1 - bx.a0) * (bx.a1 - bx.a0) / 8.0;
         const double sagB = ddB * (bx.b1 - bx.b0) * (bx.b1 - bx.b0) / 8.0;
@@ -600,6 +724,61 @@ void translatePathX(ConductorPath& path, double dx) {
     }
 }
 
+// COPPER AGAINST THE BOBBIN'S FLANGES (boost_inductor_complete, 2026-09-02). Every primitive's
+// coated envelope, wherever it lies within the flanges' radial reach, must stay inside the
+// winding window's axial extent. MKF's stations do (turn 0 sits one coated radius above the
+// flange face, to the nm), but a pitch-true dip at an off-plane entrance slot continues the
+// first wrap BELOW its station -- on the boost, 47 um into the flange -- and nothing here saw
+// it: the collision gate knows only copper, and the STEP overlap audit is downstream. Proven at
+// the gate's declared resolution (half the coordinate grid), thrown with the deepest intrusion.
+struct WindowBounds {
+    double lo = 0.0, hi = 0.0;       // the flange faces (axial)
+    double axisX = 0.0, outerR = 0.0; // the column axis and the flanges' radial reach
+};
+void checkWindowContainment(const std::vector<ConductorPath>& paths,
+                            const std::vector<std::optional<WindowBounds>>& windows) {
+    double worst = 0.0;
+    std::string where;
+    for (size_t ci = 0; ci < paths.size() && ci < windows.size(); ++ci) {
+        const ConductorPath& p = paths[ci];
+        if (p.toroidal || !windows[ci]) continue;
+        const WindowBounds& wb = *windows[ci];
+        const double env = p.isRectangular ? 0.5 * p.wireHeight : p.wireRadius;
+        for (const Primitive& pr : p.prims) {
+            double lo, hi;
+            if (pr.kind == Primitive::BLEND) {
+                lo = std::numeric_limits<double>::max();
+                hi = std::numeric_limits<double>::lowest();
+                bool any = false;
+                for (const gp_Pnt& q : samplePrim(pr, p.wireRadius)) {
+                    if (std::hypot(q.X() - wb.axisX, q.Z()) > wb.outerR) continue;
+                    lo = std::min(lo, q.Y()); hi = std::max(hi, q.Y()); any = true;
+                }
+                if (!any) continue;
+            }
+            else if (!cert::primAxialExtentInReach(pr, wb.axisX, wb.outerR, lo, hi)) {
+                continue;
+            }
+            const double below = wb.lo - (lo - env), above = (hi + env) - wb.hi;
+            const double depth = std::max(below, above);
+            if (depth > cert::kCoordinateGridHalf && depth > worst) {
+                worst = depth;
+                std::ostringstream w;
+                w.precision(9);
+                w << p.name << " '" << pr.label << "' reaches " << (below > above ? "below" : "above")
+                  << " the winding window by " << depth * 1e6 << " um (coated envelope at y = "
+                  << (below > above ? lo - env : hi + env) * 1e3 << " mm, flange face at y = "
+                  << (below > above ? wb.lo : wb.hi) * 1e3 << " mm)";
+                where = w.str();
+            }
+        }
+    }
+    if (worst > 0.0) {
+        throw std::runtime_error("ConductorBuilder: copper inside the bobbin flange -- " + where +
+                                 ". The winding window is the bobbin's; turns and leads stay in it.");
+    }
+}
+
 void checkCollisions(const std::vector<ConductorPath>& paths) {
     if (std::getenv("MVB_PATH_DUMP")) {
         for (size_t ci = 0; ci < paths.size(); ++ci) {
@@ -621,19 +800,22 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                     continue;
                 }
                 if (pr.kind == Primitive::ARC3) {
-                    std::fprintf(stderr, "[arc] ci=%zu '%s' ARC3 from=%.2f deg sweep=%.2f deg r=%.4f y=%.4f\n",
+                    std::fprintf(stderr, "[arc] ci=%zu '%s' ARC3 from=%.2f deg sweep=%.2f deg r=%.4f y=%.4f"
+                                 " | c=(%.9f,%.9f,%.9f) axis=(%.9f,%.9f,%.9f) v0=(%.9f,%.9f,%.9f) sweep=%.12f\n",
                                  ci, pr.label.c_str(),
                                  std::atan2(-pr.arc.v0.Z(), pr.arc.v0.X()) * 180 / kPi,
                                  pr.arc.sweep * 180 / kPi,
-                                 std::hypot(pr.arc.v0.X(), pr.arc.v0.Z()) * 1e3, pr.arc.c.Y() * 1e3);
+                                 std::hypot(pr.arc.v0.X(), pr.arc.v0.Z()) * 1e3, pr.arc.c.Y() * 1e3,
+                                 pr.arc.c.X()*1e3, pr.arc.c.Y()*1e3, pr.arc.c.Z()*1e3,
+                                 pr.arc.axis.X(), pr.arc.axis.Y(), pr.arc.axis.Z(),
+                                 pr.arc.v0.X()*1e3, pr.arc.v0.Y()*1e3, pr.arc.v0.Z()*1e3, pr.arc.sweep);
                     continue;
                 }
                 if (pr.kind != Primitive::SEG) continue;
                 a = pr.seg.a; bEnd = pr.seg.b;
-                std::cerr << "[prim] ci=" << ci << " '" << pr.label << "'"
-                          << " a=(" << a.X() << "," << a.Y() << "," << a.Z() << ")"
-                          << " b=(" << bEnd.X() << "," << bEnd.Y() << "," << bEnd.Z() << ")"
-                          << " lead=" << pr.isLead << std::endl;
+                std::fprintf(stderr, "[prim] ci=%zu '%s' a=(%.9f,%.9f,%.9f) b=(%.9f,%.9f,%.9f) lead=%d\n",
+                             ci, pr.label.c_str(), a.X()*1e3, a.Y()*1e3, a.Z()*1e3,
+                             bEnd.X()*1e3, bEnd.Y()*1e3, bEnd.Z()*1e3, int(pr.isLead));
             }
         }
     }
@@ -746,8 +928,8 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                                 }
                             }
                             else {
-                                const auto verdict =
-                                    cert::provePairClears(pa, pb, coatedEnvelope);
+                                const auto verdict = cert::provePairClears(
+                                    pa, pb, coatedEnvelope - cert::kCoordinateGridHalf);
                                 // ABT #865 (b), Alf 2026-08-24 ("all parts should be CLEAN of
                                 // coil collision"): the gate's DECLARED RESOLUTION is half the
                                 // coordinate grid. MKF ships every turn coordinate rounded to
@@ -764,11 +946,11 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                                 // here. This is a stated measurement resolution, not a
                                 // tolerance to be widened: it may never exceed half the grid
                                 // the coordinates are actually written on.
-                                constexpr double kCoordinateGridHalf = 0.5e-9;
-                                const bool withinGridOfTouch =
-                                    !verdict.clears &&
-                                    (coatedEnvelope - verdict.violationUB) <= kCoordinateGridHalf;
-                                if (!verdict.clears && !withinGridOfTouch) {
+                                // (The proof above runs at envelope - kCoordinateGridHalf, so a
+                                // refusal here is a violation deeper than the resolution -- not a
+                                // first witness that merely grazed the grid while the true minimum
+                                // lay deeper, which the old post-hoc test on the witness let by.)
+                                if (!verdict.clears) {
                                     ++coatedIntrusions;
                                     if (std::getenv("MVB_ENAMEL_LIST")) {
                                         const gp_Pnt qa = cert::evalPrim(pa, verdict.tA);
@@ -817,13 +999,35 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                                         spDump("A", pa);
                                         spDump("B", pb);
                                     }
-                                    if (verdict.violationUB < worstCoatedGap) {
-                                        worstCoatedGap = verdict.violationUB;
+                                    // THE TRUE DEPTH, not the first witness (pushpull, 2026-09-02).
+                                    // provePairClears returns on the FIRST achieved violation it
+                                    // meets -- a proof of failure, not a measurement: the pushpull's
+                                    // Secondary 1 p1 exit lead was reported 18 nm inside Secondary 2
+                                    // p1's final wrap while its true interpenetration was 14.76 um.
+                                    // A refused pair is rare and the refinement is cheap, so the
+                                    // pair's certified minimum is measured here and "worst" means
+                                    // what it says. The lower bound is the safe side; if the two
+                                    // have not met, the achieved figure is what is reported and the
+                                    // bound is printed beside it.
+                                    const cert::Bounds deep =
+                                        cert::boundedMinDist(pa, pb, 1e-12, 200000);
+                                    double achieved = verdict.violationUB;
+                                    double tA = verdict.tA, tB = verdict.tB;
+                                    if (deep.ub < achieved) {
+                                        achieved = deep.ub;
+                                        tA = deep.ta;
+                                        tB = deep.tb;
+                                    }
+                                    if (achieved < worstCoatedGap) {
+                                        worstCoatedGap = achieved;
                                         worstCoatedEnvelope = coatedEnvelope;
-                                        worstCoatedWhere = A.name + " '" + pa.label + "' (t=" +
-                                                           std::to_string(verdict.tA) + ") vs " +
-                                                           B.name + " '" + pb.label + "' (t=" +
-                                                           std::to_string(verdict.tB) + ")";
+                                        std::ostringstream wh;
+                                        wh << A.name << " '" << pa.label << "' (t=" << tA << ") vs "
+                                           << B.name << " '" << pb.label << "' (t=" << tB
+                                           << "); certified minimum of the pair, lower bound "
+                                           << deep.lb << " m, first witness "
+                                           << verdict.violationUB << " m";
+                                        worstCoatedWhere = wh.str();
                                     }
                                 }
                             }
@@ -914,7 +1118,8 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
         m << "ConductorBuilder: enamel overlap, CERTIFIED -- " << coatedIntrusions
           << " primitive pairs whose true curves come closer than their coated envelope; worst "
           << worstCoatedGap << " m against " << worstCoatedEnvelope << " m ("
-          << (worstCoatedEnvelope - worstCoatedGap) * 1e9 << " nm of interpenetration): "
+          << (worstCoatedEnvelope - worstCoatedGap) * 1e9
+          << " nm of interpenetration, the deepest pair's certified minimum): "
           << worstCoatedWhere
           << ". Wires may touch at their coated envelopes, never interpenetrate.";
         if (std::getenv("MVB_ALLOW_ENAMEL")) {
@@ -1249,6 +1454,17 @@ TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir&
             TopoDS_Wire prof = rectProfileWire(p0, t0, axialAxis, rectWidth, rectHeight);
             BRepOffsetAPI_MakePipeShell ps(spine);
             ps.SetMode(axialAxis);   // fixed binormal = column axis: section stays axial/radial
+            // TIGHT SURFACE TOLERANCE, not OCC's default. The default tol3d is 1e-4 MODEL UNITS
+            // and this sweep runs in metres, so the swept faces were allowed to sag 100 um off
+            // the true helix -- measured on 03_buck --copper: the wrap's inner face undershot
+            // its nominal radius by up to 50 um (6.725 vs 6.775), eating exactly the conducting
+            // clearance MKF's outer-based placement guarantees, and landing the copper ON the
+            // core wall (tangency on the exact core, certified 1.2e-5 mm3 interpenetration on
+            // the faceted one). kSweepTol3d stays the round branches' opt-in; the rect branch
+            // gets 1e-7 m by default because the volume acceptance BELOW is its discriminator
+            // against the known silent-collapse failure mode (the EP stadium note above).
+            const double rectTol = kSweepTol3d > 0.0 ? kSweepTol3d : 1e-7;
+            ps.SetTolerance(rectTol, rectTol, 1e-2);
             ps.Add(prof);
             ps.Build();
             if (!ps.IsDone() || !ps.MakeSolid()) {
@@ -1258,7 +1474,26 @@ TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir&
                 return TopoDS_Shape();
             }
             TopoDS_Shape s = ps.Shape();
-            if (BRepCheck_Analyzer(s).IsValid()) return s;
+            if (BRepCheck_Analyzer(s).IsValid()) {
+                // VOLUME ACCEPTANCE -- the discriminator the tight tolerance was waiting for
+                // (see the kSweepTol3d note: a tight fit once collapsed a section SILENTLY on
+                // the EP stadium spine, passing BRepCheck and volume-of-shell checks). A rect
+                // sweep's volume is length x width x height to first order; a collapsed section
+                // loses a section's worth of it. 2% headroom covers helix curvature and mitred
+                // ends, which are orders below the failure mode (a lost section is >10%).
+                GProp_GProps lp, vp;
+                BRepGProp::LinearProperties(spine, lp);
+                BRepGProp::VolumeProperties(s, vp);
+                const double expect = lp.Mass() * rectWidth * rectHeight;
+                if (expect > 0 && std::abs(vp.Mass() - expect) > 0.02 * expect) {
+                    if (std::getenv("MVB_DIAG"))
+                        std::cerr << "[sweepWire] rect sweep volume " << vp.Mass() * 1e9
+                                  << " mm3 vs expected " << expect * 1e9
+                                  << " mm3 -- rejecting the swept body\n";
+                    return TopoDS_Shape();
+                }
+                return s;
+            }
             if (std::getenv("MVB_DIAG"))
                 std::cerr << "[sweepWire] rect fixed-binormal: swept but INVALID\n";
         } catch (const Standard_Failure& f) {
@@ -1517,10 +1752,25 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
 // tighter than the wire's half-width cleanly, exactly where a swept flat section would collapse);
 // straights are prisms; gentle -Z transitions are piped (corrected Frenet). Used for rect/oblong
 // columns, whose racetrack corners defeat a single swept pipe.
+// capNormalA/capNormalB: the NEIGHBOUR's tangent at each end, when that neighbour is joined
+// nearly-but-not-exactly tangentially. A prism's caps are normally square to its OWN axis, so a
+// junction whose two pieces differ in direction by a sub-elbow angle leaves two NON-PARALLEL
+// caps at the same centreline point: they touch along one line and open into a wedge of
+// (section half-diagonal) x angle across the section. Measured on 18_stacked: the entrance lead
+// drifts 20.3 um in y over its 17.8 mm run (1.14 mrad) to reach the wrap entry, its cap is
+// square to that tilted axis, the following lead-corner arc's cap is square to +Z, and the
+// resulting ~1 um wedge survives the union (UnifySameDomain's default 0.1 um cannot merge it)
+// as an internal 5 x 0.5 mm slab -- gmsh then meshes both faces and their triangles overlap
+// ("Invalid boundary mesh (overlapping facets) on surface 68 surface 69", 4/5 volumes meshed).
+// Squaring the cap to the NEIGHBOUR's tangent instead makes the two caps coplanar and identical,
+// so the union dissolves them. The centreline endpoints stay exactly where MKF put them; only
+// the cap's shear changes, and the true section area changes by cos(angle) = 1 - 6.5e-7 here.
 TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir& axialStart,
                            const gp_Dir& axialEnd, double extendA = 0.0, double extendB = 0.0,
                            bool round = false, double radius = 0.0,
-                           int splitOverride = -1) {
+                           int splitOverride = -1,
+                           const gp_Dir* capNormalA = nullptr,
+                           const gp_Dir* capNormalB = nullptr) {
     // Section profile at a point: an exact circle for round/litz wire, else the oriented rectangle.
     // NOTE: do NOT split this into arcs. The analytic Cylinder/Torus surfaces a closed circular
     // profile produces are exactly what gmsh meshes best here; splitting them was measured to make
@@ -1585,6 +1835,30 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
                              ext.Modulus(),
                              (round || axialStart.Angle(axialEnd) < 0.01) ? "prism" : "loft");
                 std::fflush(stderr);
+            }
+            // COPLANAR JUNCTION CAPS (see the capNormal note on this function). A rect SEG whose
+            // neighbours are joined nearly-tangentially takes ITS NEIGHBOURS' cap planes, so the
+            // abutting faces coincide exactly instead of opening a micron-scale wedge. Only a
+            // rect section has an orientation to shear; a round one is rotation-invariant and is
+            // left alone. Lofting between the two end sections is the same solid as the prism
+            // when the caps agree, and the correctly sheared one when they do not.
+            const bool shearA = !round && capNormalA && capNormalA->Angle(t) > 1e-9;
+            const bool shearB = !round && capNormalB && capNormalB->Angle(t) > 1e-9;
+            if (shearA || shearB) {
+                const gp_Dir nA = shearA ? *capNormalA : t;
+                const gp_Dir nB = shearB ? *capNormalB : t;
+                if (trace) {
+                    std::fprintf(stderr, "[rect-seg]   sheared caps: A=%.3g rad B=%.3g rad\n",
+                                 shearA ? capNormalA->Angle(t) : 0.0,
+                                 shearB ? capNormalB->Angle(t) : 0.0);
+                    std::fflush(stderr);
+                }
+                BRepOffsetAPI_ThruSections sheared(Standard_True);   // solid
+                sheared.AddWire(rectProfileWire(sa, nA, axialStart, w, h));
+                sheared.AddWire(rectProfileWire(sb, nB, axialEnd, w, h));
+                sheared.Build();
+                if (sheared.IsDone() && !sheared.Shape().IsNull()) return sheared.Shape();
+                // Fall through to the plain prism rather than emit nothing.
             }
             if (round || axialStart.Angle(axialEnd) < 0.01) {
                 TopoDS_Face face = BRepBuilderAPI_MakeFace(profile(sa, t, axialStart)).Face();
@@ -1860,8 +2134,73 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                          segLen, segLen + extA + extB);
             std::fflush(stderr);
         }
+        // NEARLY-TANGENT NEIGHBOUR CAPS. A junction whose direction change is below the elbow
+        // threshold (0.05 rad) gets no elbow and no trim, so the two pieces butt with caps that
+        // are square to their OWN axes -- non-parallel by that angle, opening a wedge the union
+        // cannot close (see rectPrimSolid). Hand this SEG its neighbours' tangents so its caps
+        // land in the neighbours' planes. Only sub-threshold junctions qualify: at a real corner
+        // the elbow already supplies coincident caps, and shearing a cap through a large angle
+        // would distort the section instead of squaring it.
+        gp_Dir capA, capB;
+        bool haveCapA = false, haveCapB = false;
+        if (!round && pr.kind == Primitive::SEG) {
+            const gp_Dir own = gp_Dir(pr.seg.b.XYZ() - pr.seg.a.XYZ());
+            // The neighbour's TRUE tangent, analytically. entryDir/exitDir above return the
+            // CHORD between the first two sampled points, which on a coarsely sampled arc sits
+            // half a sample-sweep off the real tangent -- measured 0.0873 rad (5.0 deg) on
+            // 18_stacked's 90-degree lead corner, i.e. pure sampling error, two orders of
+            // magnitude larger than the 1.14 mrad junction mismatch we are trying to square.
+            // A cap plane must come from the real tangent or it squares to nothing.
+            auto arcTangent = [](const Primitive& p, bool atEnd) {
+                gp_XYZ v = p.arc.v0;
+                if (atEnd) {
+                    gp_Trsf rot;
+                    rot.SetRotation(gp_Ax1(p.arc.c, gp_Dir(p.arc.axis)), p.arc.sweep);
+                    gp_Pnt q(p.arc.c.XYZ() + p.arc.v0);
+                    v = q.Transformed(rot).XYZ() - p.arc.c.XYZ();
+                }
+                return gp_Dir(p.arc.axis.Crossed(v));
+            };
+            auto trueDir = [&](const Primitive& p, bool atEnd) {
+                if (p.kind == Primitive::SEG) return gp_Dir(p.seg.b.XYZ() - p.seg.a.XYZ());
+                if (p.kind == Primitive::ARC3 && p.arc.v0.Modulus() > 1e-12 &&
+                    p.arc.axis.Modulus() > 1e-12)
+                    return arcTangent(p, atEnd);
+                return atEnd ? exitDir(p) : entryDir(p);
+            };
+            // A neighbour's tangent may be parametrised the opposite way round; only the cap
+            // PLANE matters, so compare in the hemisphere aligned with this SEG.
+            auto sameSense = [&](gp_Dir d) {
+                if (d.Dot(own) < 0.0) d.Reverse();
+                return d;
+            };
+            const bool traceCap = std::getenv("MVB_RECT_TRACE") != nullptr;
+            // LEAD junctions only. A wrap's straights and corners are G1 by construction, so
+            // their caps already agree; it is the LEADS that carry MKF's terminal placement --
+            // 18_stacked's entrance lead drifts 20.3 um laterally over its run to reach the
+            // wrap entry, and that tilt is what leaves its cap non-parallel to the corner's.
+            // Restricting the shear to leads keeps the change to the pieces that need it.
+            if (i > 0 && trimStart[i] == 0.0 && pr.isLead && path.prims[i - 1].isLead) {
+                const gp_Dir nb = sameSense(trueDir(path.prims[i - 1], true));
+                const double a2 = nb.Angle(own);
+                if (traceCap)
+                    std::fprintf(stderr, "[rect-cap] '%s' start neighbour angle=%.6g rad\n",
+                                 pr.label.c_str(), a2);
+                if (a2 > 1e-9 && a2 < 0.05) { capA = nb; haveCapA = true; }
+            }
+            if (i + 1 < path.prims.size() && trimEnd[i] == 0.0 && pr.isLead &&
+                path.prims[i + 1].isLead) {
+                const gp_Dir nb = sameSense(trueDir(path.prims[i + 1], false));
+                const double a2 = nb.Angle(own);
+                if (traceCap)
+                    std::fprintf(stderr, "[rect-cap] '%s' end neighbour angle=%.6g rad\n",
+                                 pr.label.c_str(), a2);
+                if (a2 > 1e-9 && a2 < 0.05) { capB = nb; haveCapB = true; }
+            }
+        }
         TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB, extA,
-                                       extB, round, radius, /*splitOverride=*/-1);
+                                       extB, round, radius, /*splitOverride=*/-1,
+                                       haveCapA ? &capA : nullptr, haveCapB ? &capB : nullptr);
         if (std::getenv("MVB_RECT_TRACE")) {
             std::fprintf(stderr, "[rect-trace]   -> solid built for '%s'\n", pr.label.c_str());
             std::fflush(stderr);
@@ -2662,7 +3001,11 @@ TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double 
             if (radius < 1e-12 || std::abs(pr.arc.sweep) < 1e-12) continue;
             gp_Pnt start(pr.arc.c.XYZ() + pr.arc.v0);
             gp_XYZ tangent = pr.arc.axis.Crossed(pr.arc.v0);
-            TopoDS_Face prof = wireProfile(start, gp_Dir(tangent), wireRadius, 0);
+            // Honour the requested faceting. Hardcoding 0 revolved an EXACT circle, so every wrap
+            // arc came out as toroidal faces -- and gmsh dispatches to its fragile periodic mesher
+            // on the underlying SURFACE, not on whether the face wraps (OCCFace.cpp:142).
+            TopoDS_Face prof = wireProfile(start, gp_Dir(tangent), wireRadius,
+                                           wirePolygonSegments);
             BRepPrimAPI_MakeRevol rev(prof, gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)),
                                       pr.arc.sweep);
             if (!rev.IsDone() || rev.Shape().IsNull()) {
@@ -2687,8 +3030,14 @@ TopoDS_Shape sweepPiecewise(const Primitive* const* prims, size_t count, double 
                             BRepPrimAPI_MakeCylinder(gp_Ax2(pr.seg.a, dir), wireRadius, len)
                                 .Shape());
             } else {
+                // CORRECTION (2026-08-25): six cylindrical panels do NOT remove the periodicity --
+                // gmsh reads it off the SURFACE, not the face (OCCFace.cpp:142), so a 60-degree
+                // panel of a cylinder is still routed to meshGeneratorPeriodic. A FACETED profile
+                // has planar sides, which are never periodic; the split stays for exact surfaces.
                 TopoDS_Face segProf = BRepBuilderAPI_MakeFace(
-                    wireProfileWireSplit(pr.seg.a, dir, wireRadius, 6)).Face();
+                    wirePolygonSegments > 0
+                        ? wireProfileWire(pr.seg.a, dir, wireRadius, wirePolygonSegments)
+                        : wireProfileWireSplit(pr.seg.a, dir, wireRadius, 6)).Face();
                 TopoDS_Shape prism = BRepPrimAPI_MakePrism(segProf, gp_Vec(dir) * len).Shape();
                 if (std::getenv("MVB_DIAG")) {
                     GProp_GProps gp_; BRepGProp::VolumeProperties(prism, gp_);
@@ -4071,18 +4420,88 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
         throw std::runtime_error("ConductorBuilder: bump region boundaries inverted for '" +
                                  label + "' (vertical fan too wide for the ride-over model)");
     }
-    // The riser at a plane crossing: straight along z, from the raised half's endpoint to the
-    // level half's endpoint (or back), length exactly `raise`.
+    // THE RISER IS TANGENT TO THE PITCHED WRAP (ABT #961, 2026-09-02). The G1 claim above holds
+    // for a LEVEL wrap: there the arc's tangent at a plane crossing is purely axial and a
+    // z-riser continues it. A PITCHED wrap arrives with (0, dy/daz, -+r): against a straight
+    // riser along z that is a kink of the pitch angle -- 3.02 deg on 06_llc, 2.86 deg on
+    // 23_interleaved_llc, 5.28 deg on the complete flyback -- and OCC cannot mitre a spiral
+    // pipe that shallow (the cut "succeeds" and removes nothing), so those three designs refused.
+    // Carrying part of the pitch in the riser instead (tried first) is the physical picture but
+    // it re-pitches the arcs, and any two wraps with different spans (the two parallels' ending
+    // wraps) then advance differently through the same azimuths: 327 nm of certified enamel
+    // overlap between parallel 0's riser and parallel 1's wrap on 23_interleaved_llc. Exactness
+    // there would need MKF to place ending stations riser-aware -- a corpus-wide change.
+    // So the wrap keeps MKF's y-profile to the bit, and the riser itself bends: a symmetric
+    // BIARC (two equal circular arcs, an S in the plane of the chord and the wrap tangent),
+    // tangent to the arriving arc at one end and to the departing arc at the other, still
+    // spanning exactly the raise in z. Its excursion from the straight riser is
+    // R(1 - cos a) ~ raise * a / 8 -- 3 um at 3 deg -- identical for every wrap of the layer at
+    // that crossing, so neighbours stay exactly one OD apart. Two exact revolves, tangent to
+    // their neighbours: nothing to mitre, nothing to bridge. A level wrap (a < 1e-6 rad) keeps
+    // the straight riser.
     auto pushRiser = [&](double az, double rAt, double yAt, bool up) {
         const gp_Pnt raised = azPointC(0, -c, rAt, yAt, az);
         const gp_Pnt level = azPointC(0, 0.0, rAt, yAt, az);
-        Primitive pr;
-        pr.kind = Primitive::SEG;
-        pr.seg = up ? Seg{raised, level} : Seg{level, raised};
-        pr.label = label + " (bump riser)";
-        pr.turnOrdinal = ordinal;
-        pr.isConnection = isConnection;
-        path.prims.push_back(std::move(pr));
+        const gp_Pnt P1 = up ? raised : level, P2 = up ? level : raised;
+        const gp_Vec chord(P1, P2);
+        const double L = chord.Magnitude();
+        // The wrap's tangent at the crossing (d/daz of the piece about its own centre), oriented
+        // along the travel: (r' cos az - r sin az, k, -r' sin az - r cos az).
+        const double k = (y1 - y0) / (azEnd - azStart);
+        const double rp = (r1 - r0) / (azEnd - azStart);
+        gp_Vec t(rp * std::cos(az) - rAt * std::sin(az), k, -rp * std::sin(az) - rAt * std::cos(az));
+        t.Normalize();
+        if (t.Dot(chord) < 0) t.Reverse();
+        const gp_Vec u = chord / L;
+        const double alpha = t.Angle(u);
+        auto pushOne = [&](const Primitive& pr) {
+            path.prims.push_back(pr);
+        };
+        if (alpha < 1e-6 || L < 1e-12) {
+            Primitive pr;
+            pr.kind = Primitive::SEG;
+            pr.seg = Seg{P1, P2};
+            pr.label = label + " (bump riser)";
+            pr.turnOrdinal = ordinal;
+            pr.isConnection = isConnection;
+            pushOne(pr);
+            return;
+        }
+        gp_Vec pDir = t - u * t.Dot(u);   // the tangent's component across the chord
+        pDir.Normalize();
+        const double R = L / (4.0 * std::sin(alpha));
+        const gp_Pnt M = P1.Translated(u * (0.5 * L));
+        const gp_Pnt C1 = P1.Translated(u * (R * std::sin(alpha)) - pDir * (R * std::cos(alpha)));
+        const gp_Pnt C2 = M.Translated(u * (R * std::sin(alpha)) + pDir * (R * std::cos(alpha)));
+        const gp_Vec tMid = u * std::cos(alpha) - pDir * std::sin(alpha);   // tangent at M
+        auto arc = [&](const gp_Pnt& centre, const gp_Pnt& from, const gp_Vec& tangent,
+                       const gp_Pnt& to, const char* what) {
+            Primitive pr;
+            pr.kind = Primitive::ARC3;
+            pr.arc.c = centre;
+            gp_Vec v0(centre, from);
+            pr.arc.v0 = v0.XYZ();
+            gp_Vec ax = v0.Crossed(tangent);
+            ax.Normalize();
+            pr.arc.axis = ax.XYZ();
+            pr.arc.sweep = 2.0 * alpha;
+            // Self-check, not a fallback: the arc must land on `to` to the bit.
+            const gp_Pnt landed = from.Rotated(gp_Ax1(centre, gp_Dir(ax)), 2.0 * alpha);
+            if (landed.Distance(to) > 1e-9 * std::max(L, 1e-9)) {
+                std::ostringstream m;
+                m.precision(12);
+                m << "ConductorBuilder: bump riser biarc of '" << label << "' " << what
+                  << " misses its landing by " << landed.Distance(to) * 1e6 << " um (alpha "
+                  << alpha * 180.0 / kPi << " deg, R " << R * 1e3 << " mm).";
+                throw std::runtime_error(m.str());
+            }
+            pr.label = label + std::string(" (bump riser ") + what + ")";
+            pr.turnOrdinal = ordinal;
+            pr.isConnection = isConnection;
+            pushOne(pr);
+        };
+        arc(C1, P1, t, M, "arc 1");
+        arc(C2, M, tMid, P2, "arc 2");
     };
     pushPiece(azStart, aHead, radiusAt(azStart), radiusAt(aHead), heightAt(azStart),
               heightAt(aHead), false, " (over dragback)", -c);
@@ -4452,6 +4871,16 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
         // ABT #839: THE OSCULATING ARC -- the unique tangent circle that clears its sibling
         // exactly (see roundWrapStub). Same inputs the wrap itself was drawn from, so the
         // terminal-lead emitter can ask the same function where this arc ends.
+        // THE STUB IS THE HELIX ITSELF (2026-09-02, ABT #961 / #839 follow-up). The osculating
+        // circle below was the price of mitring the stub against the lead; the corner is now a
+        // tangent biarc fillet (TerminalFillet), so the stub can be the exact SPIRAL and every
+        // sibling relation is exactly MKF's. MVB_OSCULATING_STUB=1 restores the circle (bisect).
+        if (!std::getenv("MVB_OSCULATING_STUB")) {
+            stub.kind = Primitive::SPIRAL;
+            stub.spiral = {0.0, -raise, r0s, y0s, az0, r1s, y1s, az1, false};
+            path.prims.push_back(std::move(stub));
+            return;
+        }
         {
             const RoundStub osc = roundWrapStub(s, n, wireRadius, azS, azE, endYOverride,
                                                 terminalAtStart,
@@ -5071,7 +5500,7 @@ struct RectStation {
     double y = 0, zPos = 0, xPos = 0, cornerR = 0, segX = 0, segZ = 0;
 };
 RectStation rectStation(const PlanePt& p, double halfW, double halfD, double minBend,
-                        const std::string& who) {
+                        double formerCornerRadius, const std::string& who) {
     double clearance = p.x - halfW;
     if (std::getenv("MVB_RECT_DIAG")) {
         std::fprintf(stderr, "[rectStation] %s p.x=%.6f halfW=%.6f halfD=%.6f minBend=%.6f clearance=%.6f\n",
@@ -5083,19 +5512,27 @@ RectStation rectStation(const PlanePt& p, double halfW, double halfD, double min
             " m lies inside the column (half-width " + std::to_string(halfW) +
             " m) for " + who + " — inconsistent MAS turn/bobbin data");
     }
-    double cornerR = clearance;
-    double inset = 0.0;
+    // THE WIRE BENDS AROUND THE FORMER'S CORNER, not around a mathematical point (MKF WireBend,
+    // ABT #959). MKF places the turn `clearance` from the column FACE, and the corner it turns
+    // through is the former's own corner radius plus that clearance -- which is also the only
+    // radius at which the turn stays exactly `clearance` from the former's surface the whole way
+    // round. The faces do not move (xPos/zPos below are untouched); the arc CENTRES move inward
+    // by the corner radius, which is what `inset` has always meant here. formerCornerRadius = 0
+    // reproduces the old sharp-column behaviour exactly.
+    double cornerR = clearance + formerCornerRadius;
     if (cornerR < minBend) {
-        inset = minBend - clearance;
         cornerR = minBend;
-        if (inset > std::min(halfW, halfD)) {
-            throw std::runtime_error(
-                "ConductorBuilder: minimum bend radius " + std::to_string(minBend) +
-                " m cannot be accommodated (clearance " + std::to_string(clearance) +
-                " m, column half-dims " + std::to_string(halfW) + "/" +
-                std::to_string(halfD) + " m) for " + who +
-                " — adjacent corner arcs would cross");
     }
+    double inset = cornerR - clearance;
+    if (inset > std::min(halfW, halfD)) {
+        throw std::runtime_error(
+            "ConductorBuilder: corner radius " + std::to_string(cornerR) +
+            " m cannot be accommodated (clearance " + std::to_string(clearance) +
+            " m, former corner " + std::to_string(formerCornerRadius) +
+            " m, minimum bend " + std::to_string(minBend) +
+            " m, column half-dims " + std::to_string(halfW) + "/" +
+            std::to_string(halfD) + " m) for " + who +
+            " — adjacent corner arcs would cross");
     }
     return {p.y, halfD + clearance, halfW + clearance, cornerR, halfW - inset,
             halfD - inset};
@@ -5492,6 +5929,461 @@ struct ToroCross {
     bool hasOuter = true;
 };
 
+// ---------------------------------------------------------------------------------------------
+// THE TOROID FACE SPIRAL WITH A PRESCRIBED CORNER HEADING (ABT #961, 2026-09-02).
+// ABT #685 made the face crossing a spiral (radius linear in azimuth) between the inner corner's
+// take-off point and the rim corner's. A spiral through two given points has NO free tangent: the
+// heading of the corner at each end has to be the spiral's own tangent there (the natural fixed
+// point), otherwise the corner arc and the chord meet at a KINK. The corner solve (the
+// lead-clearance twist wave, ABT #865) deliberately retilts inner corners away from that fixed
+// point -- 0.913 deg on the two lead-side corners of 05_pfc and 12_boost, 0.15..2 deg through 39
+// corners of the current transformer -- and every retilted corner kinked: the assembler bridged
+// the kink (growing the chord r*tan(delta) = 6.4 um into the corner), the weld was refused as
+// self-intersecting, and the growth shipped as a copper self-overlap (0.0032 mm3 on 05_pfc).
+// The spiral's missing degree of freedom is its CENTRE. A spiral about a centre shifted off the
+// toroid axis still passes through both points and still advances its radius linearly with
+// azimuth, but its end tangents rotate with the shift, so a prescribed corner heading is met
+// EXACTLY (Newton on the shift perpendicular to the chord). ABT #685's property -- rotated copies
+// of neighbouring chords stay equidistant -- holds to the order of that shift, and the certified
+// verifier, which builds its footprint through this same solver, remains the authority on the
+// coated envelopes. No convergence, no answer: the solver throws.
+struct ToroFaceSpiral {
+    gp_XY centre{0.0, 0.0};   // spiral axis in the face plane; (0,0) is the natural chord
+    gp_XY near{0.0, 0.0};     // chord end at the inner corner: station +/- nearHeading * bend
+    gp_XY far{0.0, 0.0};      // chord end at the rim corner: pout -/+ farHeading * bend
+    gp_XY nearHeading{1.0, 0.0};   // inner corner heading == the spiral's tangent at `near`
+    gp_XY farHeading{1.0, 0.0};    // rim corner heading == the spiral's tangent at `far`
+};
+
+// Unit tangent (travel direction) at one end of the spiral about `centre` through from -> to.
+gp_XY toroSpiralTangentAbout(const gp_XY& centre, const gp_XY& from, const gp_XY& to,
+                             bool atStart) {
+    const gp_XY f = from - centre, t = to - centre;
+    const double r0 = f.Modulus(), r1 = t.Modulus();
+    const double az0 = std::atan2(-f.Y(), f.X());
+    const double az1 = az0 + std::remainder(std::atan2(-t.Y(), t.X()) - az0, kTwoPi);
+    const double span = az1 - az0;
+    if (std::abs(span) < 1e-12) {
+        gp_XY radial = to - from;
+        if (radial.Modulus() > 1e-12) radial.Normalize();
+        return radial;
+    }
+    const double k = (r1 - r0) / span;             // dr/daz
+    const double az = atStart ? az0 : az1;
+    const double r = atStart ? r0 : r1;
+    gp_XY tg(k * std::cos(az) - r * std::sin(az), -k * std::sin(az) - r * std::cos(az));
+    if (tg.Modulus() > 1e-12) tg.Normalize();
+    if (span < 0) tg = gp_XY(-tg.X(), -tg.Y());   // travelling the other way round
+    return tg;
+}
+
+// `heading`: the inner corner's heading, prescribed by the corner solve, or absent for the
+// natural fixed point. `top`: the chord runs inner -> rim (top face); otherwise rim -> inner
+// (bottom face). Headings are travel directions at the corner's take-off point. `farHeadingFixed`
+// imposes the rim corner's heading (ABT #865's poloidal rule) instead of letting it follow the
+// spiral; the rim end then keeps whatever kink that rule implies -- only the inner end is solved.
+// The try-variant answers "does a face spiral meet this heading?" -- nullopt (with `why`) when
+// Newton does not converge or the shift would leave the ABT #685 family. The corner solve's
+// candidate search treats that as an INFEASIBLE heading (slack -inf), exactly like a heading
+// that fails the lead verticals; the emission uses the throwing variant below.
+std::optional<ToroFaceSpiral> trySolveToroFaceSpiral(const gp_XY& station,
+                                                     const std::optional<gp_XY>& heading,
+                                                     const gp_XY& pout, double bend, bool top,
+                                                     const std::optional<gp_XY>& farHeadingFixed,
+                                                     const std::string& who, std::string* why,
+                                                     // the rim end pinned to a POINT (the start of
+                                                     // a bend arc) instead of pout -/+ heading*bend;
+                                                     // the far tangent is then free.
+                                                     const std::optional<gp_XY>& farPointFixed = std::nullopt) {
+    gp_XY natural = top ? pout - station : station - pout;   // the chord's travel direction
+    if (natural.Modulus() < 1e-12) {
+        throw std::runtime_error("ConductorBuilder: the toroid face spiral of " + who +
+                                 " has coincident inner and rim stations");
+    }
+    natural.Normalize();
+    auto angleBetween = [](const gp_XY& a, const gp_XY& b) {
+        return std::atan2(a.Crossed(b), a.Dot(b));
+    };
+    auto ends = [&](const gp_XY& hNear, const gp_XY& hFar) {
+        const gp_XY near = top ? station + hNear * bend : station - hNear * bend;
+        const gp_XY far = farPointFixed ? *farPointFixed
+                                        : (top ? pout - hFar * bend : pout + hFar * bend);
+        return std::make_pair(near, far);
+    };
+    gp_XY h = heading.value_or(natural);
+    gp_XY hFar = farHeadingFixed.value_or(natural);
+    gp_XY centre(0.0, 0.0);
+    double prevShift = std::numeric_limits<double>::max();
+    for (int pass = 0; pass < 200; ++pass) {
+        const auto [near, far] = ends(h, hFar);
+        const gp_XY from = top ? near : far, to = top ? far : near;
+        if (heading || farHeadingFixed) {
+            // The centre that gives the spiral the prescribed tangent(s). One prescribed end is
+            // one equation in the centre's two coordinates: a whole curve of centres qualifies,
+            // and the one nearest the toroid axis is the least departure from the natural chord.
+            // A single line of centres is NOT enough -- along one line the rotation the tangent
+            // can take saturates within a few degrees (the spiral degenerates towards the
+            // straight chord as the centre recedes), while the lead corners of complete_buck ask
+            // for 18..61 deg. So: scan rays from the axis, bracket the signed residual along
+            // each, bisect, keep the nearest admissible solution. Both ends prescribed (the
+            // inner corner retilted AND ABT #865's poloidal rim corner) is two equations in two
+            // unknowns: Newton from the one-end solution. Admissible = nowhere tighter than the
+            // wire's bend radius (a chord that bends tighter than the corner it joins is not a
+            // wire path), and both radii clear of zero.
+            const double L = (to - from).Modulus();
+            auto residualNear = [&](const gp_XY& c) {
+                return heading ? angleBetween(toroSpiralTangentAbout(c, from, to, /*atStart=*/top), *heading) : 0.0;
+            };
+            auto residualFar = [&](const gp_XY& c) {
+                return farHeadingFixed
+                           ? angleBetween(toroSpiralTangentAbout(c, from, to, /*atStart=*/!top), *farHeadingFixed)
+                           : 0.0;
+            };
+            // The one-constraint residual: whichever end is prescribed (near wins when both are;
+            // the far end is then met by Newton below).
+            auto residualAt = [&](const gp_XY& c) { return heading ? residualNear(c) : residualFar(c); };
+            auto admissible = [&](const gp_XY& c) {
+                const gp_XY f = from - c, t = to - c;
+                const double r0 = f.Modulus(), r1 = t.Modulus();
+                if (r0 < 0.05 * L || r1 < 0.05 * L) return false;
+                const double az0 = std::atan2(-f.Y(), f.X());
+                const double az1 = az0 + std::remainder(std::atan2(-t.Y(), t.X()) - az0, kTwoPi);
+                const double span = az1 - az0;
+                if (std::abs(span) < 1e-12) return true;   // a radial run: straight
+                const double k = (r1 - r0) / span;         // dr/daz, r'' = 0
+                for (int q = 0; q <= 64; ++q) {
+                    const double r = r0 + (r1 - r0) * q / 64.0;
+                    const double num = r * r + 2.0 * k * k;
+                    const double den = std::pow(r * r + k * k, 1.5);
+                    if (num > den / bend) return false;    // curvature > 1/bend
+                }
+                return true;
+            };
+            auto refuse = [&](const char* detail) {
+                std::ostringstream m;
+                m.precision(12);
+                m << "ConductorBuilder: the toroid face spiral of " << who
+                  << " cannot meet its prescribed corner heading(s) at (" << station.X() << ", "
+                  << station.Y() << "): " << detail << " (natural residuals near "
+                  << residualNear(gp_XY(0.0, 0.0)) * 180.0 / kPi << " deg, far "
+                  << residualFar(gp_XY(0.0, 0.0)) * 180.0 / kPi << " deg).";
+                if (why) *why = m.str();
+            };
+            const double rhoMax = 2.0 * std::max(from.Modulus(), to.Modulus());
+            // Root of a residual along the ray `dir` (rho >= 0): geometric march until the sign
+            // flips (a jump across +-pi is the branch cut, not a root), then bisection.
+            auto rootAlongRay = [&](const gp_XY& dir, const std::function<double(const gp_XY&)>& res,
+                                    double rhoStop) -> std::optional<double> {
+                double lo = 0.0, glo = res(gp_XY(0.0, 0.0));
+                if (std::abs(glo) < 1e-14) return 0.0;
+                for (double rho = 1e-3 * L; rho <= std::min(rhoMax, rhoStop); rho *= 1.15) {
+                    const gp_XY c(dir.X() * rho, dir.Y() * rho);
+                    const double g = res(c);
+                    if ((g < 0) != (glo < 0) && std::abs(g - glo) < kPi) {
+                        double hi = rho, ghi = g;
+                        for (int it = 0; it < 200 && hi - lo > 1e-16 * rhoMax; ++it) {
+                            const double mid = 0.5 * (lo + hi);
+                            const double gm = res(gp_XY(dir.X() * mid, dir.Y() * mid));
+                            if ((gm < 0) == (glo < 0)) { lo = mid; glo = gm; }
+                            else { hi = mid; ghi = gm; }
+                        }
+                        const double r = 0.5 * (lo + hi);
+                        if (std::abs(res(gp_XY(dir.X() * r, dir.Y() * r))) < 1e-13) return r;
+                        return std::nullopt;
+                    }
+                    lo = rho;
+                    glo = g;
+                }
+                return std::nullopt;
+            };
+            const int nRays = 72;
+            auto rayDir = [&](double phi) { return gp_XY(std::cos(phi), std::sin(phi)); };
+            gp_XY best(0.0, 0.0);
+            bool found = false;
+            std::ostringstream bothDiag;
+            if (!(heading && farHeadingFixed)) {
+                // One prescribed end: the nearest admissible centre over all rays.
+                double bestRho = std::numeric_limits<double>::max();
+                if (std::abs(residualAt(gp_XY(0.0, 0.0))) < 1e-14) {
+                    found = true;
+                }
+                else {
+                    for (int ray = 0; ray < nRays; ++ray) {
+                        const gp_XY dir = rayDir(kTwoPi * ray / nRays);
+                        const auto rho = rootAlongRay(dir, residualAt, bestRho);
+                        if (!rho) continue;
+                        const gp_XY c(dir.X() * *rho, dir.Y() * *rho);
+                        if (admissible(c) && *rho < bestRho) { best = c; bestRho = *rho; found = true; }
+                    }
+                }
+            }
+            else {
+                // Both ends: the centres meeting the NEAR tangent form a curve, parametrised by
+                // the ray angle phi (one root per ray where it exists). Walk it, and root-find
+                // the FAR residual along it; the nearest admissible crossing wins.
+                if (std::abs(residualNear(gp_XY(0.0, 0.0))) < 1e-14 &&
+                    std::abs(residualFar(gp_XY(0.0, 0.0))) < 1e-14) {
+                    found = true;
+                }
+                else {
+                    auto centreAt = [&](double phi) -> std::optional<gp_XY> {
+                        const gp_XY dir = rayDir(phi);
+                        const auto rho = rootAlongRay(dir, residualNear, rhoMax);
+                        if (!rho) return std::nullopt;
+                        return gp_XY(dir.X() * *rho, dir.Y() * *rho);
+                    };
+                    double bestRho = std::numeric_limits<double>::max();
+                    std::optional<double> prevPhi, prevG;
+                    const int nFine = 4 * nRays;
+                    double closestFar = std::numeric_limits<double>::max();
+                    int onCurve = 0, inadmissibleRoots = 0;
+                    for (int k = 0; k <= nFine; ++k) {
+                        const double phi = kTwoPi * k / nFine;
+                        const auto c = centreAt(phi);
+                        if (!c) { prevPhi.reset(); prevG.reset(); continue; }
+                        const double g = residualFar(*c);
+                        ++onCurve;
+                        closestFar = std::min(closestFar, std::abs(g));
+                        if (std::abs(g) < 1e-13) {
+                            if (admissible(*c) && c->Modulus() < bestRho) { best = *c; bestRho = c->Modulus(); found = true; }
+                            else if (!admissible(*c)) ++inadmissibleRoots;
+                        }
+                        else if (prevPhi && prevG && ((g < 0) != (*prevG < 0)) && std::abs(g - *prevG) < kPi) {
+                            double lo = *prevPhi, hi = phi, glo = *prevG;
+                            std::optional<gp_XY> cRoot;
+                            for (int it = 0; it < 200 && hi - lo > 1e-15; ++it) {
+                                const double mid = 0.5 * (lo + hi);
+                                const auto cm = centreAt(mid);
+                                if (!cm) break;   // the near-curve ended inside the bracket
+                                const double gm = residualFar(*cm);
+                                if ((gm < 0) == (glo < 0)) { lo = mid; glo = gm; }
+                                else { hi = mid; }
+                                cRoot = cm;
+                            }
+                            if (cRoot && std::abs(residualNear(*cRoot)) < 1e-13 &&
+                                std::abs(residualFar(*cRoot)) < 1e-13) {
+                                if (admissible(*cRoot)) {
+                                    if (cRoot->Modulus() < bestRho) {
+                                        best = *cRoot;
+                                        bestRho = cRoot->Modulus();
+                                        found = true;
+                                    }
+                                }
+                                else {
+                                    ++inadmissibleRoots;
+                                }
+                            }
+                        }
+                        prevPhi = phi;
+                        prevG = g;
+                    }
+                    bothDiag << onCurve << " of " << (nFine + 1) << " rays carry a near-tangent centre, "
+                             << "closest far residual " << closestFar * 180.0 / kPi << " deg, "
+                             << inadmissibleRoots << " root(s) rejected for curvature > 1/bend";
+                }
+            }
+            if (!found) {
+                if (heading && farHeadingFixed) {
+                    std::ostringstream d;
+                    d.precision(6);
+                    d << "no spiral centre meets both headings: " << bothDiag.str();
+                    refuse(d.str().c_str());
+                }
+                else {
+                    refuse("no spiral centre within reach gives that tangent without bending "
+                           "tighter than the wire's bend radius");
+                }
+                return std::nullopt;
+            }
+            centre = best;
+        }
+        const gp_XY c = centre;
+        const gp_XY tNear = toroSpiralTangentAbout(c, from, to, top);
+        const gp_XY tFar = toroSpiralTangentAbout(c, from, to, !top);
+        const gp_XY hNew = heading ? *heading : tNear;
+        const gp_XY hFarNew = farHeadingFixed ? *farHeadingFixed : tFar;
+        const double shift = (hNew - h).Modulus() + (hFarNew - hFar).Modulus();
+        h = hNew;
+        hFar = hFarNew;
+        // Converged, or stalled at floating-point noise: both headings are then the spiral's own
+        // tangents to the last bit that can be represented.
+        if (shift < 1e-14 || (shift < 1e-10 && shift >= prevShift)) {
+            const auto [nearF, farF] = ends(h, hFar);
+            ToroFaceSpiral sp;
+            sp.centre = c;
+            sp.near = nearF;
+            sp.far = farF;
+            sp.nearHeading = h;
+            sp.farHeading = hFar;
+            return sp;
+        }
+        prevShift = shift;
+    }
+    if (why)
+        *why = "ConductorBuilder: the toroid face spiral of " + who +
+               " did not converge on its corner headings (200 passes).";
+    return std::nullopt;
+}
+
+// THE POLOIDAL RIM CORNER TAKES A BEND, NOT A MITRE (ABT #961, 2026-09-02). ABT #865 makes a
+// rim corner POLOIDAL (radial) when its natural tangent corner would enter a neighbour's coated
+// envelope, and took the chord's direction change there "as a small bisection mitre". The
+// spiral family cannot arrive radially after leaving the inner corner at its (retilted)
+// heading -- on the current transformer the closest the two tangents get is 17 deg -- and the
+// mitre cut on a spiral pipe is the one OCC operation that lies (it removed the grown stub back
+// to a perpendicular cap, leaving a wedge of the chord inside the corner: eight real self-
+// overlaps, proven by point sampling). A wire turning 14 deg does what a wire does: it BENDS,
+// at its bend radius. So the chord is spiral + a planar arc of radius `bend` in the face
+// plane, the arc ending (top) or starting (bottom) at the rim corner's take-off point with the
+// poloidal heading; its turning angle is solved so the spiral's tangent at the arc matches.
+// Every joint is then tangent: nothing to mitre, nothing to bridge.
+struct ToroChordBend {
+    ToroFaceSpiral spiral;   // inner corner <-> arc joint
+    gp_XY joint{0.0, 0.0};   // where the spiral meets the arc
+    gp_XY centre{0.0, 0.0};  // the arc's centre, in the face plane
+    double turn = 0.0;       // signed turning angle of the arc (CCW positive in the face plane)
+    gp_XY rim{0.0, 0.0};     // the rim corner's take-off point
+};
+
+std::optional<ToroChordBend> trySolveToroChordBend(const gp_XY& station,
+                                                   const std::optional<gp_XY>& heading,
+                                                   const gp_XY& pout, const gp_XY& rimHeading,
+                                                   double bend, bool top, const std::string& who,
+                                                   std::string* why,
+                                                   // The arc's radius is free ABOVE the bend
+                                                   // radius. A 0.85 deg turn at the bend radius
+                                                   // is a 4 um sliver of copper (measured, current
+                                                   // transformer); the radius is raised so the arc
+                                                   // is at least this long, capped to a quarter of
+                                                   // the chord.
+                                                   double minArcLength = 0.0) {
+    auto rot = [](const gp_XY& v, double a) {
+        return gp_XY(v.X() * std::cos(a) - v.Y() * std::sin(a), v.X() * std::sin(a) + v.Y() * std::cos(a));
+    };
+    auto angleBetween = [](const gp_XY& a, const gp_XY& b) { return std::atan2(a.Crossed(b), a.Dot(b)); };
+    const gp_XY rim = top ? pout - rimHeading * bend : pout + rimHeading * bend;
+    double arcRadius = bend;
+    // The arc's geometry for a turning angle `turn`. Top: the chord ARRIVES at `rim` travelling
+    // along rimHeading, so the arc ends there; walking backwards along the arc by `turn` gives
+    // the joint and the tangent the spiral must have there. Bottom: the chord DEPARTS `rim`
+    // along rimHeading, so the arc starts there and the joint is `turn` ahead.
+    struct Arc { gp_XY joint, centre, tJoint; };
+    auto arcFor = [&](double turn) -> Arc {
+        const gp_XY left(-rimHeading.Y(), rimHeading.X());
+        const double side = turn >= 0 ? 1.0 : -1.0;          // CCW turn: centre on the left
+        const gp_XY centre = rim + left * (arcRadius * side);
+        const gp_XY rRim = rim - centre;
+        if (top) {   // arc ends at rim: joint is `turn` BEFORE it along the arc
+            return {centre + rot(rRim, -turn), centre, rot(rimHeading, -turn)};
+        }
+        return {centre + rot(rRim, turn), centre, rot(rimHeading, turn)};
+    };
+    // Residual: the spiral's tangent at the joint against the arc's tangent there.
+    auto residual = [&](double turn, std::optional<ToroFaceSpiral>* spOut) -> std::optional<double> {
+        const Arc a = arcFor(turn);
+        auto sp = trySolveToroFaceSpiral(station, heading, pout, bend, top, std::nullopt, who, nullptr, a.joint);
+        if (!sp) return std::nullopt;
+        if (spOut) *spOut = sp;
+        return angleBetween(sp->farHeading, a.tJoint);
+    };
+    // Scan the turning angle for a sign change of the residual, then bisect.
+    auto solveTurn = [&]() -> std::optional<ToroChordBend> {
+    const double lo0 = -80.0 * kPi / 180.0, hi0 = 80.0 * kPi / 180.0;
+    const int n = 160;
+    std::optional<double> prevT, prevG;
+    for (int k = 0; k <= n; ++k) {
+        const double t = lo0 + (hi0 - lo0) * k / n;
+        const auto g = residual(t, nullptr);
+        if (!g) { prevT.reset(); prevG.reset(); continue; }
+        if (std::abs(*g) < 1e-13 || (prevT && prevG && ((*g < 0) != (*prevG < 0)) && std::abs(*g - *prevG) < kPi)) {
+            double lo = prevT ? *prevT : t, hi = t, glo = prevG ? *prevG : *g;
+            if (std::abs(*g) >= 1e-13) {
+                for (int it = 0; it < 200 && hi - lo > 1e-15; ++it) {
+                    const double mid = 0.5 * (lo + hi);
+                    const auto gm = residual(mid, nullptr);
+                    if (!gm) break;
+                    if ((*gm < 0) == (glo < 0)) { lo = mid; glo = *gm; }
+                    else { hi = mid; }
+                }
+            }
+            const double turn = std::abs(*g) < 1e-13 ? t : 0.5 * (lo + hi);
+            std::optional<ToroFaceSpiral> sp;
+            const auto gFinal = residual(turn, &sp);
+            if (gFinal && sp && std::abs(*gFinal) < 1e-12) {
+                ToroChordBend out;
+                out.spiral = *sp;
+                const Arc a = arcFor(turn);
+                out.joint = a.joint;
+                out.centre = a.centre;
+                out.turn = turn;
+                out.rim = rim;
+                return out;
+            }
+        }
+        prevT = t;
+        prevG = *g;
+    }
+    return std::nullopt;
+    };
+    std::optional<ToroChordBend> result = solveTurn();
+    // Raise the radius until the arc is long enough (the turning angle barely moves with the
+    // radius when the arc is short against the chord, so a few rounds settle it).
+    for (int round = 0; result && round < 6; ++round) {
+        const double len = std::abs(result->turn) * arcRadius;
+        if (std::abs(result->turn) < 1e-12 || len >= minArcLength) break;
+        const double chord = (rim - result->spiral.near).Modulus();
+        const double wanted = minArcLength / std::abs(result->turn);
+        const double cap = 0.25 * chord / std::tan(0.5 * std::abs(result->turn));
+        const double next = std::max(bend, std::min(wanted, cap));
+        if (next <= arcRadius * (1.0 + 1e-9)) break;
+        arcRadius = next;
+        auto again = solveTurn();
+        if (!again) break;   // keep the last solvable radius
+        result = again;
+    }
+    if (result) return result;
+    if (why) {
+        std::ostringstream m;
+        m.precision(12);
+        m << "ConductorBuilder: the toroid chord of " << who << " at (" << station.X() << ", "
+          << station.Y() << ") cannot bend into the poloidal rim heading (" << rimHeading.X()
+          << ", " << rimHeading.Y() << ") with a bend of " << bend * 1e3
+          << " mm: no turning angle within +-80 deg makes the spiral tangent to the arc.";
+        *why = m.str();
+    }
+    return std::nullopt;
+}
+
+ToroChordBend solveToroChordBend(const gp_XY& station, const std::optional<gp_XY>& heading,
+                                 const gp_XY& pout, const gp_XY& rimHeading, double bend, bool top,
+                                 const std::string& who, double minArcLength) {
+    std::string why;
+    auto r = trySolveToroChordBend(station, heading, pout, rimHeading, bend, top, who, &why,
+                                   minArcLength);
+    if (!r) throw std::runtime_error(why);
+    return *r;
+}
+
+// MVB_TORO_SOLVE_DIAG=1: print every refused chord (the certifier's candidate search probes
+// headings far from the natural one; seeing which ones have no chord, and why, is the only way
+// to tell a too-strict solver from a genuinely unreachable heading).
+struct ToroSolveDiag {
+    static void refused(const std::string& why) {
+        static const bool on = std::getenv("MVB_TORO_SOLVE_DIAG") != nullptr;
+        if (on) std::cerr << "[toro-solve] REFUSED: " << why << "\n";
+    }
+};
+
+ToroFaceSpiral solveToroFaceSpiral(const gp_XY& station, const std::optional<gp_XY>& heading,
+                                   const gp_XY& pout, double bend, bool top,
+                                   const std::optional<gp_XY>& farHeadingFixed,
+                                   const std::string& who) {
+    std::string why;
+    auto sp = trySolveToroFaceSpiral(station, heading, pout, bend, top, farHeadingFixed, who, &why);
+    if (!sp) throw std::runtime_error(why);
+    return *sp;
+}
+
 // Bottom-half BASE running depth of the wrap between two crossings — the clearance under
 // the core face shared by all rings. Ring-to-ring separation is added on top as an
 // explicit stagger (see appendToroWrap RING STAGGER); the per-ring tube length already
@@ -5503,7 +6395,7 @@ double toroWrapDepth(const ToroCross& c0, const ToroCross& c1, double /*bend*/) 
 
 void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c1,
                     double bend, double bottomExtraDepth, const std::string& label,
-                    size_t ordinal,
+                    size_t ordinal, bool mitreCorners,
                     // Corner headings resolved by the caller's global solve (common retilt +
                     // lead relaxation, certified against the coated envelopes). NaN only in the
                     // degenerate no-solve case; the certified verifier remains the authority.
@@ -5543,6 +6435,28 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     };
     const gp_XYZ yHat(0, 1, 0);
     const double b = bend;
+    // A planar arc in a face plane: centre, start point, travel tangent (2D, in the face frame)
+    // at the start, and its sweep; the axis follows from the tangent so the arc runs the right
+    // way. Self-checked: the arc must be tangent to `tStart2` to the bit.
+    auto pushPlanarArc = [&](const gp_Pnt& centre, const gp_Pnt& start, const gp_XY& tStart2,
+                             double sweep, const char* what) {
+        Primitive pr;
+        pr.kind = Primitive::ARC3;
+        pr.arc.c = centre;
+        const gp_Vec v0(centre, start);
+        const gp_Vec t(tStart2.X(), 0.0, tStart2.Y());
+        gp_Vec ax = v0.Crossed(t);
+        if (ax.Magnitude() < 1e-18) {
+            throw std::runtime_error("ConductorBuilder: degenerate planar arc '" + label + " " + what + "'");
+        }
+        ax.Normalize();
+        pr.arc.v0 = v0.XYZ();
+        pr.arc.axis = ax.XYZ();
+        pr.arc.sweep = sweep;
+        pr.label = label + std::string(" ") + what;
+        pr.turnOrdinal = ordinal;
+        path.prims.push_back(std::move(pr));
+    };
 
     // THE FACE CROSSING IS A SPIRAL, NOT A CHORD. ABT #685 (Alf, 2026-08-19). A straight chord
     // from an inner station to an outer crossing is, for the NEXT station, a ROTATED copy of
@@ -5553,36 +6467,22 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     // azimuth does not have that defect -- rotating it by an angle shifts it radially by a
     // constant, so neighbouring crossings stay the same distance apart the whole way across the
     // face, which is how the wires actually lie on a hand-wound toroid.
-    auto faceSpiral = [&](const gp_XY& from, const gp_XY& to, double y, const char* what) {
-        const double r0 = from.Modulus(), r1 = to.Modulus();
-        const double az0 = std::atan2(-from.Y(), from.X());
-        const double az1 = az0 + std::remainder(std::atan2(-to.Y(), to.X()) - az0, kTwoPi);
+    // `centre`: the spiral's axis in the face plane -- (0,0) for the natural chord, shifted by
+    // solveToroFaceSpiral when the corner heading is prescribed (ABT #961).
+    auto faceSpiral = [&](const gp_XY& from, const gp_XY& to, double y, const char* what,
+                          const gp_XY& centre = gp_XY(0.0, 0.0)) {
+        const gp_XY f = from - centre, t = to - centre;
+        const double r0 = f.Modulus(), r1 = t.Modulus();
+        const double az0 = std::atan2(-f.Y(), f.X());
+        const double az1 = az0 + std::remainder(std::atan2(-t.Y(), t.X()) - az0, kTwoPi);
         Primitive pr;
         pr.kind = Primitive::SPIRAL;
-        pr.spiral = {0.0, 0.0, r0, y, az0, r1, y, az1, false};
+        pr.spiral = {centre.X(), centre.Y(), r0, y, az0, r1, y, az1, false};
         pr.label = label + std::string(" ") + what;
         pr.turnOrdinal = ordinal;
         path.prims.push_back(std::move(pr));
     };
     // Its tangent, so the corners at either end stay tangent to it.
-    auto faceSpiralTangent = [&](const gp_XY& from, const gp_XY& to, bool atStart) {
-        const double r0 = from.Modulus(), r1 = to.Modulus();
-        const double az0 = std::atan2(-from.Y(), from.X());
-        const double az1 = az0 + std::remainder(std::atan2(-to.Y(), to.X()) - az0, kTwoPi);
-        const double span = az1 - az0;
-        if (std::abs(span) < 1e-12) {
-            gp_XY radial = to - from;
-            if (radial.Modulus() > 1e-12) radial.Normalize();
-            return radial;
-        }
-        const double k = (r1 - r0) / span;             // dr/daz
-        const double az = atStart ? az0 : az1;
-        const double r = atStart ? r0 : r1;
-        gp_XY t(k * std::cos(az) - r * std::sin(az), -k * std::sin(az) - r * std::cos(az));
-        if (t.Modulus() > 1e-12) t.Normalize();
-        if (span < 0) t = gp_XY(-t.X(), -t.Y());       // travelling the other way round
-        return t;
-    };
 
 
 
@@ -5598,38 +6498,45 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     gp_XYZ d3(dH.X(), 0, dH.Y());
     double t0 = c0.tube, rh0 = t0 + b;
 
+    // MITRE CORNERS (Alf, 2026-08-27: "would it fix it having the option to use round or mitre
+    // corner?"). The round fillet corners are TANGENT constructions -- the arc and its tube meet
+    // on osculating surfaces, the grazing-contact class OCC's booleans and gmsh's fragment
+    // handle worst. With mitre corners the turn is FIVE straight runs meeting at sharp 90-degree
+    // corner points; the conformal assembler slices each junction on its 45-degree bisector
+    // plane -- transversal, the robust class -- and at segments > 0 every piece is built as an
+    // EXACT mitred polygon prism (mitredFacetPrism), so the whole turn is boolean-free exact
+    // polyhedra. Endpoints of the turn are unchanged; the chords run straight corner-to-corner
+    // (the round mode's face spirals deviate from that line by micrometres over their ~2 deg of
+    // azimuth). Corner CLEARANCE stays the certified enamel gate's job, as for round corners.
+    if (mitreCorners) {
+        const double tbM = toroWrapDepth(c0, c1, b) + bottomExtraDepth;
+        const double rhbM = tbM + b;
+        pushSeg(P(c0.pin, 0), P(c0.pin, rh0), "inner tube up");
+        pushSeg(P(c0.pin, rh0), P(c0.pout, rh0), "top chord");
+        pushSeg(P(c0.pout, rh0), P(c0.pout, -rhbM), "outer tube down");
+        pushSeg(P(c0.pout, -rhbM), P(c1.pin, -rhbM), "bottom chord");
+        pushSeg(P(c1.pin, -rhbM), P(c1.pin, 0), "inner tube up to crossing");
+        return;
+    }
+
     pushSeg(P(c0.pin, 0), P(c0.pin, t0), "inner tube up");
     // Case 1 leaves dTop == dH and the knee collapses onto the chord's far end, reproducing the
     // old two-piece half exactly; case 2 clamps the corner and bends at the knee instead.
     // Solve the spiral and its two tangents together: each corner is a bend radius along the
     // tangent it meets, and the tangent depends on where the corner put the spiral's end.
-    gp_XY dTop = dH, dTopEnd = dH;
-    for (int pass = 0; pass < 8; ++pass) {
-        const gp_XY start = c0.pin + dTop * b;
-        const gp_XY finish = c0.pout - dTopEnd * b;
-        const gp_XY tStart = faceSpiralTangent(start, finish, true);
-        const gp_XY tEnd = faceSpiralTangent(start, finish, false);
-        const double shift = (tStart - dTop).Modulus() + (tEnd - dTopEnd).Modulus();
-        dTop = tStart;
-        dTopEnd = tEnd;
-        if (shift < 1e-12) break;
-    }
-    if (!std::isnan(resolvedTop.X())) {
-        dTop = resolvedTop;   // the caller solved every corner against every other (common delta)
-        // Re-solve the far-end tangent around the RESOLVED heading -- leaving it at the value
-        // computed for the unrotated corner shipped a spiral 11 um off the one the solver
-        // validated (measured: solver >= 0.6785 mm, emitted pair sampled 0.6673).
-        for (int pass = 0; pass < 8; ++pass) {
-            const gp_XY a1 = c0.pin + dTop * b, b1 = c0.pout - dTopEnd * b;
-            dTopEnd = faceSpiralTangent(a1, b1, false);
-        }
-    }
+    // The caller's corner solve prescribes the inner corner's heading (it solved every corner
+    // against every other: common retilt + lead relaxation, certified against the coated
+    // envelopes); the chord is then solved to MEET that heading, never the other way round.
+    std::optional<gp_XY> topHeading;
+    if (!std::isnan(resolvedTop.X())) topHeading = resolvedTop;
+    ToroFaceSpiral topSp =
+        solveToroFaceSpiral(c0.pin, topHeading, c0.pout, b, /*top=*/true, std::nullopt, label);
+    gp_XY dTop = topSp.nearHeading, dTopEnd = topSp.farHeading;
     // No resolved heading means the caller's corner solve did not run -- which for a real
     // toroidal winding it always does (any design with two or more stations). The spiral's own
     // tangent stands, and the certified zero-overlap verification downstream is the authority:
     // there is no local per-corner clearance rule any more, and no fallback.
 
-    const gp_XYZ dTop3(dTop.X(), 0, dTop.Y());
     // ABT #865 (a) (Alf: "all parts should be CLEAN of coil collision"): CONDITIONALLY POLOIDAL
     // OUTER CORNERS. A rim corner tangent to its face chord bulges azimuthally, and MKF packs
     // the rim crossings so tightly (station-geometry margins of ~100 nm) that the bulge
@@ -5670,8 +6577,31 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
         return natural;
     };
     const gp_XY dTopChord = outerHeading(dTopEnd);
-    pushArc(P(c0.pin + dTop * b, t0), yHat.Crossed(dTop3), dTop3 * (-b), "top inner corner");
-    faceSpiral(c0.pin + dTop * b, c0.pout - dTopChord * b, rh0, "top chord");
+    std::optional<ToroChordBend> topBend;
+    if ((dTopChord - dTopEnd).Modulus() > 0.0) {
+        // ABT #865 imposed the poloidal rim heading: the chord becomes spiral + bend arc.
+        topBend = solveToroChordBend(c0.pin, topHeading, c0.pout, dTopChord, b, /*top=*/true, label,
+                                     2.0 * b / kRoundCornerBendFactor);
+        topSp = topBend->spiral;
+        dTop = topSp.nearHeading;
+    }
+    if (std::getenv("MVB_TORO_DIAG") && topSp.centre.Modulus() > 0.0) {
+        std::cerr << "[toro]   " << label << " top chord: spiral centre shifted "
+                  << topSp.centre.Modulus() * 1e6 << " um to meet the prescribed corner heading"
+                  << (topBend ? " (+ poloidal bend arc)" : "") << "\n";
+    }
+    if (std::getenv("MVB_TORO_DIAG") && topBend) {
+        const double R = (topBend->joint - topBend->centre).Modulus();
+        std::cerr << "[toro-bend] " << label << " top: turn " << topBend->turn * 180.0 / kPi
+                  << " deg, radius " << R * 1e3 << " mm, arc length " << std::abs(topBend->turn) * R * 1e6 << " um\n";
+    }
+    const gp_XYZ dTop3(dTop.X(), 0, dTop.Y());
+    pushArc(P(topSp.near, t0), yHat.Crossed(dTop3), dTop3 * (-b), "top inner corner");
+    faceSpiral(topSp.near, topSp.far, rh0, "top chord", topSp.centre);
+    if (topBend) {
+        pushPlanarArc(P(topBend->centre, rh0), P(topBend->joint, rh0), topSp.farHeading,
+                      std::abs(topBend->turn), "top chord bend");
+    }
     const gp_XYZ dTopChord3(dTopChord.X(), 0, dTopChord.Y());
     pushArc(P(c0.pout - dTopChord * b, t0), yHat.Crossed(dTopChord3), yHat * b, "top outer corner");
 
@@ -5711,28 +6641,14 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     // corner, and the chord -- and therefore the outer corner it is tangent to -- runs to
     // wherever that knee ended up.
     // Same as the top: corner, spiral across the face, corner. The bottom travels rim -> bore.
-    gp_XY eBotStart = eH, eBot = eH;
-    for (int pass = 0; pass < 8; ++pass) {
-        const gp_XY start = c0.pout + eBotStart * b;
-        const gp_XY finish = c1.pin - eBot * b;
-        const gp_XY tStart = faceSpiralTangent(start, finish, true);
-        const gp_XY tEnd = faceSpiralTangent(start, finish, false);
-        const double shift = (tStart - eBotStart).Modulus() + (tEnd - eBot).Modulus();
-        eBotStart = tStart;
-        eBot = tEnd;
-        if (shift < 1e-12) break;
-    }
-    if (!std::isnan(resolvedBottom.X())) {
-        eBot = resolvedBottom;
-        for (int pass = 0; pass < 8; ++pass) {   // same re-solve as the top half
-            const gp_XY a2 = c0.pout + eBotStart * b, b2 = c1.pin - eBot * b;
-            eBotStart = faceSpiralTangent(a2, b2, true);
-        }
-    }
+    std::optional<gp_XY> bottomHeading;
+    if (!std::isnan(resolvedBottom.X())) bottomHeading = resolvedBottom;
+    ToroFaceSpiral botSp = solveToroFaceSpiral(c1.pin, bottomHeading, c0.pout, b, /*top=*/false,
+                                               std::nullopt, label);
+    gp_XY eBotStart = botSp.farHeading, eBot = botSp.nearHeading;
     // Same as the top half: no local rule, no fallback -- the caller's solve plus the certified
     // verification own clearance.
 
-    const gp_XYZ eBot3(eBot.X(), 0, eBot.Y());
     // Same conditional rule for the bottom outer corner (see the top's comment); the bottom
     // corner's footprint runs pout + heading*bend, so the sign mirrors.
     auto outerHeadingBot = [&](const gp_XY& natural) -> gp_XY {
@@ -5755,12 +6671,35 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
         return natural;
     };
     const gp_XY eBotChord = outerHeadingBot(eBotStart);
+    std::optional<ToroChordBend> botBend;
+    if ((eBotChord - eBotStart).Modulus() > 0.0) {
+        botBend = solveToroChordBend(c1.pin, bottomHeading, c0.pout, eBotChord, b, /*top=*/false, label,
+                                     2.0 * b / kRoundCornerBendFactor);
+        botSp = botBend->spiral;
+        eBot = botSp.nearHeading;
+    }
+    if (std::getenv("MVB_TORO_DIAG") && botSp.centre.Modulus() > 0.0) {
+        std::cerr << "[toro]   " << label << " bottom chord: spiral centre shifted "
+                  << botSp.centre.Modulus() * 1e6 << " um to meet the prescribed corner heading"
+                  << (botBend ? " (+ poloidal bend arc)" : "") << "\n";
+    }
+    if (std::getenv("MVB_TORO_DIAG") && botBend) {
+        const double R = (botBend->joint - botBend->centre).Modulus();
+        std::cerr << "[toro-bend] " << label << " bottom: turn " << botBend->turn * 180.0 / kPi
+                  << " deg, radius " << R * 1e3 << " mm, arc length " << std::abs(botBend->turn) * R * 1e6 << " um\n";
+    }
+    const gp_XYZ eBot3(eBot.X(), 0, eBot.Y());
     const gp_XYZ eBotChord3(eBotChord.X(), 0, eBotChord.Y());
     pushSeg(P(c0.pout, t0), P(c0.pout, -tb), "outer tube down");
-    pushArc(P(c0.pout + eBotChord * b, -tb), eBotChord3.Crossed(yHat), eBotChord3 * (-b),
+    const gp_XY botRim = botBend ? botBend->rim : botSp.far;
+    pushArc(P(botRim, -tb), eBotChord3.Crossed(yHat), eBotChord3 * (-b),
             "bottom outer corner");
-    faceSpiral(c0.pout + eBotChord * b, c1.pin - eBot * b, -rhb, "bottom chord");
-    pushArc(P(c1.pin - eBot * b, -tb), eBot3.Crossed(yHat), yHat * (-b), "bottom inner corner");
+    if (botBend) {
+        pushPlanarArc(P(botBend->centre, -rhb), P(botRim, -rhb), eBotChord, std::abs(botBend->turn),
+                      "bottom chord bend");
+    }
+    faceSpiral(botSp.far, botSp.near, -rhb, "bottom chord", botSp.centre);
+    pushArc(P(botSp.near, -tb), eBot3.Crossed(yHat), yHat * (-b), "bottom inner corner");
     pushSeg(P(c1.pin, -tb), P(c1.pin, 0), "inner tube up to crossing");
 }
 
@@ -6084,6 +7023,27 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     // Column geometry (concentric) / toroidal window data.
     MAS::ColumnShape columnShape = bobbinPd.get_column_shape();
+    // THE FORMER'S CORNER RADIUS (ABT #959), from MKF so there is one definition of it: the MAS
+    // datum when the bobbin carries one, the shape's own radius for round/oblong, and the
+    // injection-moulding rule for a synthesised rectangular bobbin. A moulded former has no sharp
+    // corner, and the wire wound on it bends around that radius -- which is what BobbinBuilder
+    // already assumed when it rounded the bobbin SOLID's outer corners, while this path went on
+    // routing the copper around a mathematically sharp one.
+    // MVB_FORMER_CORNER: OPT-IN until ABT #959's sibling-parallel question is settled. Routing
+    // the copper around the former's real corner removes 02_flyback's 42 self-intersections, but
+    // it also SHORTENS the wrap path (42.28 -> 41.41 mm on 02), which steepens the pitch-true
+    // slope by ~2%. On a design whose sibling parallels were laid EXACTLY tangent that is enough
+    // to push them inside their coated envelopes: 04_forward refuses with 114 pairs, worst 53 nm.
+    // Measured both ways on 04: corner ON -> refused, corner OFF -> builds clean. Default OFF, so
+    // this tree behaves exactly as it did before, and the corner is one env var away for testing.
+    double formerCornerRadius = 0.0;
+    if (!isToroidal && std::getenv("MVB_FORMER_CORNER") &&
+        (columnShape == MAS::ColumnShape::RECTANGULAR ||
+         columnShape == MAS::ColumnShape::IRREGULAR)) {
+        OpenMagnetics::Bobbin bobbinForCorner;
+        bobbinForCorner.set_processed_description(bobbinPd);
+        formerCornerRadius = bobbinForCorner.get_column_corner_radius();
+    }
     // IRREGULAR columns (EFD / EPX-style poles: flat-sided profiles that are none of the three
     // analytic shapes): approximate the WRAP PATH with the column's bounding RECTANGLE
     // (columnWidth x columnDepth). This is a stated geometric approximation, not a silent one --
@@ -6560,7 +7520,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (std::getenv("MVB_DIAG")) {
                 for (size_t i = 0; i < ct.turns.size(); ++i) {
                     const RectStation st =
-                        rectStation(station(ct.turns[i]), rectHalfW, rectHalfD, mb, ct.winding);
+                        rectStation(station(ct.turns[i]), rectHalfW, rectHalfD, mb, formerCornerRadius, ct.winding);
                     std::cerr << "[rect] ci=" << cv << " turn " << i << " zPos=" << st.zPos
                               << " y=" << st.y << " segX=" << st.segX << " segZ=" << st.segZ
                               << "\n";
@@ -6571,9 +7531,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (t->get_layer()) turnsInLayer[t->get_layer().value()]++;
             for (size_t i = 0; i + 1 < ct.turns.size(); ++i) {
                 const RectStation a =
-                    rectStation(station(ct.turns[i]), rectHalfW, rectHalfD, mb, ct.winding);
+                    rectStation(station(ct.turns[i]), rectHalfW, rectHalfD, mb, formerCornerRadius, ct.winding);
                 const RectStation b =
-                    rectStation(station(ct.turns[i + 1]), rectHalfW, rectHalfD, mb, ct.winding);
+                    rectStation(station(ct.turns[i + 1]), rectHalfW, rectHalfD, mb, formerCornerRadius, ct.winding);
                 // ANY depth change is a return -- including a pure layer climb with no axial
                 // move (its descent just has zero length). Requiring a y-move too let a
                 // dy=0 layer change fall into the rising-turn branch, which ignores depth
@@ -6760,11 +7720,91 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // leads at well-separated heights) reuse the same angle -- except a lead RUNS THROUGH every
     // layer radius on its way out, so leads are also cleared against any return whose axial span
     // covers the lead's height.
+    // THE COMMON TIP PLANE'S INPUTS, computed ONCE and shared by the fan and the terminal-lead
+    // emitter (leadTipRadius, below). The fan re-derives the polyline the emitter will draw for a
+    // lead at each candidate slot -- attach dip, vertical, border extension to the tip plane, kink
+    // absorption -- and the absorbed diagonal's SLOPE depends on where the tip plane is: modelling
+    // MKF's drawn border (17.75 mm on the pushpull) where the emitter extends to the tip plane
+    // (23.25 mm) put the modelled run 53 um above the drawn one at the crossing of Secondary 2's
+    // ring band. One implementation, or the two disagree again.
+    // RECT columns: the terminal attach can sit on a dragback-DISPLACED face (rectRideFor), so
+    // the common tip plane must clear the displaced attach too, or the tip lands INSIDE the
+    // attach (17_cllc: exit attach ridden to 24.9 mm vs a 24.2 mm tip plane). Conservative: all
+    // reservation levels stacked.
+    double maxRideAll = 0.0;
+    if (rectFamily)
+        for (int side2 = 0; side2 < 2; ++side2)
+            for (const auto& [lvlZ, diam] : rectRideLevels[side2]) maxRideAll += diam;
+    // The terminals must EMERGE FROM THE COMPONENT: the tip plane always clears the BOBBIN's own
+    // extent (Alf, 2026-08-08), never just the winding's. The bobbin's flange reaches
+    // columnWidth + windowWidth radially (BobbinBuilder), and the 2D radial coordinate maps to 3D
+    // depth with the same zoff the leads use, so the comparison is exact in this frame.
+    // ABT #871: measured in THIS conductor's frame. For a main-column conductor the frame axis is
+    // the origin and this is the bobbin's own outer edge. For a lateral leg the bobbin describes
+    // no flange at all (its columnWidth/thickness are the main column's), so the reach that stands
+    // in for one is the far edge of the winding window the conductor is actually wound in,
+    // measured from the leg axis.
+    // The winding window each conductor is wound in: its flange faces (axial) and their radial
+    // reach, in the conductor's own frame -- for the flange containment proof (fan and gate).
+    auto windowBoundsFor = [&](size_t ciQ) -> std::optional<WindowBounds> {
+        if (isToroidal) return std::nullopt;
+        const auto& ctQ = conductors[ciQ];
+        const double frameAxisX = conductorAxisX[ciQ];
+        for (const auto& ww : bobbinPd.get_winding_windows()) {
+            if (!ww.get_coordinates() || !ww.get_width() || !ww.get_height()) continue;
+            if (ww.get_coordinates()->size() < 2) continue;
+            const double windowLow = (*ww.get_coordinates())[0] - *ww.get_width() / 2.0;
+            const double windowHigh = (*ww.get_coordinates())[0] + *ww.get_width() / 2.0;
+            const bool holds = frameAxisX == 0.0 ||
+                std::any_of(ctQ.turns.begin(), ctQ.turns.end(), [&](const MAS::Turn* t) {
+                    const double turnX = t->get_coordinates()[0];
+                    return turnX >= windowLow - 1e-9 && turnX <= windowHigh + 1e-9;
+                });
+            if (!holds) continue;
+            WindowBounds wb;
+            wb.lo = (*ww.get_coordinates())[1] - *ww.get_height() / 2.0;
+            wb.hi = (*ww.get_coordinates())[1] + *ww.get_height() / 2.0;
+            wb.axisX = frameAxisX;
+            wb.outerR = frameAxisX == 0.0 ? windowHigh
+                                          : std::max(std::abs(windowHigh - frameAxisX),
+                                                     std::abs(windowLow - frameAxisX));
+            return wb;
+        }
+        return std::nullopt;
+    };
+    std::vector<std::optional<WindowBounds>> windowBoundsPerPath(conductors.size());
+    for (size_t ciQ = 0; ciQ < conductors.size(); ++ciQ) windowBoundsPerPath[ciQ] = windowBoundsFor(ciQ);
+    auto bobbinOuterXFor = [&](size_t ciQ) {
+        const auto& ctQ = conductors[ciQ];
+        const double frameAxisX = conductorAxisX[ciQ];
+        double bobbinOuterX = 0.0;
+        for (const auto& ww : bobbinPd.get_winding_windows()) {
+            if (!ww.get_coordinates() || !ww.get_width()) continue;
+            const double windowLow = (*ww.get_coordinates())[0] - *ww.get_width() / 2.0;
+            const double windowHigh = (*ww.get_coordinates())[0] + *ww.get_width() / 2.0;
+            if (frameAxisX == 0.0) {
+                bobbinOuterX = std::max(bobbinOuterX, windowHigh);
+                continue;
+            }
+            const bool holdsThisConductor =
+                std::any_of(ctQ.turns.begin(), ctQ.turns.end(), [&](const MAS::Turn* t) {
+                    const double turnX = t->get_coordinates()[0];
+                    return turnX >= windowLow - 1e-9 && turnX <= windowHigh + 1e-9;
+                });
+            if (!holdsThisConductor) continue;
+            bobbinOuterX = std::max({bobbinOuterX, std::abs(windowHigh - frameAxisX),
+                                     std::abs(windowLow - frameAxisX)});
+        }
+        return bobbinOuterX;
+    };
     struct LaidDragback { double az; double radius; double diam; };
     std::vector<LaidDragback> laidDragbacks;
     std::map<std::pair<size_t, size_t>, double> dragAzOf;   // (conductor, transition) -> azimuth
     std::map<std::pair<size_t, size_t>, double> linkAzOf;   // ABT #831: the same, for U links
     std::map<size_t, double> leadAzIn, leadAzOut;           // conductor -> lead azimuth
+    // conductor -> the length of the LEVEL leg its lead keeps at the attach before climbing to
+    // MKF's row (the fan's answer, from the terminal fillet it derives; see emittedRoute)
+    std::map<size_t, std::pair<double, double>> leadLegIn, leadLegOut;   // (dr, dy)
     // ABT #839 mechanism C: per (conductor, side), the stub sweep cap -- half the azimuth gap
     // to the nearest ROTATED same-winding sibling lane on the stub's own sweep side. Filled at
     // the fan tail, consumed by the emission (see appendRoundWrap's cappedStub).
@@ -6823,7 +7863,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             std::vector<std::array<double, 4>> segs;   // (r0, y0, r1, y1)
             double destAdvance = 0.0;  // dragbacks: the climb of the layer they land on
             double attachY = 0.0;
+            // WHAT THE EMITTER IS HANDED (ABT #685, "what the fan reserves must be what the
+            // emitter draws"): MKF's drawn route ATTACH FIRST, before any absorption, plus the
+            // wire's absorption bound. The fan re-derives the emitted polyline from these at
+            // every candidate slot (emittedRoute, below) -- dip, vertical, border extension to
+            // the common tip plane, kink absorption -- instead of shifting one endpoint of a
+            // route absorbed at a different border.
+            std::vector<PlanePt> route;
+            double absorbTol = 0.0;
+            bool rectWire = false;
             std::string wname;
+            // The EMISSION wire radius (path.wireRadius): what bumpsForTurn selects lanes with,
+            // and the radius the terminal fillet's bend is scaled from.
+            double rwEmit = 0.0;
+            // Rectangular wire: the BARE section (width radial, height axial) the gate's box
+            // test uses, and the COATED axial half-height the flange containment uses.
+            double condW = 0.0, condH = 0.0, rwAxialCoat = 0.0;
         };
         // Min distance between two 2D segment sets -- the exact clearance criterion for
         // two lead routes (or a route and a dragback descent) sharing an azimuth plane.
@@ -6882,6 +7937,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // ABT #831: which station this row belongs to, so a vertical that MOVES its own
             // crossing can find the two wraps that move with it.
             size_t station = 0;
+            // The EMISSION wire radius of the row's conductor (path.wireRadius): the ride-over
+            // lanes a turn at this radius flies over are selected with it (bumpsForTurn).
+            double rwEmit = 0.0;
+            // Rectangular wire: the gate judges rect pairs on BARE section boxes, not capsules.
+            bool rect = false;
+            double condW = 0.0, condH = 0.0;
         };
         std::vector<WireRow> rows;   // NB: WireRow.rw carries the BARE radius: rows are MKF's
                                      // geometry, and lead corridors past them are planned at
@@ -7012,10 +8073,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                  size_t attachStation = 0) {
                 // Model EXACTLY what the emitter draws: same kink absorption, same tolerance
                 // (the emitter's wire radius -- rwEmit is "what the emitter bends").
+                const std::vector<PlanePt> drawnRoute = wpv;   // attach first, pre-absorption
                 wpv = absorbLeadWaypoints(wpv, rwEmit);
                 Vert v;
                 v.kind = 0; v.ci = cv; v.trans = 0; v.entrance = entrance;
                 v.rw = rwCoat; v.rwBare = rwBare;
+                v.route = drawnRoute;
+                v.absorbTol = rectW ? 0.5 * std::min(ew, eh) : rwEmit;   // pushPlaneSegs' bound
+                v.rectWire = rectW;
                 v.r = 1e30; v.y0 = 1e30; v.y1 = -1e30;
                 for (const auto& pw : wpv) {
                     v.r = std::min(v.r, pw.x);
@@ -7030,6 +8095,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 v.wname = ct.winding;
                 v.attachAdvance = attachAdvance;
                 v.attachStation = attachStation;   // ABT #830: the wrap this lead may touch
+                v.rwEmit = rwEmit;
+                v.condW = bw; v.condH = bh;
+                v.rwAxialCoat = rectW ? 0.5 * chh : rwCoat;
                 if (!v.segs.empty()) {
                     v.attachSegIdeal = v.segs.front();
                     v.hasAttachSeg = true;
@@ -7087,11 +8155,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const PlanePt st = station(ct.turns[i]);
                 if (i + 1 < nEmitP && transKindP[i] == 0) {
                     const double advLeaving = station(ct.turns[i + 1]).y - st.y;
-                    rows.push_back({st.x, st.y, advLeaving, rwBare, rwCoat, cv, 0.0, 1e30, i});
+                    rows.push_back({st.x, st.y, advLeaving, rwBare, rwCoat, cv, 0.0, 1e30, i, rwEmit, rectW, bw, bh});
                 }
                 if (i > 0 && transKindP[i - 1] == 0) {
                     const double advArriving = st.y - station(ct.turns[i - 1]).y;
-                    rows.push_back({st.x, st.y, advArriving, rwBare, rwCoat, cv, -1e30, 0.0, i});
+                    rows.push_back({st.x, st.y, advArriving, rwBare, rwCoat, cv, -1e30, 0.0, i, rwEmit, rectW, bw, bh});
                 }
             }
         }
@@ -7101,6 +8169,30 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // adjacent turns. It sits strictly above the collision gate's fault criterion
         // (gateMinSeparation on bare copper), so fan-placed geometry can never sit AT the
         // gate's threshold where sampling noise flips the verdict.
+        // The slots as handed out so far (filled by runPack, below). Declared here because the
+        // route models read them: the common tip plane depends on the dragback columns, and a
+        // row's copper extent on the lead or return that carries its crossing.
+        std::vector<double> az(verts.size(), 0.0);
+        std::vector<char> azAssigned(verts.size(), 0);
+        // The CANDIDATE slots of the lead block being evaluated (boost_inductor_complete,
+        // 2026-09-02). A block's members are unassigned while their anchor is tested, so the
+        // helix a member's own lead terminates (its stub) and the sibling helices that end at
+        // the same slot were modelled to the PLANE -- copper up to 5.7 deg past where it truly
+        // stops, and no stub at the slot at all. The candidate overrides the assignment here.
+        std::vector<double> azCand(verts.size(), 0.0);
+        std::vector<char> azCandSet(verts.size(), 0);
+        // THE PREVIOUS PACK'S SLOTS (06_llc / 11_pushpull, 2026-09-02). A block is proven against
+        // another winding's wrap at that wrap's crossing slot -- the plane while the crossing's
+        // block is still unplaced. When that block later takes an off-plane slot, its wrap dips
+        // and the earlier lead is no longer clear (06: Primary p2's run 3.8 um inside the
+        // Secondary's dipped first wrap; 11: 282 nm). The dip loop repacks -- but a repack starts
+        // from nothing, so the earlier block again sees the plane and lands where it was: no
+        // fixpoint. An unplaced crossing now carries the slot the previous pack gave it.
+        std::vector<double> azPrev(verts.size(), 0.0);
+        std::vector<char> azPrevSet(verts.size(), 0);
+        // ABT #841: the slot PERMUTATION a pack produced, as a signature -- see the proof
+        // obligation at runPack's call sites.
+        std::string permSig;
         auto need = [&](const Vert& A, const Vert& B) -> double {
             const double dSep = A.rw + B.rw;
             if (A.kind == 2 || B.kind == 2) {
@@ -7275,14 +8367,38 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         //
         // So: every pair involving a lead is measured in X. Dragback-vs-dragback keeps the ray
         // model (both really are radial there, and that model is what its tuning assumes).
+        // THE LANE OF A LEAD IS ITS RUN (06_llc / 23_illc / 11_pushpull, 2026-09-02). The run
+        // that lies side by side with a sibling's is drawn parallel to Z at the world X of the
+        // waypoint before the tip -- the elbow, one leg out from the attach -- while the lanes
+        // were spaced at the ATTACH radius: a member with an elbow ran (r + leg)/r further out in
+        // X than one without (06: 1.959 vs 2.634 mm, 0.675 apart against 0.8). runRadiusOf
+        // (set once the route model exists) is that waypoint's radius; xAt is the run's X.
+        std::function<double(const Vert&, double)> runRadiusOf;
         auto xAt = [](const Vert& v, double c) { return -v.r * std::sin(c); };
+        auto xRunAt = [&](const Vert& v, double c) {
+            const double r = (v.kind == 0 && runRadiusOf) ? runRadiusOf(v, c) : v.r;
+            return -r * std::sin(c);
+        };
         // The DISTANCE need() encodes as an angle at the pair's innermost radius, recovered so
         // the two metrics agree on the requirement and differ only in how they measure it.
         auto needDist = [&](const Vert& A, const Vert& B, double nd) {
             const double rr = std::max(std::min(A.r, B.r), A.rw + B.rw);
             return rr * std::sin(std::min(nd, kPi / 2.0));
         };
+        // EXACT LEAD-vs-LEAD ACCEPTANCE (11_pushpull_etd49_tp4a, 2026-09-02). need()'s X buy
+        // measures routes in the (r, y) half-plane, but the emitted lead lives in the plane
+        // x = X at DEPTH z = r cos(c): a corner modelled at r sits r(1 - cos c) further along the
+        // other lead's tilted run than it is drawn. On 11_pushpull that is 1.64 um along Primary
+        // 2's 0.187-degree exit run, i.e. 5.4 nm of the 0.9585 mm envelope -- and the certified
+        // gate refuses at 5 nm. The buy stays the candidate generator; the ACCEPTANCE is the
+        // exact minimum distance between the two emitted polylines (leadPairDist3D, set below
+        // once the route model exists), which is the very object the gate measures.
+        std::function<double(const Vert&, double, const Vert&, double)> leadPairDist3D;
+        bool explainPairs = false;   // diagnostics: name the refused prim pair
         auto clears = [&](const Vert& A, double cA, const Vert& B, double cB) {
+            if (A.kind == 0 && B.kind == 0 && !A.rectWire && !B.rectWire && leadPairDist3D &&
+                leadPairDist3D(A, cA, B, cB) + 1e-12 < A.rw + B.rw)
+                return false;
             const double nd = need(A, B);
             if (nd <= 0.0) return true;
             if (A.kind == 0 || B.kind == 0)
@@ -7361,72 +8477,604 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             return true;
         };
+        // =========================================================================================
+        // THE EMITTED LEAD, RE-DERIVED PER CANDIDATE SLOT (ABT #685, pushpull_transformer_complete,
+        // 2026-09-02). The fan used to model a terminal lead as MKF's route absorbed once at MKF's
+        // drawn border, with its attach endpoint shifted by advance*|slot|/2pi -- MINUS for an
+        // entrance, PLUS for an exit -- and measured a row at the slot azimuth against the BARE
+        // envelope. Against the emitter (pushPlaneSegs) every one of those disagrees:
+        //   * THE EXIT SIGN. The last wrap keeps its pitch to the exit slot, so at a slot BEFORE
+        //     the plane it ends LOWER (wrapEndYOverride: n.y + adv*(azExit - azPrev)/2pi), exactly
+        //     as an entrance before the plane starts lower. The fan RAISED Secondary 1 p1's exit
+        //     attach 0.1916 mm (12.7647 -> 12.9562) where the emitter LOWERED it (-> 12.5731): a
+        //     0.383 mm disagreement that (a) invented a conflict with Primary 2's exit row (route
+        //     distance 1.449 vs 1.5855 mm) and pushed the bundle out to 11.74 deg, and (b) hid the
+        //     real crossing of Secondary 2 p1's final wrap 14.76 um inside the coated envelope --
+        //     which the gate then reported through its first 18 nm witness.
+        //   * THE BORDER. The emitter extends the run to the common tip plane BEFORE absorbing the
+        //     corner, so the absorbed diagonal is shallower than one absorbed at MKF's border
+        //     (23.25 vs 17.75 mm here: 53 um at the ring-band crossing).
+        //   * THE CROSSING AZIMUTH. The emitted run is a straight line at constant world X, so it
+        //     crosses an outer band at asin(X/R), not at the slot (22 um of helix drift here).
+        //   * THE CRITERION. The certified gate enforces the COATED envelope; a plan at the bare
+        //     one certifies geometry the gate refuses.
+        // So the model is now the emitter's own recipe (attach dip, vertical, border extension,
+        // absorption, the constant-X tip) and the measurement is the certified engine's: the
+        // lead's 3D segments against the exact helix of each wrap, proven at the coated envelope.
+        // Nothing linearized, nothing at bare, no margin. Not modelled (as before): the ride-over
+        // lift of a run flying over dragback columns (the raises preserve radial order) and the
+        // sub-100 nm departure of an osculating terminal stub from the helix point it stands in
+        // for -- both remain the gate's to measure.
+        // ROW-HOLD IS THE ROUTE (Alf, 2026-09-02, on the two review STEPs): the lead runs on the
+        // row MKF drew and turns at an elbow; it does not climb along an absorbed diagonal. The
+        // diagonal put pushpull's Secondary 1 exit bundle 45/59 deg off the terminal plane (the
+        // only slots where it clears) -- "the second looks more real to me too". The fan models
+        // exactly this route (emittedRoute), so plan and drawing agree.
+        // MVB_LEAD_DIAGONAL_ROUTE=1 restores the absorbed diagonal (bisect switch).
+        const bool holdRowElbow = std::getenv("MVB_LEAD_DIAGONAL_ROUTE") == nullptr;
+        // Tallest dragback column among the returns placed so far -- the emitter's fanMaxRaise
+        // (laidDragbacks stacked per azimuth, consecutive returns of one conductor chained onto
+        // one azimuth), from the same slots the emitter will receive. Returns place before leads,
+        // so a lead's tip plane is final by the time the lead is evaluated.
+        auto fanRaiseNow = [&]() {
+            std::map<std::pair<size_t, size_t>, double> dAz;
+            std::map<std::pair<size_t, size_t>, double> dDiam;
+            for (size_t k = 0; k < verts.size(); ++k) {
+                if (verts[k].kind != 1 || !azAssigned[k]) continue;
+                dAz[{verts[k].ci, verts[k].trans}] = az[k];
+                dDiam[{verts[k].ci, verts[k].trans}] = 2.0 * verts[k].rw;
+            }
+            for (auto& [key, a] : dAz) {
+                if (key.second == 0) continue;
+                auto prev = dAz.find({key.first, key.second - 1});
+                if (prev != dAz.end()) a = prev->second;
+            }
+            std::vector<std::pair<double, double>> cols;
+            for (const auto& [key, a] : dAz) {
+                bool found = false;
+                for (auto& col : cols) {
+                    if (std::abs(std::remainder(a - col.first, kTwoPi)) < 1e-9) {
+                        col.second += dDiam.at(key);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) cols.push_back({a, dDiam.at(key)});
+            }
+            double raise = 0.0;
+            for (const auto& col : cols) raise = std::max(raise, col.second);
+            return raise;
+        };
+        // The common tip plane this conductor's leads finish on -- leadTipRadius in the emitter,
+        // from the same inputs.
+        auto tipRadiusFor = [&](size_t ciQ) {
+            return std::max(commonTipBase + fanRaiseNow() + maxRideAll,
+                            bobbinOuterXFor(ciQ) + 2.0 * commonTipWireRadius);
+        };
+        // The fan-frame azimuth at which conductor ci's station s crosses: the slot of the return
+        // or lead that carries it (a return wins, as crossAz in the emitter), the plane otherwise
+        // -- and the plane while that vertical is still unplaced.
+        auto crossingSlotOf = [&](size_t ciQ, size_t s) {
+            auto slotOf = [&](size_t k) {
+                if (azCandSet[k]) return azCand[k];
+                if (azAssigned[k]) return az[k];
+                return azPrevSet[k] ? azPrev[k] : 0.0;
+            };
+            for (size_t k = 0; k < verts.size(); ++k) {
+                const Vert& v = verts[k];
+                if (v.ci != ciQ || v.kind == 0) continue;
+                if (v.trans == s || v.trans + 1 == s) return slotOf(k);
+            }
+            for (size_t k = 0; k < verts.size(); ++k) {
+                const Vert& v = verts[k];
+                if (v.ci != ciQ || v.kind != 0 || v.attachStation != s) continue;
+                return slotOf(k);
+            }
+            return 0.0;
+        };
+        // THE RIDE-OVER LIFT, AS THE EMITTER COMPUTES IT (boost_inductor_complete, 2026-09-02):
+        // bumpsForTurn over the dragbacks placed so far (chained per conductor, at their world
+        // azimuths, exactly what laidDragbacks will hold), through tallestBumpColumn. The fan
+        // modelled every lead and helix UNLIFTED while its tip plane carried the lift -- so a
+        // lead attaching on a lifted layer was drawn from the bare radius to the lifted plane,
+        // 1.9 mm longer than the emitted one on the boost and correspondingly shallower. Both the
+        // lead's waypoints (per waypoint, at its own radius) and each wrap's helix (cz = -raise)
+        // now carry the same lift the emitter gives them, from the same lists.
+        auto fanBumpsAt = [&](double turnRadius, double rwEmitOf) {
+            std::map<std::pair<size_t, size_t>, double> dAz;
+            std::map<std::pair<size_t, size_t>, size_t> dIdx;
+            for (size_t k = 0; k < verts.size(); ++k) {
+                if (verts[k].kind != 1 || !azAssigned[k]) continue;
+                dAz[{verts[k].ci, verts[k].trans}] = az[k];
+                dIdx[{verts[k].ci, verts[k].trans}] = k;
+            }
+            for (auto& [key, a] : dAz) {
+                if (key.second == 0) continue;
+                auto prev = dAz.find({key.first, key.second - 1});
+                if (prev != dAz.end()) a = prev->second;
+            }
+            std::vector<WrapBump> out;
+            for (const auto& [key, a] : dAz) {
+                const Vert& d = verts[dIdx.at(key)];
+                if (turnRadius < d.r - rwEmitOf) continue;   // bumpsForTurn's selection
+                out.push_back({kPlaneAz + a, d.r, 2.0 * d.rw});
+            }
+            return out;
+        };
+        auto fanRaiseAt = [&](double turnRadius, double rwEmitOf) {
+            return tallestBumpColumn(fanBumpsAt(turnRadius, rwEmitOf)).first;
+        };
+        // The exact helix of the wrap LEAVING station R.station (a wrap's two rows describe one
+        // helix; the leaving row carries it): anchored at the plane, y = R.y + adv*(az - plane)/2pi,
+        // from this station's crossing slot to one revolution plus the next station's -- the
+        // pitch-true start and end the emitter draws (entranceAttachY, landingAttach, endY) --
+        // lifted by the ride-over raise a turn at this radius gets (cz = -raise, appendRoundWrap).
+        // lo/hi override the crossing slots (the lead whose stub this is knows its own).
+        auto wrapHelixOf = [&](const WireRow& R, std::optional<double> loOverride = std::nullopt,
+                               std::optional<double> hiOverride = std::nullopt) {
+            const double lo = loOverride ? *loOverride : crossingSlotOf(R.ci, R.station);
+            const double hi = kTwoPi + (hiOverride ? *hiOverride : crossingSlotOf(R.ci, R.station + 1));
+            Primitive pr;
+            pr.kind = Primitive::SPIRAL;
+            pr.spiral.cx = 0.0;
+            pr.spiral.cz = -fanRaiseAt(R.r, R.rwEmit);
+            pr.spiral.r0 = pr.spiral.r1 = R.r + conductorZoff[R.ci];
+            pr.spiral.az0 = kPlaneAz + lo;
+            pr.spiral.az1 = kPlaneAz + hi;
+            pr.spiral.y0 = R.y + R.adv * lo / kTwoPi;
+            pr.spiral.y1 = R.y + R.adv * hi / kTwoPi;
+            return pr;
+        };
+        // The helix of lead L's OWN wrap -- the one leaving station 0 (entrance) or the one
+        // leaving the station before the attach (exit) -- ending (starting) at slot c, labelled
+        // as the terminal stub the emitter draws so TerminalFillet recognises it.
+        auto ownHelixOf = [&](const Vert& L, double c) -> std::optional<Primitive> {
+            if (L.rectWire || L.kind != 0) return std::nullopt;
+            for (const auto& R : rows) {
+                if (R.ci != L.ci || R.cHi < 1e29) continue;
+                if (L.entrance ? R.station == 0
+                               : (L.attachStation >= 1 && R.station + 1 == L.attachStation)) {
+                    Primitive helix = L.entrance ? wrapHelixOf(R, c, std::nullopt)
+                                                 : wrapHelixOf(R, std::nullopt, c);
+                    helix.label = "wrap (terminal stub)";
+                    return helix;
+                }
+            }
+            return std::nullopt;
+        };
+        // A waypoint of lead L on the ray of slot c, lifted at its own radius exactly as
+        // pushPlaneSegs lifts it.
+        auto liftedPt = [&](const Vert& L, double x, double y, double c) {
+            const double lift = L.rectWire ? 0.0 : fanRaiseAt(x, L.rwEmit);
+            return azPointC(0.0, lift > 0.0 ? -lift : 0.0, x + conductorZoff[L.ci], y, kPlaneAz + c);
+        };
+        // THE ATTACH LEG (boost_inductor_complete, 2026-09-02; osculating plane, coordinator's
+        // design change). The leg a lead keeps at its attach before climbing to MKF's row is
+        // (i) as long as the terminal fillet's tangent length Lf plus the corner machinery's
+        // elbow leg (two absorb tolerances), Lf read off a trial fillet of the lead's own helix
+        // against a long leg in the leg's true direction; and (ii) directed so that the corner
+        // is PLANAR: a LEVEL radial leg leaves the osculating plane of the helix at the fillet's
+        // cut by the helix's turn over the tangent length (dAz*tan(alpha): 2-4 mrad), and the
+        // fillet then has to absorb the height difference with an S-bow that tilts towards the
+        // axial siblings (boost: 3.68 um certified). So the leg is the direction in the plane of
+        // the cut's tangent line and the attach point (the osculating plane there, to the torsion
+        // cubic) that has no tangential component -- the one direction in that plane which the
+        // (r, y) route can carry exactly -- so tangent, leg and chord are coplanar and ONE arc
+        // of the bend radius is the exact fillet, with no tilt towards the siblings at all. The
+        // cut depends on Lf and Lf on the direction; the fixpoint converges in a few rounds.
+        // Returned as the elbow's offset from the attach in the route plane (dr along the route's
+        // x direction, dy axial); (2*absorbTol, 0) when the lead has no helix or no fillet fits
+        // (that slot is refused by leadPrims3D).
+        struct AttachLeg { double dr, dy; };
+        auto attachLegFor = [&](const Vert& L, double c, const PlanePt& att, double dir) {
+            AttachLeg leg{2.0 * L.absorbTol, 0.0};
+            const auto helix = ownHelixOf(L, c);
+            if (!helix) return leg;
+            const double azL = kPlaneAz + c;
+            const gp_XYZ rhat(dir * std::cos(azL), 0.0, -dir * std::sin(azL));
+            const gp_XYZ phat(-std::sin(azL), 0.0, -std::cos(azL));
+            double ur = 1.0, uy = 0.0, len = leg.dr;
+            for (int it = 0; it < 8; ++it) {
+                const gp_Pnt P0 = liftedPt(L, att.x, att.y, c);
+                const gp_Pnt P1 = liftedPt(L, att.x + dir * len * ur, att.y + len * uy, c);
+                gp_Vec d(P0, P1);
+                if (d.Magnitude() < 1e-12) return leg;
+                d.Normalize();
+                const gp_Pnt Pfar = P0.Translated(d * (len + 50.0 * L.absorbTol));
+                Primitive sg;
+                sg.kind = Primitive::SEG;
+                sg.isLead = true;
+                sg.label = std::string(L.entrance ? "entrance" : "exit") + " lead seg 0";
+                sg.seg = L.entrance ? Seg{Pfar, P0} : Seg{P0, Pfar};
+                std::vector<Primitive> chain;
+                if (L.entrance) { chain.push_back(sg); chain.push_back(*helix); }
+                else            { chain.push_back(*helix); chain.push_back(sg); }
+                try {
+                    filletTerminalCorners(chain, kRoundCornerBendFactor * L.rwEmit, L.rwEmit,
+                                          conductors[L.ci].winding + " (fan, attach leg)");
+                }
+                catch (const std::runtime_error&) {
+                    return leg;
+                }
+                double Lf = 0.0;
+                const Primitive* cutHelix = nullptr;
+                for (const auto& pr : chain) {
+                    if (pr.kind == Primitive::SEG)
+                        Lf = L.entrance ? pr.seg.b.Distance(P0) : pr.seg.a.Distance(P0);
+                    if (pr.kind == Primitive::SPIRAL) cutHelix = &pr;
+                }
+                if (cutHelix == nullptr) return leg;
+                // The osculating plane at the cut: the cut's tangent line and the attach.
+                const Spiral& hs = cutHelix->spiral;
+                const double azCut = L.entrance ? hs.az0 : hs.az1;
+                const double yp = (hs.y1 - hs.y0) / (hs.az1 - hs.az0);
+                const gp_Pnt Pc(hs.cx + hs.r0 * std::cos(azCut), hs.y0 + yp * (azCut - hs.az0),
+                                hs.cz - hs.r0 * std::sin(azCut));
+                gp_Vec T1(-hs.r0 * std::sin(azCut), yp, -hs.r0 * std::cos(azCut));
+                (void)Pc;
+                // The osculating plane at the cut: tangent and PRINCIPAL NORMAL (radial). (The
+                // chord to the attach leaves it by the torsion cubic -- nm -- and a plane built on
+                // the chord tilts the departure towards the axial sibling by that much.)
+                const gp_Vec N1(-std::cos(azCut), 0.0, std::sin(azCut));
+                gp_Vec m = T1.Crossed(N1);
+                if (m.Magnitude() < 1e-30) return leg;
+                m.Normalize();
+                gp_Vec u = m.Crossed(gp_Vec(phat));   // in the plane, no tangential component
+                if (u.Magnitude() < 1e-30) return leg;
+                u.Normalize();
+                if (u.Dot(gp_Vec(rhat)) < 0) u.Reverse();
+                const double nur = u.Dot(gp_Vec(rhat)), nuy = u.Y();
+                const double nlen = Lf + 2.0 * L.absorbTol;
+                const bool done = std::abs(nlen - len) < 1e-12 && std::abs(nuy - uy) < 1e-15 &&
+                                  std::abs(nur - ur) < 1e-15;
+                len = nlen; ur = nur; uy = nuy;
+                leg = AttachLeg{len * ur, len * uy};
+                if (done) break;
+            }
+            return leg;
+        };
+        // The waypoints pushPlaneSegs will sweep for lead L at slot c, attach first: the emitter's
+        // attach move (entranceAttachY / exitAttachY), its vertical, extendBorder and its kink
+        // absorption -- everything before the elbow.
+        auto dippedRoute = [&](const Vert& L, double c) -> std::vector<PlanePt> {
+            std::vector<PlanePt> wp = L.route;
+            if (wp.empty()) return wp;
+            if (L.hasAttachSeg && L.attachAdvance != 0.0) {
+                // The reference crossing: the plane for an entrance; for an exit the previous
+                // station's crossing, which is a return's slot when a return lands there.
+                double cRef = 0.0;
+                if (!L.entrance && L.attachStation >= 2)
+                    for (size_t k = 0; k < verts.size(); ++k)
+                        if (verts[k].kind == 1 && verts[k].ci == L.ci &&
+                            verts[k].trans + 2 == L.attachStation && azAssigned[k])
+                            cRef = az[k];
+                if (std::abs(c - cRef) > 1e-9)
+                    wp.front().y = L.attachY + L.attachAdvance * ((c - cRef) / kTwoPi);
+                // moving the attach must not SLANT the run: a vertical at the attach radius
+                if (wp.size() == 2 && std::abs(wp.front().y - wp.back().y) > 1e-7)
+                    wp.insert(wp.begin() + 1, PlanePt{wp.front().x, wp.back().y});
+            }
+            wp.back().x = std::max(wp.back().x, tipRadiusFor(L.ci));   // extendBorder
+            return absorbLeadWaypoints(wp, L.absorbTol);
+        };
+        // The attach leg lead L keeps at slot c (nullopt when its route needs no elbow), as the
+        // emitter is handed it (leadLegIn / leadLegOut).
+        auto attachLegOf = [&](const Vert& L, double c) -> std::optional<AttachLeg> {
+            const std::vector<PlanePt> wp = dippedRoute(L, c);
+            if (L.rectWire || wp.size() < 2) return std::nullopt;
+            const PlanePt att = wp[0], nb = wp[1];
+            const double dir = nb.x > att.x ? 1.0 : -1.0;
+            if (std::abs(att.y - nb.y) <= 1e-12 || std::abs(nb.x - att.x) <= 3.0 * L.absorbTol)
+                return std::nullopt;
+            return attachLegFor(L, c, att, dir);
+        };
+        // ...plus the elbow, as pushPlaneSegs draws it: the row-hold elbow (climb first, then the
+        // row) under the plane anchor / row-hold switches; otherwise the LEVEL attach leg (level
+        // first at the attach height, the climb after it) -- see the emitter for why a lead may
+        // never climb at its attach.
+        auto emittedRoute = [&](const Vert& L, double c) -> std::vector<PlanePt> {
+            std::vector<PlanePt> wp = dippedRoute(L, c);
+            if (!L.rectWire && wp.size() >= 2) {
+                const PlanePt att = wp[0], nb = wp[1];
+                const double dir = nb.x > att.x ? 1.0 : -1.0;
+                if (std::abs(att.y - nb.y) > 1e-12 && std::abs(nb.x - att.x) > 3.0 * L.absorbTol) {
+                    if (holdRowElbow) {
+                        wp.insert(wp.begin() + 1, PlanePt{att.x + dir * 2.0 * L.absorbTol, nb.y});
+                    }
+                    else {
+                        const AttachLeg leg = attachLegFor(L, c, att, dir);
+                        wp.insert(wp.begin() + 1, PlanePt{att.x + dir * leg.dr, att.y + leg.dy});
+                    }
+                }
+            }
+            return wp;
+        };
+        // The run's radius: the waypoint before the tip (the elbow when the route has one, MKF's
+        // drawn corner or the attach otherwise) -- what pushPlaneSegs keeps the world X of.
+        runRadiusOf = [&](const Vert& L, double c) {
+            const std::vector<PlanePt> wp = emittedRoute(L, c);
+            if (wp.size() < 2) return L.r;
+            return wp[wp.size() - 2].x;
+        };
+        auto segsOfRoute = [](const std::vector<PlanePt>& wp) {
+            std::vector<std::array<double, 4>> segs;
+            for (size_t i2 = 0; i2 + 1 < wp.size(); ++i2)
+                segs.push_back({wp[i2].x, wp[i2].y, wp[i2 + 1].x, wp[i2 + 1].y});
+            return segs;
+        };
+        // The emitted 3D centreline of lead L at slot c: waypoints on the slot's radial ray, the
+        // tip on the common tip plane at the neighbour's world X (pushPlaneSegs' straight run).
+        // THE EMITTED LEAD, FILLETED (boost_inductor_complete, 2026-09-02): the lead's segments at
+        // slot c -- waypoints on the slot's radial ray, each lifted at its own radius exactly as
+        // pushPlaneSegs lifts it, the tip on the common tip plane at the neighbour's world X --
+        // joined to the helix of the lead's own wrap by the SAME tangent biarc the emitter draws
+        // (TerminalFillet on the same two primitives, the same bend), so what the fan measures
+        // is the centreline that is swept: the two arcs, the shortened lead, the rest of the run.
+        // The wrap helix itself is the lead's own copper and is not returned. Empty when no
+        // fillet fits at this slot: the emitter would refuse the corner, so the slot is infeasible.
+        auto leadPrims3D = [&](const Vert& L, double c) -> std::optional<std::vector<Primitive>> {
+            const std::vector<PlanePt> wp = emittedRoute(L, c);
+            const double zo = conductorZoff[L.ci];
+            const double azL = kPlaneAz + c;
+            std::vector<gp_Pnt> pts;
+            for (const auto& q : wp) pts.push_back(liftedPt(L, q.x, q.y, c));
+            (void)azL;
+            if (!L.rectWire && pts.size() > 1)
+                pts.back() = gp_Pnt(pts[pts.size() - 2].X(), wp.back().y,
+                                    -(tipRadiusFor(L.ci) + zo));
+            std::vector<Primitive> segs;
+            for (size_t i2 = 0; i2 + 1 < pts.size(); ++i2) {
+                if (pts[i2].Distance(pts[i2 + 1]) < 1e-12) continue;
+                Primitive pr;
+                pr.kind = Primitive::SEG;
+                pr.seg = {pts[i2], pts[i2 + 1]};
+                pr.isLead = true;
+                pr.label = std::string(L.entrance ? "entrance" : "exit") + " lead seg " +
+                           std::to_string(segs.size());
+                segs.push_back(pr);
+            }
+            if (L.rectWire || L.kind != 0 || segs.empty()) return segs;
+            const auto helix = ownHelixOf(L, c);
+            if (!helix) return segs;
+            std::vector<Primitive> chain;
+            if (L.entrance) {
+                // Travel order: tip -> attach -> helix (the lead's last SEG ends at the attach).
+                for (size_t i2 = segs.size(); i2-- > 0;) {
+                    Primitive pr = segs[i2];
+                    std::swap(pr.seg.a, pr.seg.b);
+                    chain.push_back(pr);
+                }
+                chain.push_back(*helix);
+            }
+            else {
+                chain.push_back(*helix);
+                for (const auto& pr : segs) chain.push_back(pr);
+            }
+            try {
+                filletTerminalCorners(chain, kRoundCornerBendFactor * L.rwEmit, L.rwEmit,
+                                      conductors[L.ci].winding + " (fan)");
+            }
+            catch (const std::runtime_error& e) {
+                if (std::getenv("MVB_LEAD_DIAG")) {
+                    std::fprintf(stderr, "[fan-fillet] ci=%zu %s slot=%.4f deg: %s\n",
+                                 (size_t)L.ci, L.entrance ? "entrance" : "exit", c * 180.0 / kPi,
+                                 e.what());
+                    for (const auto& pr : chain) {
+                        if (pr.kind == Primitive::SEG)
+                            std::fprintf(stderr, "[fan-fillet]    SEG '%s' (%.6f,%.6f,%.6f)->(%.6f,%.6f,%.6f) len=%.6f mm\n",
+                                         pr.label.c_str(), pr.seg.a.X()*1e3, pr.seg.a.Y()*1e3, pr.seg.a.Z()*1e3,
+                                         pr.seg.b.X()*1e3, pr.seg.b.Y()*1e3, pr.seg.b.Z()*1e3,
+                                         pr.seg.a.Distance(pr.seg.b)*1e3);
+                        else if (pr.kind == Primitive::SPIRAL)
+                            std::fprintf(stderr, "[fan-fillet]    SPIRAL '%s' az=[%.4f,%.4f] deg y=[%.6f,%.6f] r=%.6f cz=%.6f\n",
+                                         pr.label.c_str(), pr.spiral.az0*180/kPi, pr.spiral.az1*180/kPi,
+                                         pr.spiral.y0*1e3, pr.spiral.y1*1e3, pr.spiral.r0*1e3, pr.spiral.cz*1e3);
+                    }
+                }
+                return std::nullopt;
+            }
+            std::vector<Primitive> out;
+            for (const auto& pr : chain)
+                if (pr.kind != Primitive::SPIRAL) out.push_back(pr);
+            return out;
+        };
+        leadPairDist3D = [&](const Vert& A, double cA, const Vert& B, double cB) {
+            const auto pa = leadPrims3D(A, cA), pb = leadPrims3D(B, cB);
+            if (!pa || !pb) return 0.0;   // no fillet fits: the slot is infeasible
+            // Proven at the coated envelope by the certified engine (the arcs are ARC3s, the
+            // runs SEGs -- both exact there); the distance itself is only reported.
+            const double clr = A.rw + B.rw;
+            for (const auto& a : *pa)
+                for (const auto& b : *pb) {
+                    const cert::Verdict v =
+                        cert::provePairClears(a, b, clr - cert::kCoordinateGridHalf);
+                    if (!v.clears) {
+                        if (std::getenv("MVB_LEAD_DIAG") && azCandSet.size() && explainPairs) {
+                            const gp_Pnt qa = cert::evalPrim(a, v.tA), qb = cert::evalPrim(b, v.tB);
+                            std::fprintf(stderr,
+                                         "      pair: ci=%zu '%s' (%.6f,%.6f,%.6f) vs ci=%zu '%s' (%.6f,%.6f,%.6f): %.9f mm\n",
+                                         (size_t)A.ci, a.label.c_str(), qa.X()*1e3, qa.Y()*1e3, qa.Z()*1e3,
+                                         (size_t)B.ci, b.label.c_str(), qb.X()*1e3, qb.Y()*1e3, qb.Z()*1e3,
+                                         v.violationUB * 1e3);
+                        }
+                        return v.violationUB;
+                    }
+                }
+            return clr;
+        };
+        // Lead L (its emitted segments at slot c) against the wrap leaving row R, PROVEN at
+        // clearance clr by the certified engine -- the very object the gate measures.
+        auto leadWrapClear = [&](const WireRow& R, const Vert& L, double c, double clr,
+                                 const std::vector<Primitive>& leadPrims, std::string* why) {
+            if (R.r + R.rwCoat < L.r - L.rw - 1e-12) return true;   // inside the attach: never crossed
+            const Primitive helix = wrapHelixOf(R);
+            if (L.rectWire || R.rect) {
+                // RECTANGULAR WIRE (03_buck_inductor_pq3230_n95, 2026-09-02): the round capsule at
+                // the coated envelope is the wrong criterion -- a flat 3.1 x 0.6 wire's siblings
+                // sit 0.6 apart axially, which a capsule reads as 0.6*cos(alpha) (280 nm short).
+                // The gate judges rect pairs on their BARE section boxes, axial and in-plane
+                // separately, credited with the sampling sag; the fan does exactly the same.
+                std::vector<gp_Pnt> pa;
+                for (const auto& sg : leadPrims)
+                    for (const auto& q : samplePrim(sg, L.rwEmit)) pa.push_back(q);
+                const std::vector<gp_Pnt> pb = samplePrim(helix, R.rwEmit);
+                if (pa.empty() || pb.empty()) return true;
+                const double d = polyPolyDistance(pa, pb);
+                const double wL = L.rectWire ? L.condW : 2.0 * L.rwBare, hL = L.rectWire ? L.condH : 2.0 * L.rwBare;
+                const double wR = R.rect ? R.condW : 2.0 * R.rw, hR = R.rect ? R.condH : 2.0 * R.rw;
+                if (d >= 0.5 * std::hypot(wL + hL, wR + hR)) return true;
+                gp_Pnt ca, cb;
+                double best = std::numeric_limits<double>::max();
+                for (const auto& va : pa)
+                    for (const auto& vb : pb) {
+                        const double dd = va.SquareDistance(vb);
+                        if (dd < best) { best = dd; ca = va; cb = vb; }
+                    }
+                const gp_XYZ sep = cb.XYZ() - ca.XYZ();
+                const double axialSep = std::abs(sep.Y());
+                const double inPlaneSep = std::sqrt(std::max(0.0, sep.SquareModulus() - axialSep * axialSep));
+                const double sag = samplingSag(L.rwEmit) + samplingSag(R.rwEmit);
+                const bool overlap = axialSep < (0.5 * hL + 0.5 * hR - sag) &&
+                                     inPlaneSep < (0.5 * wL + 0.5 * wR - sag);
+                if (overlap && why != nullptr) {
+                    std::ostringstream w;
+                    w << "emitted rect lead at " << c * 180.0 / kPi << " deg overlaps "
+                      << conductors[R.ci].winding << " (ci=" << R.ci << ") wrap leaving station "
+                      << R.station << " on bare section boxes (axial " << axialSep * 1e3
+                      << " mm, in-plane " << inPlaneSep * 1e3 << " mm)";
+                    *why = w.str();
+                }
+                return !overlap;
+            }
+            const double hLo = std::min(helix.spiral.y0, helix.spiral.y1) - clr;
+            const double hHi = std::max(helix.spiral.y0, helix.spiral.y1) + clr;
+            for (const auto& sg : leadPrims) {
+                double sLo, sHi;
+                if (sg.kind == Primitive::SEG) {
+                    sLo = std::min(sg.seg.a.Y(), sg.seg.b.Y());
+                    sHi = std::max(sg.seg.a.Y(), sg.seg.b.Y());
+                }
+                else {   // ARC3 (a terminal fillet arc): within one bend radius of its centre
+                    const double reach = sg.arc.v0.Modulus();
+                    sLo = sg.arc.c.Y() - reach;
+                    sHi = sg.arc.c.Y() + reach;
+                }
+                if (sHi < hLo || sLo > hHi) continue;
+                const cert::Verdict v =
+                    cert::provePairClears(sg, helix, clr - cert::kCoordinateGridHalf);
+                if (v.clears) continue;
+                if (why != nullptr) {
+                    const gp_Pnt qa = cert::evalPrim(sg, v.tA), qb = cert::evalPrim(helix, v.tB);
+                    std::ostringstream w;
+                    w.precision(9);
+                    w << "emitted lead at " << c * 180.0 / kPi << " deg ('" << sg.label
+                      << "') comes within " << v.violationUB * 1e3 << " mm ("
+                      << (clr - v.violationUB) * 1e9 << " nm inside) of "
+                      << conductors[R.ci].winding << " (ci="
+                      << R.ci << ") wrap leaving station " << R.station << " (r=" << R.r * 1e3
+                      << " mm, " << R.adv * 1e3 << " mm/rev) against its " << clr * 1e3
+                      << " mm coated envelope: lead point (" << qa.X() * 1e3 << ","
+                      << qa.Y() * 1e3 << "," << qa.Z() * 1e3 << ") mm vs wrap point ("
+                      << qb.X() * 1e3 << "," << qb.Y() * 1e3 << "," << qb.Z() * 1e3 << ") mm";
+                    *why = w.str();
+                }
+                return false;
+            }
+            return true;
+        };
         auto leadRowsClear = [&](const Vert& L, double c, std::string* why = nullptr) {
             if (L.kind == 1) return true;   // dragbacks keep the drift-window model
-            for (const auto& R : rows) {
+            if (L.kind == 2) {
                 // ABT #831: a LINK is scoped the OPPOSITE way to a lead. On the plane it is safe
                 // by construction (MKF's stations there are exactly one wire apart), but the
                 // moment the fan moves it aside it runs under wraps that are descending -- which
                 // is the whole reason it moved. Its OWN conductor's rows are the wrap it leaves
                 // and the turn it joins, so those are exempt; every other conductor's copper,
-                // sibling parallels included, is not.
-                if (L.kind == 2) {
+                // sibling parallels included, is not. (Links keep the crossing-point model: they
+                // are level radial segments, drawn exactly as modelled.)
+                for (const auto& R : rows) {
                     if (R.ci == L.ci) continue;
+                    if (!rowVertGap(R, 0.0, L, c, why)) return false;
                 }
-                // CROSS-WINDING rows only for a LEAD. Widening this to a winding's own wraps was
-                // tried under ABT #830 (with the exemption made exact -- only the station the
-                // lead attaches to) and is NOT viable: 06_llc's fan then had no feasible slot at
-                // all ("the terminal leads ... cannot all be laid out clear"), while 17_cllc --
-                // whose lead meets its own DRAGBACK segment and a rect-column FACE, neither of
-                // which is a round-wrap row -- was unchanged. This model's coverage stops at the
-                // wraps; across windings its crossing-point argument is exact.
-                else if (conductors[R.ci].winding == L.wname) continue;
-                if (!rowVertGap(R, 0.0, L, c, why)) return false;
+                return true;
+            }
+            // CROSS-WINDING wraps only for a LEAD. Widening this to a winding's own wraps was
+            // tried under ABT #830 (with the exemption made exact -- only the station the lead
+            // attaches to) and is NOT viable: 06_llc's fan then had no feasible slot at all,
+            // while 17_cllc -- whose lead meets its own DRAGBACK segment and a rect-column FACE,
+            // neither of which is a round-wrap row -- was unchanged. Sibling parallels stay
+            // separated by MKF's rows and need()/clears() between the leads themselves.
+            // SIBLING PARALLELS' WRAPS ARE CHECKED TOO (boost_inductor_complete, 2026-09-02). The
+            // premise above -- "sibling parallels stay separated by MKF's rows" -- holds for the
+            // helices, which MKF stacks at exactly od/cos(alpha), but not for a lead that leaves
+            // its helix in any direction but the tangent: the sibling's tail passes the attach at
+            // exactly the coated envelope, and the fan never measured it. Primary p0's exit lead
+            // was 80 nm inside p1's terminal stub at the slot the fan handed it. Only the lead's
+            // OWN conductor keeps the soft, station-exempt check (leadOwnRowsSoft).
+            const auto prims = leadPrims3D(L, c);
+            if (!prims) {
+                if (why != nullptr) *why = "no terminal fillet fits the corner at this slot";
+                return false;
+            }
+            // THE FLANGES (boost_inductor_complete, 2026-09-02): the lead's emitted primitives
+            // and the pitch-true start (end) of its own wrap at this slot must keep the coated
+            // envelope inside the winding window wherever they lie within the flanges' reach.
+            // MKF's stations do; a dip below a first turn that sits on the flange is not
+            // available -- the slot has to be where the wrap's true height is inside the window.
+            if (const auto& wb = windowBoundsPerPath[L.ci]) {
+                std::vector<Primitive> all = *prims;
+                if (const auto helix = ownHelixOf(L, c)) all.push_back(*helix);
+                for (const auto& pr : all) {
+                    double lo, hi;
+                    if (!cert::primAxialExtentInReach(pr, wb->axisX, wb->outerR, lo, hi)) continue;
+                    const double below = wb->lo - (lo - L.rwAxialCoat), above = (hi + L.rwAxialCoat) - wb->hi;
+                    const double depth = std::max(below, above);
+                    if (depth > cert::kCoordinateGridHalf) {
+                        if (why != nullptr) {
+                            std::ostringstream w;
+                            w.precision(9);
+                            w << "at " << c * 180.0 / kPi << " deg '" << pr.label << "' reaches "
+                              << (below > above ? "below" : "above") << " the winding window by "
+                              << depth * 1e6 << " um (flange face at y = "
+                              << (below > above ? wb->lo : wb->hi) * 1e3 << " mm)";
+                            *why = w.str();
+                        }
+                        return false;
+                    }
+                }
+            }
+            for (const auto& R : rows) {
+                if (R.cHi < 1e29) continue;   // the LEAVING row carries the wrap's helix
+                if (R.ci == L.ci) continue;
+                if (!leadWrapClear(R, L, c, L.rw + R.rwCoat, *prims, why)) return false;
             }
             return true;
         };
-        // ABT #830/#839: A LEAD AGAINST ITS OWN CONDUCTOR'S ROWS, AT THE ENAMEL CRITERION.
-        //
-        // MKF reserves a terminal lead's row exactly one coated OD from the neighbouring
-        // station row -- zero margin by design -- and the emitted lead is NOT the flat row: its
-        // attach sits at the TURN (up to a whole absorbed stub above the row) and the pitch-true
-        // dip moves that attach with the slot. On 06_llc the entrance lead's absorbed diagonal
-        // rises 26 um toward its attach and crosses under its own conductor's rows (the
-        // over-dragback wrap, the layer link's end, the exit stub) 4-5 um inside the COATED
-        // envelope -- which is what the certified enamel gate enforces, while everything the fan
-        // checks for this class is bare-criterion or skips same-winding copper outright.
-        //
-        // So the one honest addition: evaluated with the MEMBER'S DIPPED ROUTE at the candidate
-        // slot (the dip is the fan's own model -- without it the requirement is wildly
-        // overestimated, because moving off-plane lowers the attach and buys most of the
-        // clearance back), against SAME-CONDUCTOR rows only (sibling parallels stay separated
-        // by MKF's rows and the existing models; widening to the whole winding was tried under
-        // ABT #830 and left 06_llc with no feasible slot at all). Rows within one station of
-        // the attach are the copper the lead legitimately joins -- the gate's own
-        // |ordinal diff| <= 1 exemption, mirrored. SOFT: a design with no coated-clear slot
-        // packs exactly as today and the gate keeps the final word.
-        auto dippedSegsAt = [&](const Vert& L, double c) {
-            std::vector<std::array<double, 4>> segs2 = L.segs;
-            if (L.hasAttachSeg && !segs2.empty() && L.attachAdvance != 0.0) {
-                auto seg = L.attachSegIdeal;
-                const double dip = L.attachAdvance * (std::abs(c) / kTwoPi);
-                seg[1] += L.entrance ? -dip : dip;
-                segs2.front() = seg;
-            }
-            return segs2;
-        };
+        // ABT #830/#839: A LEAD AGAINST ITS OWN CONDUCTOR'S WRAPS, AT THE ENAMEL CRITERION.
+        // Same exact model; wraps within one station of the attach are the copper the lead
+        // legitimately joins -- the gate's own |ordinal diff| <= 1 exemption, mirrored. SOFT: a
+        // design with no coated-clear slot packs exactly as today and the gate keeps the final
+        // word (widening to the whole winding was tried under ABT #830 and left 06_llc with no
+        // feasible slot at all).
         auto leadOwnRowsSoft = [&](const Vert& L, double c, std::string* why = nullptr) {
             if (L.kind != 0) return true;
-            const auto segs2 = dippedSegsAt(L, c);
+            const auto prims = leadPrims3D(L, c);
+            if (!prims) return false;
             for (const auto& R : rows) {
-                if (R.ci != L.ci) continue;
+                if (R.ci != L.ci || R.cHi < 1e29) continue;
                 const size_t dS = R.station > L.attachStation ? R.station - L.attachStation
                                                               : L.attachStation - R.station;
                 if (dS <= 1) continue;
-                if (!rowVertGap(R, 0.0, L, c, why, &segs2, L.rw + R.rwCoat)) return false;
+                if (!leadWrapClear(R, L, c, L.rw + R.rwCoat, *prims, why)) return false;
             }
             return true;
         };
+        // Every lead's modelled route starts as the emitted route AT THE PLANE (the anchor every
+        // block tries first); the dip refinement below re-derives it at the assigned slots.
+        for (auto& v : verts) {
+            if (v.kind != 0 || v.route.empty()) continue;
+            v.segs = segsOfRoute(emittedRoute(v, 0.0));
+        }
         // CENTRE-OUT symmetric packing (Alf, 2026-08-05): every vertical takes the FEASIBLE
         // azimuth CLOSEST TO THE STATION PLANE (0 deg), so the fan hugs the plane and only
         // spreads as far as real conflicts force it -- the bump treatment (one raised region,
@@ -7587,11 +9235,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
             }
         }
-        std::vector<double> az(verts.size(), 0.0);
-        std::vector<char> azAssigned(verts.size(), 0);
-        // ABT #841: the slot PERMUTATION this pack produced, as a signature -- see the proof
-        // obligation at the call sites.
-        std::string permSig;
+        // az / azAssigned / permSig are declared above need(): the route models read the
+        // slots already handed out (the tip plane depends on the dragback columns, a row's
+        // copper extent on the lead or return that carries its crossing).
         auto runPack = [&]() {
         std::fill(az.begin(), az.end(), 0.0);
         std::fill(azAssigned.begin(), azAssigned.end(), 0);
@@ -7759,6 +9405,34 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (!azAssigned[j] && verts[j].kind == 0 && verts[j].wname == verts[k].wname &&
                     verts[j].entrance == verts[k].entrance)
                     group.push_back(j);
+            // LANE ORDER FIRST (pushpull, 2026-09-02). The pack used to certify member g on lane g
+            // and THEN permute the bundle's slots by Alf's rule (lower turn furthest round; the
+            // bridging lead where the sibling's wrap has already ended -- see the post-pack
+            // permutation below). Permuting is separation-neutral between the leads themselves,
+            // but a lead's row crossings and its pitch-true dip are functions of ITS OWN slot: on
+            // the pushpull Secondary 1 p1's short exit was certified at the plane and then handed
+            // the 8.9 deg lane, where its dip runs it into Secondary 2 p1's final wrap. So the
+            // bundle is ordered by the same pass-stable key BEFORE the anchor search and every
+            // member is certified on the lane it will actually be emitted on; the permutation
+            // below is then the identity. Same-radius bundles only, as the permutation itself.
+            if (group.size() >= 2) {
+                bool sameRadiusBlock = true;
+                for (size_t j : group)
+                    if (std::abs(verts[j].r - verts[group[0]].r) > verts[group[0]].rw)
+                        sameRadiusBlock = false;
+                if (sameRadiusBlock) {
+                    const bool entranceBlock = verts[group[0]].entrance;
+                    std::stable_sort(group.begin(), group.end(), [&](size_t a, size_t b) {
+                        const double spanA = dippedPermKeys ? verts[a].y1 - verts[a].y0
+                                                            : verts[a].y1Ideal - verts[a].y0Ideal;
+                        const double spanB = dippedPermKeys ? verts[b].y1 - verts[b].y0
+                                                            : verts[b].y1Ideal - verts[b].y0Ideal;
+                        if (std::abs(spanA - spanB) > 1e-12)
+                            return entranceBlock ? spanA < spanB : spanA > spanB;
+                        return verts[a].attachY < verts[b].attachY;
+                    });
+                }
+            }
             // Intra-block offsets, IN X (ABT #685, Alf 2026-08-16). The block's members are
             // terminal leads, whose runs come out parallel at constant world X (see clears()
             // above), so what has to be one wire apart is their X — not their azimuth. The
@@ -7794,28 +9468,126 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // whole block on +x with member 0 furthest out and the LAST member's edge grazing
             // x = 0; anchoring at the plane with the old minus sign would have sent the
             // siblings across to -x instead.)
-            auto azMember = [&](size_t g, double c) {
-                const double x0 = -verts[group[0]].r * std::sin(c);
-                const double s = (x0 + xoff[g]) / verts[group[g]].r;
-                return std::abs(s) > 1.0 ? kNaN : -std::asin(s);
+            // LANES ON BOTH THE ATTACH AND THE RUN (06_llc / 23_illc / 11_pushpull /
+            // pushpull_transformer_complete, 2026-09-02). A member's lead has two places where
+            // it lies side by side with its neighbour's: the attach (its stub, its vertical, its
+            // fillet -- at the attach radius) and the run (parallel to Z at the world X of the
+            // waypoint before the tip: the elbow one leg out, or MKF's drawn corner, or the attach
+            // itself). The legs are radial, so the two separations scale differently with the
+            // slot, and a member with an elbow runs (r + leg)/r further out than one without:
+            // spaced at the attach alone, 06's runs came 0.675 mm apart against 0.8; spaced on
+            // the run alone, pushpull's sibling stub ended 1.64 mm from the other member's
+            // vertical against 2.023. So each member takes the slot at which BOTH its attach and
+            // its run are one lane step from the previous member's -- the further-out of the two
+            // -- and the pair is then PROVEN in 3D (blockHardOk).
+            auto slotAtX = [&](const Vert& v, double X, bool run) {
+                double c = 0.0;
+                for (int it = 0; it < 8; ++it) {
+                    const double r = run ? ((v.kind == 0 && runRadiusOf) ? runRadiusOf(v, c) : v.r) : v.r;
+                    const double sn = X / r;
+                    if (std::abs(sn) > 1.0) return kNaN;
+                    const double next = -std::asin(sn);
+                    if (std::abs(next - c) < 1e-14) return next;
+                    c = next;
+                }
+                return c;
             };
+            // ...and where the two members' EMITTED leads -- fillets included -- still come
+            // closer than their coated envelopes at that lane (a fillet bows sideways off its
+            // leg: boost's p1 vertical-to-helix corner by 7.7 um towards p0's lane), the member
+            // moves outward to the exact boundary where the pair is proven clear (bisection to
+            // 1e-12 rad). The lane is the inner bound (MKF's one-OD side-by-side datum); the
+            // proof decides. Cached per member as the bracket's warm start, re-proven each call.
+            std::vector<double> extraOut(group.size(), 0.0);
+            auto azMember = [&](size_t g, double c) {
+                double cg = c;
+                for (size_t h = 1; h <= g; ++h) {
+                    const Vert& prev = verts[group[h - 1]];
+                    const Vert& me = verts[group[h]];
+                    const double step = xoff[h] - xoff[h - 1];
+                    const double cAtt = slotAtX(me, xAt(prev, cg) + step, false);
+                    const double cRun = slotAtX(me, xRunAt(prev, cg) + step, true);
+                    if (std::isnan(cAtt) || std::isnan(cRun)) return kNaN;
+                    const double cPrev = cg;
+                    const double cLane = std::min(cAtt, cRun);
+                    auto ok = [&](double cm) { return clears(prev, cPrev, me, cm); };
+                    if (ok(cLane)) { cg = cLane; extraOut[h] = 0.0; continue; }
+                    // outward bracket: [hi = fails, lo = passes]
+                    double hi = cLane;
+                    double step2 = extraOut[h] > 0.0 ? extraOut[h] : kPi / 720.0;
+                    double lo = cLane - step2;
+                    bool found = false;
+                    for (int it = 0; it < 12; ++it, step2 *= 2.0, lo = cLane - step2) {
+                        if (lo < cLane - kPi / 2.0) break;
+                        if (ok(lo)) { found = true; break; }
+                        hi = lo;
+                    }
+                    if (!found) return kNaN;
+                    for (int it = 0; it < 60 && hi - lo > 1e-12; ++it) {
+                        const double mid = 0.5 * (lo + hi);
+                        if (ok(mid)) lo = mid; else hi = mid;
+                    }
+                    cg = lo;
+                    extraOut[h] = cLane - lo;
+                }
+                return cg;
+            };
+            // The anchor at which member g sits at slot t (azMember inverted by bisection: member
+            // slots decrease monotonically with the anchor).
             auto anchorFor = [&](size_t g, double t) {
-                const double xg = -verts[group[g]].r * std::sin(t);
-                const double s = (xg - xoff[g]) / verts[group[0]].r;
-                return std::abs(s) > 1.0 ? kNaN : -std::asin(s);
+                if (g == 0) return t;
+                double lo = t - kPi / 2.0, hi = t;
+                if (std::isnan(azMember(g, hi)) || azMember(g, hi) < t) {
+                    // member g at anchor t already sits beyond t: no anchor puts it AT t below t
+                    double h2 = t, l2 = t;
+                    for (int it = 0; it < 8 && (std::isnan(azMember(g, h2)) || azMember(g, h2) < t); ++it)
+                        h2 += kPi / 16.0;
+                    if (std::isnan(azMember(g, h2)) || azMember(g, h2) < t) return kNaN;
+                    lo = l2; hi = h2;
+                }
+                for (int it = 0; it < 60 && hi - lo > 1e-13; ++it) {
+                    const double mid = 0.5 * (lo + hi);
+                    const double cm = azMember(g, mid);
+                    if (std::isnan(cm) || cm < t) lo = mid; else hi = mid;
+                }
+                return hi;
             };
             const double blockSpan = group.empty() ? 0.0 : (azMember(group.size() - 1, 0.0) -
                                                             azMember(0, 0.0));
-            auto blockHardOk = [&](double c) {
+            // The block's candidate slots, visible to the route models while the anchor is
+            // tested (crossingSlotOf; see azCand).
+            auto setBlockCand = [&](double c) {
                 for (size_t g = 0; g < group.size(); ++g) {
                     const double cg = azMember(g, c);
-                    if (std::isnan(cg)) return false;
-                    if (!leadRowsClear(verts[group[g]], cg)) return false;
-                    for (size_t j = 0; j < verts.size(); ++j)
-                        if (azAssigned[j] && !clears(verts[j], az[j], verts[group[g]], cg))
-                            return false;
+                    azCandSet[group[g]] = !std::isnan(cg);
+                    azCand[group[g]] = std::isnan(cg) ? 0.0 : cg;
                 }
-                return true;
+            };
+            auto clearBlockCand = [&]() {
+                for (size_t g = 0; g < group.size(); ++g) azCandSet[group[g]] = 0;
+            };
+            auto blockHardOk = [&](double c) {
+                setBlockCand(c);
+                bool ok = true;
+                for (size_t g = 0; g < group.size() && ok; ++g) {
+                    const double cg = azMember(g, c);
+                    if (std::isnan(cg)) { ok = false; break; }
+                    if (!leadRowsClear(verts[group[g]], cg)) { ok = false; break; }
+                    for (size_t j = 0; j < verts.size(); ++j)
+                        if (azAssigned[j] && !clears(verts[j], az[j], verts[group[g]], cg)) {
+                            ok = false;
+                            break;
+                        }
+                    // The block's own members against each other, PROVEN (the lanes are the
+                    // candidate generator; the emitted legs and fillets are what the gate sees).
+                    for (size_t h = 0; h < g && ok; ++h) {
+                        const double ch = azMember(h, c);
+                        if (std::isnan(ch) || !clears(verts[group[h]], ch, verts[group[g]], cg))
+                            ok = false;
+                    }
+                }
+                clearBlockCand();
+                return ok;
             };
             auto blockSoftOk = [&](double c) {
                 for (size_t g = 0; g < group.size(); ++g) {
@@ -7829,12 +9601,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // ABT #839: every member's dipped route against its own conductor's rows at the
             // enamel criterion (see leadOwnRowsSoft) -- soft, like the drift windows.
             auto blockOwnRowsOk = [&](double c) {
-                for (size_t g = 0; g < group.size(); ++g) {
+                setBlockCand(c);
+                bool ok = true;
+                for (size_t g = 0; g < group.size() && ok; ++g) {
                     const double cg = azMember(g, c);
-                    if (std::isnan(cg)) return false;
-                    if (!leadOwnRowsSoft(verts[group[g]], cg)) return false;
+                    if (std::isnan(cg) || !leadOwnRowsSoft(verts[group[g]], cg)) ok = false;
                 }
-                return true;
+                clearBlockCand();
+                return ok;
             };
             bool ownRowsBinding = false;   // some anchor failed ONLY the own-rows check
             // ABT #839 (Alf, 14_dab: "redo the change for having terminals at x=0"). EXPERIMENT,
@@ -7873,8 +9647,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // clear of the block by construction; need() carries that pair, as it always
             // enforced the full clearance on top of the floor anyway.
             const double cMax = 0.0;
+            std::vector<double> tried;   // every anchor evaluated (for the boundary bisection)
+            bool bestSoft = false, bestFromSweep = false, sweeping = false;
             auto consider = [&](double c, bool withSoft) {
                 if (std::isnan(c) || c > cMax + 1e-12) return;
+                tried.push_back(c);
                 if (!blockHardOk(c)) return;
                 if (withSoft) {
                     const bool softOk = blockSoftOk(c);
@@ -7891,6 +9668,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (!have || c > best + 1e-12) {
                     best = c;
                     have = true;
+                    bestSoft = withSoft;
+                    bestFromSweep = sweeping;
                 }
             };
             // Candidate anchors: every position at which SOME member comes to rest exactly on an
@@ -7928,9 +9707,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // that everything else accepted, sweep outward for the nearest slot that clears
                 // it too. Gated on ownRowsBinding: any block the new check never touches packs
                 // exactly as before, tier fallbacks included.
-                if (tier == 0 && !have && ownRowsBinding)
+                if (tier == 0 && !have && ownRowsBinding) {
+                    sweeping = true;
                     for (int i = 1; i <= 720 && !have; ++i)
                         consider(cMax - i * (kPi / 720.0), true);
+                    sweeping = false;
+                }
             }
             if (!have) {
                 // The exact candidates are the touching positions; in X they can all be
@@ -7938,38 +9720,57 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // radii differ, so their touch anchors interleave). Sweep outward from the
                 // plane, quarter of a degree at a time, and take the first anchor that clears
                 // everything. This only ever ADDS positions the exact list missed.
+                sweeping = true;
                 for (int i = 1; i <= 720 && !have; ++i)
                     consider(cMax - i * (kPi / 720.0), false);
+                sweeping = false;
             }
-            if (!have) {
-                // No anchor exists: the bundle's own X spread does not fit on its radius.
-                // Never assign a NaN or a clamped slot here — that would put NaN coordinates
-                // into the emitted spine, or quietly hand back a slot the caller believes is
-                // clear. Say what is wrong.
-                double spread = xoff.empty() ? 0.0 : xoff.back();
-                throw std::runtime_error(
-                    "ConductorBuilder: the terminal leads of '" + verts[group[0]].wname +
-                    "' (" + std::to_string(group.size()) + " parallel" +
-                    (group.size() == 1 ? "" : "s") + ", " +
-                    std::to_string(spread * 1e3) + " mm of side-by-side run needed on a " +
-                    std::to_string(verts[group[0]].r * 1e3) + " mm radius) cannot all be laid "
-                    "out clear of the window's other verticals. Fix the winding data or the "
-                    "MKF blocking -- the leads are never moved into each other.");
+            // EXACT BOUNDARY FOR A SWEPT ANCHOR (11_pushpull_etd49_tp4a, 2026-09-02). The analytic
+            // candidates come from the (r, y) route model; the acceptance test is exact 3D. Where
+            // the two differ by nanometres the analytic touching position is refused and the
+            // quarter-degree sweep would park the block a whole step out. A swept anchor is
+            // therefore bisected back toward the nearest refused position, so the block ends on
+            // the exact boundary -- where an analytic candidate would have put it. Only swept
+            // anchors: an accepted analytic candidate is already the touching position.
+            if (have && !forcePlane && bestFromSweep && best < cMax - 1e-12) {
+                double hi = cMax;
+                for (double c : tried)
+                    if (!std::isnan(c) && c > best + 1e-12 && c < hi) hi = c;
+                auto feasibleAt = [&](double c) {
+                    if (std::isnan(c) || c > cMax + 1e-12 || !blockHardOk(c)) return false;
+                    return !bestSoft || (blockSoftOk(c) && blockOwnRowsOk(c));
+                };
+                if (hi > best + 1e-12 && !feasibleAt(hi)) {
+                    double lo = best;
+                    for (int it = 0; it < 64 && hi - lo > 1e-12; ++it) {
+                        const double mid = 0.5 * (lo + hi);
+                        if (feasibleAt(mid)) lo = mid;
+                        else hi = mid;
+                    }
+                    best = lo;
+                }
             }
-            // ABT #685 (Alf): "why are Primary parallels not starting with the first parallel
-            // centre in x=0?" -- a block that does NOT land on the plane owes an explanation, so
-            // the plane candidate is re-evaluated in explain mode and the binding constraint
-            // named. Diagnosis only; nothing here changes the chosen anchor.
-            if (std::getenv("MVB_LEAD_DIAG") && best < cMax - 1e-9) {
-                std::fprintf(stderr,
-                             "[fan-offplane] wname='%s' entrance=%d anchored %.4f deg off the "
-                             "plane (nearest member x=%.4f mm). At the plane:\n",
-                             verts[group[0]].wname.c_str(), (int)verts[group[0]].entrance,
-                             -best * 180 / kPi,
-                             std::abs(xAt(verts[group[group.size() - 1]],
-                                          azMember(group.size() - 1, best))) * 1e3);
+            // Every binding constraint of this block at anchor cExplain, named (diagnosis only).
+            auto explainBlockAt = [&](double cExplain) {
+                setBlockCand(cExplain);   // the route models see cExplain as the block's slot
+                for (size_t g = 0; g < group.size(); ++g)
+                    for (size_t h = 0; h < g; ++h) {
+                        const double cg = azMember(g, cExplain), ch = azMember(h, cExplain);
+                        if (std::isnan(cg) || std::isnan(ch)) continue;
+                        if (clears(verts[group[h]], ch, verts[group[g]], cg)) continue;
+                        explainPairs = true;
+                        (void)leadPairDist3D(verts[group[h]], ch, verts[group[g]], cg);
+                        explainPairs = false;
+                        std::fprintf(stderr,
+                                     "   members ci=%zu (%.4f deg, x=%.4f) and ci=%zu (%.4f deg, x=%.4f): "
+                                     "the emitted leads come within %.9f mm of each other (need %.4f)\n",
+                                     (size_t)verts[group[h]].ci, ch * 180 / kPi, xAt(verts[group[h]], ch) * 1e3,
+                                     (size_t)verts[group[g]].ci, cg * 180 / kPi, xAt(verts[group[g]], cg) * 1e3,
+                                     leadPairDist3D ? leadPairDist3D(verts[group[h]], ch, verts[group[g]], cg) * 1e3 : -1.0,
+                                     (verts[group[h]].rw + verts[group[g]].rw) * 1e3);
+                    }
                 for (size_t g = 0; g < group.size(); ++g) {
-                    const double cg = azMember(g, cMax);
+                    const double cg = azMember(g, cExplain);
                     if (std::isnan(cg)) {
                         std::fprintf(stderr, "   member ci=%zu: does not fit on its radius\n",
                                      (size_t)verts[group[g]].ci);
@@ -8029,6 +9830,49 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         std::fprintf(stderr, "\n");
                     }
                 }
+                clearBlockCand();
+            };
+            if (!have) {
+                // No anchor exists: the bundle's own X spread does not fit on its radius.
+                // Never assign a NaN or a clamped slot here — that would put NaN coordinates
+                // into the emitted spine, or quietly hand back a slot the caller believes is
+                // clear. Say what is wrong.
+                double spread = xoff.empty() ? 0.0 : xoff.back();
+                if (std::getenv("MVB_LEAD_DIAG")) {
+                    std::fprintf(stderr,
+                                 "[fan-noslot] wname='%s' entrance=%d: no feasible anchor. At the "
+                                 "plane:\n", verts[group[0]].wname.c_str(),
+                                 (int)verts[group[0]].entrance);
+                    explainBlockAt(cMax);
+                    for (double cx : cand) {
+                        if (std::isnan(cx) || cx > cMax - 1e-9) continue;
+                        std::fprintf(stderr, "[fan-noslot] at the analytic candidate %.4f deg:\n",
+                                     cx * 180 / kPi);
+                        explainBlockAt(cx);
+                    }
+                }
+                throw std::runtime_error(
+                    "ConductorBuilder: the terminal leads of '" + verts[group[0]].wname +
+                    "' (" + std::to_string(group.size()) + " parallel" +
+                    (group.size() == 1 ? "" : "s") + ", " +
+                    std::to_string(spread * 1e3) + " mm of side-by-side run needed on a " +
+                    std::to_string(verts[group[0]].r * 1e3) + " mm radius) cannot all be laid "
+                    "out clear of the window's other verticals. Fix the winding data or the "
+                    "MKF blocking -- the leads are never moved into each other.");
+            }
+            // ABT #685 (Alf): "why are Primary parallels not starting with the first parallel
+            // centre in x=0?" -- a block that does NOT land on the plane owes an explanation, so
+            // the plane candidate is re-evaluated in explain mode and the binding constraint
+            // named. Diagnosis only; nothing here changes the chosen anchor.
+            if (std::getenv("MVB_LEAD_DIAG") && best < cMax - 1e-9) {
+                std::fprintf(stderr,
+                             "[fan-offplane] wname='%s' entrance=%d anchored %.4f deg off the "
+                             "plane (nearest member x=%.4f mm). At the plane:\n",
+                             verts[group[0]].wname.c_str(), (int)verts[group[0]].entrance,
+                             -best * 180 / kPi,
+                             std::abs(xAt(verts[group[group.size() - 1]],
+                                          azMember(group.size() - 1, best))) * 1e3);
+                explainBlockAt(cMax);
             }
             for (size_t g = 0; g < group.size(); ++g) {
                 az[group[g]] = azMember(g, best);
@@ -8089,7 +9933,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // is the UNDIPPED span: runPack() is then idempotent in ordering and only the
                 // anchor moves, which is the precondition for iterating the dip to a fixpoint
                 // (ABT #841, Alf's "make the permutation pass-stable first").
-                std::sort(members.begin(), members.end(), [&](size_t a, size_t b) {
+                std::stable_sort(members.begin(), members.end(), [&](size_t a, size_t b) {
                     const double spanA = dippedPermKeys ? verts[a].y1 - verts[a].y0
                                                         : verts[a].y1Ideal - verts[a].y0Ideal;
                     const double spanB = dippedPermKeys ? verts[b].y1 - verts[b].y0
@@ -8208,20 +10052,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (size_t k = 0; k < verts.size(); ++k) {
                 Vert& v = verts[k];
                 if (v.kind != 0 || !v.hasAttachSeg || v.attachAdvance == 0.0) continue;
-                const double delta = std::abs(az[k]);   // plane offset of the assigned slot
-                const double dip = v.attachAdvance * (delta / kTwoPi);
-                auto seg = v.attachSegIdeal;
-                // entrance: the helix is LOWER before the plane; exit: the stretch continues
-                // PAST the station. seg[1] is the attach endpoint's y (segs[0] starts at it).
-                seg[1] += v.entrance ? -dip : dip;
+                // The route the emitter will draw at this slot -- the SIGNED pitch-true attach
+                // (lower before the plane at BOTH ends: entranceAttachY / wrapEndYOverride),
+                // the vertical, the tip-plane extension and the absorption, all as pushPlaneSegs
+                // does them (emittedRoute).
+                const std::vector<PlanePt> wpk = emittedRoute(v, az[k]);
+                const double yAtt = wpk.front().y;
                 if (std::getenv("MVB_LEAD_DIAG"))
                     std::fprintf(stderr,
                                  "[dip] pass=%d ci=%zu entrance=%d slot=%.4f deg advance=%.4f mm "
                                  "dip=%.4f mm attach y %.4f -> %.4f mm\n",
                                  dipPass, (size_t)v.ci, (int)v.entrance, az[k] * 180 / kPi,
-                                 v.attachAdvance * 1e3, dip * 1e3, v.attachSegIdeal[1] * 1e3,
-                                 seg[1] * 1e3);
-                v.segs.front() = seg;
+                                 v.attachAdvance * 1e3, (yAtt - v.attachY) * 1e3,
+                                 v.attachY * 1e3, yAtt * 1e3);
+                v.segs = segsOfRoute(wpk);
+                const std::array<double, 4> seg{wpk.front().x, yAtt, wpk.front().x, yAtt};
                 // ABT #841: recompute from the UNDIPPED extent, never accumulate. Folding each
                 // pass's dip into the previous pass's y0/y1 made the extent a function of the
                 // iteration's HISTORY -- it could only ever grow, so a slot that came back toward
@@ -8255,6 +10100,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (!dipViolated && !permProof) break;
             if (dipPass + 1 >= kMaxDipPasses) break;
             const std::vector<double> azBefore = az;
+            azPrev = az;
+            std::fill(azPrevSet.begin(), azPrevSet.end(), 1);
             runPack();
             // ABT #841: the permutation must be the SAME permutation on every pass -- that is the
             // precondition this whole loop rests on, so it is checked, not assumed.
@@ -8282,16 +10129,42 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 for (size_t k = 0; k < verts.size(); ++k) {
                     Vert& v = verts[k];
                     if (v.kind != 0 || !v.hasAttachSeg || v.attachAdvance == 0.0) continue;
-                    auto seg = v.attachSegIdeal;
-                    const double dip = v.attachAdvance * (std::abs(az[k]) / kTwoPi);
-                    seg[1] += v.entrance ? -dip : dip;
-                    v.segs.front() = seg;
+                    const std::vector<PlanePt> wpk = emittedRoute(v, az[k]);
+                    v.segs = segsOfRoute(wpk);
                     if (!dippedPermKeys) {
-                        v.y0 = std::min(v.y0Ideal, seg[1]);
-                        v.y1 = std::max(v.y1Ideal, seg[1]);
+                        v.y0 = std::min(v.y0Ideal, wpk.front().y);
+                        v.y1 = std::max(v.y1Ideal, wpk.front().y);
                     }
                 }
                 break;
+            }
+        }
+        // WHAT THE FAN COULD NOT RESOLVE, said out loud (pushpull, 2026-09-02). The dip loop above
+        // ends either at a fixpoint or at its pass cap; if its own exact model still finds a
+        // violation at the final slots, the emitted geometry WILL fail the certified gate, and the
+        // gate's witness alone does not say which planning constraint was unsatisfiable. Printed
+        // always: this is a defect report, not a diagnostic.
+        for (size_t j = 0; j < verts.size(); ++j) {
+            if (verts[j].kind == 2) continue;
+            std::string why;
+            if (!leadRowsClear(verts[j], az[j], &why))
+                std::fprintf(stderr,
+                             "[fan] UNRESOLVED at the final slots: %s %s (ci=%zu) at %.4f deg: "
+                             "%s\n",
+                             verts[j].wname.c_str(),
+                             verts[j].kind == 0 ? (verts[j].entrance ? "entrance lead" : "exit lead")
+                                                : "dragback",
+                             (size_t)verts[j].ci, az[j] * 180.0 / kPi, why.c_str());
+            for (size_t k2 = j + 1; k2 < verts.size(); ++k2) {
+                if (verts[k2].kind == 2) continue;
+                if (clears(verts[j], az[j], verts[k2], az[k2])) continue;
+                std::fprintf(stderr,
+                             "[fan] UNRESOLVED at the final slots: verticals ci=%zu (%s, %.4f deg) "
+                             "and ci=%zu (%s, %.4f deg) are %.4f mm apart in x, need %.4f mm\n",
+                             (size_t)verts[j].ci, verts[j].wname.c_str(), az[j] * 180.0 / kPi,
+                             (size_t)verts[k2].ci, verts[k2].wname.c_str(), az[k2] * 180.0 / kPi,
+                             std::abs(xAt(verts[j], az[j]) - xAt(verts[k2], az[k2])) * 1e3,
+                             needDist(verts[j], verts[k2], need(verts[j], verts[k2])) * 1e3);
             }
         }
         // ABT #839 mechanism C: stub sweep caps. An ENTRANCE stub sweeps forward from its
@@ -8337,9 +10210,30 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 dragAzOf[{verts[k].ci, verts[k].trans}] = a;
             } else {
                 // The group's slot binds EVERY parallel of the winding on this side.
+                const auto leg = attachLegOf(verts[k], az[k]);
+                if (std::getenv("MVB_FAN_PRIMS")) {
+                    const auto fp = leadPrims3D(verts[k], az[k]);
+                    std::fprintf(stderr, "[fan-prims] ci=%zu %s slot=%.9f deg leg=(%.9f,%.9f) %s\n",
+                                 (size_t)verts[k].ci, verts[k].entrance ? "entrance" : "exit",
+                                 az[k] * 180 / kPi, leg ? leg->dr * 1e3 : -1.0, leg ? leg->dy * 1e3 : 0.0,
+                                 fp ? "" : "(no fillet)");
+                    if (fp)
+                        for (const auto& pr : *fp) {
+                            if (pr.kind == Primitive::SEG)
+                                std::fprintf(stderr, "[fan-prims]   SEG '%s' (%.9f,%.9f,%.9f)->(%.9f,%.9f,%.9f)\n",
+                                             pr.label.c_str(), pr.seg.a.X()*1e3, pr.seg.a.Y()*1e3, pr.seg.a.Z()*1e3,
+                                             pr.seg.b.X()*1e3, pr.seg.b.Y()*1e3, pr.seg.b.Z()*1e3);
+                            else if (pr.kind == Primitive::ARC3)
+                                std::fprintf(stderr, "[fan-prims]   ARC3 '%s' c=(%.9f,%.9f,%.9f) axis=(%.9f,%.9f,%.9f) v0=(%.9f,%.9f,%.9f) sweep=%.12f\n",
+                                             pr.label.c_str(), pr.arc.c.X()*1e3, pr.arc.c.Y()*1e3, pr.arc.c.Z()*1e3,
+                                             pr.arc.axis.X(), pr.arc.axis.Y(), pr.arc.axis.Z(),
+                                             pr.arc.v0.X()*1e3, pr.arc.v0.Y()*1e3, pr.arc.v0.Z()*1e3, pr.arc.sweep);
+                        }
+                }
                 for (size_t m : verts[k].cis) {
                     if (verts[k].entrance) leadAzIn[m] = a;
                     else                   leadAzOut[m] = a;
+                    if (leg) (verts[k].entrance ? leadLegIn : leadLegOut)[m] = {leg->dr, leg->dy};
                 }
             }
         }
@@ -8524,7 +10418,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     minOut = std::min(minOut, tc.pout.Modulus());
                 }
                 const double rMid = 0.5 * (maxIn + minOut);
-                const double b = kRoundCornerBendFactor * cross[cv].front().rwEmit;
+                const double b = opts.effectiveBend(kRoundCornerBendFactor * cross[cv].front().rwEmit);
                 if (rMid - b <= b) { toroBandForAll = false; break; }
                 const double rt1 = std::sqrt(std::max(0.0, (rMid + b) * (rMid + b) - b * b));
                 const double rt2 = std::sqrt(std::max(0.0, (rMid - b) * (rMid - b) - b * b));
@@ -8599,7 +10493,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         auto [copW, copH] = TurnBuilder::wireDimensions(wire, *ct.turns.front(), /*paintCoating=*/false);
         // Same minimum-bend rule as build_concentric_rect_column_turn: a swept corner
         // self-intersects when the arc radius is below the profile's radial half-extent.
-        double minBend = wireRadius * 1.02;
+        double minBend = opts.effectiveBend(wireRadius * 1.02);
 
         ConductorPath path;
         path.name = ct.winding + " parallel " + std::to_string(ct.parallel);
@@ -9097,9 +10991,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     }
                     const gp_XYZ u = inVec.XYZ() / lenIn, v = outVec.XYZ() / lenOut;
                     const double cosTurn = u.Dot(v);
+                    // NOTE (Alf, 2026-08-27, "can we have ALL of them respect the setting?"):
+                    // TRIED and MEASURED WORSE. Forcing the lead elbows to plain-seg mitres under
+                    // toroidMitreCorners regressed 05_pfc from 141/227 meshed volumes to 1/225
+                    // ("Invalid boundary mesh (overlapping facets)" in the lead region), so the
+                    // lead corners KEEP the round fillet (with its built-in no-room mitre
+                    // fallback) even in mitre-corner mode until the lead-region interaction is
+                    // understood. The wrap corners obey the setting; that is where the 140x
+                    // improvement lives.
                     // > wireRadius, never == : an equal-radius corner is a horn torus (the tube
                     // touches its own revolution axis) and OCC rejects the solid.
-                    const double b = 1.5 * wireRadius;
+                    const double b = opts.effectiveBend(1.5 * wireRadius);
                     const double tangentLen =
                         b * std::sqrt(std::max(0.0, (1.0 - cosTurn) / (1.0 + cosTurn)));
                     if (cosTurn > 1.0 - 1e-9 || tangentLen > 0.49 * std::min(lenIn, lenOut)) {
@@ -9228,7 +11130,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     auto [cw, ch] = TurnBuilder::wireDimensions(wireMap.at(ct2.winding),
                                                                 *ct2.turns.front(), true);
                     const double rw = 0.5 * std::min(ew, eh);
-                    const double bend = kRoundCornerBendFactor * rw;
+                    const double bend = opts.effectiveBend(kRoundCornerBendFactor * rw);
                     const double coatedRw = 0.5 * std::min(cw, ch);
                     for (size_t i = 0; i + 1 < ct2.turns.size(); ++i) {
                         const auto& ca = ct2.turns[i]->get_coordinates();
@@ -9238,19 +11140,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         if (!(add && !add->empty() && (*add)[0].size() >= 2)) continue;
                         const gp_XY pin(ca[0], ca[1]), nextPin(cb[0], cb[1]);
                         const gp_XY pout((*add)[0][0], (*add)[0][1]);
-                        gp_XY dTop = pout - pin, dTopEnd = dTop;
-                        gp_XY eStart = nextPin - pout, eEnd = eStart;
-                        if (dTop.Modulus() < 1e-12 || eStart.Modulus() < 1e-12) continue;
-                        dTop.Normalize(); dTopEnd = dTop;
-                        eStart.Normalize(); eEnd = eStart;
-                        for (int pass = 0; pass < 8; ++pass) {   // same fixed point as emission
-                            const gp_XY a1 = pin + dTop * bend, b1 = pout - dTopEnd * bend;
-                            dTop = spiralTangent(a1, b1, true);
-                            dTopEnd = spiralTangent(a1, b1, false);
-                            const gp_XY a2 = pout + eStart * bend, b2 = nextPin - eEnd * bend;
-                            eStart = spiralTangent(a2, b2, true);
-                            eEnd = spiralTangent(a2, b2, false);
-                        }
+                        if ((pout - pin).Modulus() < 1e-12 || (nextPin - pout).Modulus() < 1e-12)
+                            continue;
+                        // The natural fixed point, through the same solver as the emission.
+                        const gp_XY dTop = solveToroFaceSpiral(pin, std::nullopt, pout, bend, true,
+                                                               std::nullopt, ct2.winding)
+                                               .nearHeading;
+                        const gp_XY eEnd = solveToroFaceSpiral(nextPin, std::nullopt, pout, bend,
+                                                               false, std::nullopt, ct2.winding)
+                                               .nearHeading;
                         // ABT #865: the ring pitch is the WINDING'S OWN coated OD — its rings
                         // nest one of ITS wire diameters apart (RING STAGGER), and the divisor
                         // decides which corners the certification treats as sharing a face
@@ -9367,43 +11265,28 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // 0.679). The far-end tangent re-solves per candidate exactly as emission does.
                 constexpr int kSp = 24;
                 auto impliedSpiral = [&](const SolveCorner& k, const gp_XY& d,
-                                         std::array<std::array<double, 3>, kSp + 1>& out) {
-                    gp_XY nearEnd, farDir;
-                    if (k.top) {
-                        nearEnd = gp_XY(k.station.X() + d.X() * k.bend,
-                                        k.station.Y() + d.Y() * k.bend);
-                        farDir = d;
-                        for (int pass = 0; pass < 8; ++pass) {
-                            farDir = spiralTangent(nearEnd,
-                                                   gp_XY(k.pout.X() - farDir.X() * k.bend,
-                                                         k.pout.Y() - farDir.Y() * k.bend),
-                                                   false);
-                        }
-                    }
-                    else {
-                        nearEnd = gp_XY(k.station.X() - d.X() * k.bend,
-                                        k.station.Y() - d.Y() * k.bend);
-                        farDir = d;
-                        for (int pass = 0; pass < 8; ++pass) {
-                            farDir = spiralTangent(gp_XY(k.pout.X() + farDir.X() * k.bend,
-                                                         k.pout.Y() + farDir.Y() * k.bend),
-                                                   nearEnd, true);
-                        }
-                    }
-                    const gp_XY far = k.top ? gp_XY(k.pout.X() - farDir.X() * k.bend,
-                                                    k.pout.Y() - farDir.Y() * k.bend)
-                                            : gp_XY(k.pout.X() + farDir.X() * k.bend,
-                                                    k.pout.Y() + farDir.Y() * k.bend);
-                    const double r0 = nearEnd.Modulus(), r1 = far.Modulus();
-                    const double az0 = std::atan2(-nearEnd.Y(), nearEnd.X());
+                                         std::array<std::array<double, 3>, kSp + 1>& out) -> bool {
+                    // The chord meets the heading d exactly (solveToroFaceSpiral, ABT #961):
+                    // the sampled footprint is the emitted spiral, about the same centre. No
+                    // chord for this heading = the heading is infeasible (false).
+                    std::string why;
+                    const auto spOpt = trySolveToroFaceSpiral(k.station, d, k.pout, k.bend, k.top,
+                                                              std::nullopt, k.winding, &why);
+                    if (!spOpt) { ToroSolveDiag::refused(why); return false; }
+                    const ToroFaceSpiral& sp = *spOpt;
+                    const gp_XY nRel = sp.near - sp.centre, fRel = sp.far - sp.centre;
+                    const double r0 = nRel.Modulus(), r1 = fRel.Modulus();
+                    const double az0 = std::atan2(-nRel.Y(), nRel.X());
                     const double az1 =
-                        az0 + std::remainder(std::atan2(-far.Y(), far.X()) - az0, kTwoPi);
+                        az0 + std::remainder(std::atan2(-fRel.Y(), fRel.X()) - az0, kTwoPi);
                     const double yRel = k.top ? k.bend : -k.bend;   // the chord plane
                     for (int q = 0; q <= kSp; ++q) {
                         const double t = double(q) / kSp;
                         const double az = az0 + (az1 - az0) * t, r = r0 + (r1 - r0) * t;
-                        out[q] = {r * std::cos(az), -r * std::sin(az), yRel};
+                        out[q] = {sp.centre.X() + r * std::cos(az),
+                                  sp.centre.Y() - r * std::sin(az), yRel};
                     }
+                    return true;
                 };
                 auto footPairMin = [&](const SolveCorner& A, const gp_XY& dA, const SolveCorner& B,
                                        const gp_XY& dB) {
@@ -9412,8 +11295,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     std::array<std::array<double, 3>, kSp + 1> aSp, bSp;
                     sampleArc(A, dA, aArc);
                     sampleArc(B, dB, bArc);
-                    impliedSpiral(A, dA, aSp);
-                    impliedSpiral(B, dB, bSp);
+                    if (!impliedSpiral(A, dA, aSp) || !impliedSpiral(B, dB, bSp))
+                        return -std::numeric_limits<double>::infinity();   // no chord: infeasible
                     double best = std::numeric_limits<double>::max();
                     auto acc = [&](const auto& U, const auto& V) {
                         for (const auto& u : U)
@@ -9432,52 +11315,40 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // on candidate headings with the exact curves the emission will produce (relative
                 // depths: 0 = this half's tube end, +/-bend = the chord plane).
                 auto makeFootprint = [&](const SolveCorner& k, const gp_XY& d, Primitive& arcPr,
-                                         Primitive& spPr) {
+                                         Primitive& spPr) -> bool {
                     const gp_XYZ d3(d.X(), 0, d.Y());
                     const gp_XYZ yHat(0, 1, 0);
                     arcPr = Primitive{};
                     arcPr.kind = Primitive::ARC3;
                     arcPr.arc.sweep = 0.5 * kPi;
-                    gp_XY nearEnd, farDir = d;
+                    // The chord meets the heading d exactly (solveToroFaceSpiral, ABT #961):
+                    // the certified footprint IS the emitted geometry. No chord for this
+                    // heading = the heading is infeasible (false).
+                    std::string why;
+                    const auto spOpt = trySolveToroFaceSpiral(k.station, d, k.pout, k.bend, k.top,
+                                                              std::nullopt, k.winding, &why);
+                    if (!spOpt) { ToroSolveDiag::refused(why); return false; }
+                    const ToroFaceSpiral& sp = *spOpt;
+                    const gp_XY nearEnd = sp.near, far = sp.far;
+                    arcPr.arc.c = gp_Pnt(nearEnd.X(), 0.0, nearEnd.Y());
                     if (k.top) {
-                        arcPr.arc.c = gp_Pnt(k.station.X() + d.X() * k.bend, 0.0,
-                                             k.station.Y() + d.Y() * k.bend);
                         arcPr.arc.axis = yHat.Crossed(d3);
                         arcPr.arc.v0 = d3 * (-k.bend);
-                        nearEnd = gp_XY(k.station.X() + d.X() * k.bend,
-                                        k.station.Y() + d.Y() * k.bend);
-                        for (int pass = 0; pass < 8; ++pass) {
-                            farDir = spiralTangent(nearEnd,
-                                                   gp_XY(k.pout.X() - farDir.X() * k.bend,
-                                                         k.pout.Y() - farDir.Y() * k.bend),
-                                                   false);
-                        }
                     }
                     else {
-                        arcPr.arc.c = gp_Pnt(k.station.X() - d.X() * k.bend, 0.0,
-                                             k.station.Y() - d.Y() * k.bend);
                         arcPr.arc.axis = d3.Crossed(yHat);
                         arcPr.arc.v0 = yHat * (-k.bend);
-                        nearEnd = gp_XY(k.station.X() - d.X() * k.bend,
-                                        k.station.Y() - d.Y() * k.bend);
-                        for (int pass = 0; pass < 8; ++pass) {
-                            farDir = spiralTangent(gp_XY(k.pout.X() + farDir.X() * k.bend,
-                                                         k.pout.Y() + farDir.Y() * k.bend),
-                                                   nearEnd, true);
-                        }
                     }
-                    const gp_XY far = k.top ? gp_XY(k.pout.X() - farDir.X() * k.bend,
-                                                    k.pout.Y() - farDir.Y() * k.bend)
-                                            : gp_XY(k.pout.X() + farDir.X() * k.bend,
-                                                    k.pout.Y() + farDir.Y() * k.bend);
                     const double yRel = k.top ? k.bend : -k.bend;
                     spPr = Primitive{};
                     spPr.kind = Primitive::SPIRAL;
-                    const double az0 = std::atan2(-nearEnd.Y(), nearEnd.X());
+                    const gp_XY nRel = nearEnd - sp.centre, fRel = far - sp.centre;
+                    const double az0 = std::atan2(-nRel.Y(), nRel.X());
                     const double az1 =
-                        az0 + std::remainder(std::atan2(-far.Y(), far.X()) - az0, kTwoPi);
-                    spPr.spiral = {0.0,  0.0,  nearEnd.Modulus(), yRel, az0,
-                                   far.Modulus(), yRel, az1, false};
+                        az0 + std::remainder(std::atan2(-fRel.Y(), fRel.X()) - az0, kTwoPi);
+                    spPr.spiral = {sp.centre.X(), sp.centre.Y(), nRel.Modulus(), yRel, az0,
+                                   fRel.Modulus(), yRel, az1, false};
+                    return true;
                 };
                 // CERTIFIED footprint clearance: true curves at or beyond E, or a proven
                 // violation. The sampled figure is only a fast path in the direction it is
@@ -9486,8 +11357,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 auto footprintClears = [&](const SolveCorner& A, const gp_XY& dA,
                                            const SolveCorner& B, const gp_XY& dB, double E) {
                     Primitive aArc, aSp, bArc, bSp;
-                    makeFootprint(A, dA, aArc, aSp);
-                    makeFootprint(B, dB, bArc, bSp);
+                    if (!makeFootprint(A, dA, aArc, aSp) || !makeFootprint(B, dB, bArc, bSp))
+                        return false;   // no chord for a heading: it does not clear
                     for (const Primitive* u : {&aArc, &aSp}) {
                         for (const Primitive* v : {&bArc, &bSp}) {
                             if (!cert::provePairClears(*u, *v, E).clears) return false;
@@ -9618,8 +11489,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         for (const auto& [ia, ib] : pairIndices) {
                             const double E2 = corners[ia].coatedRw + corners[ib].coatedRw;
                             Primitive aArc, aSp, bArc, bSp;
-                            makeFootprint(corners[ia], dirAt(ia, tilt), aArc, aSp);
-                            makeFootprint(corners[ib], dirAt(ib, tilt), bArc, bSp);
+                            if (!makeFootprint(corners[ia], dirAt(ia, tilt), aArc, aSp) ||
+                                !makeFootprint(corners[ib], dirAt(ib, tilt), bArc, bSp))
+                                return -std::numeric_limits<double>::infinity();
                             for (const Primitive* u : {&aArc, &aSp})
                                 for (const Primitive* v : {&bArc, &bSp})
                                     worst = std::min(worst,
@@ -9827,13 +11699,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         const auto& k = corners[idx];
                         double slack = std::numeric_limits<double>::max();
                         Primitive myArc, mySp;
-                        makeFootprint(k, d, myArc, mySp);
+                        if (!makeFootprint(k, d, myArc, mySp))
+                            return -std::numeric_limits<double>::infinity();   // no chord
                         for (size_t j2 : against) {
                             if (j2 == idx || !reachable(idx, j2)) continue;
                             const auto& other = corners[j2];
                             const double E2 = k.coatedRw + other.coatedRw;
                             Primitive oArc, oSp;
-                            makeFootprint(other, dirNow[j2], oArc, oSp);
+                            if (!makeFootprint(other, dirNow[j2], oArc, oSp))
+                                return -std::numeric_limits<double>::infinity();
                             for (const Primitive* u : {&myArc, &mySp})
                                 for (const Primitive* v : {&oArc, &oSp})
                                     slack = std::min(
@@ -10064,7 +11938,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // same margin appendFilletedPolyline already uses for exactly this reason, and
                 // it is also the honest physics — a wire does not bend tighter than its own
                 // radius.
-                const double toroBend = kRoundCornerBendFactor * wireRadius;
+                const double toroBend = opts.effectiveBend(kRoundCornerBendFactor * wireRadius);
                 if (r0 != r1)
                     // Same per-parallel nesting as below: once every turn is on a band, a ring
                     // change that ignored the strand index shared its lane with the others'
@@ -10089,6 +11963,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                              toroBandRadius, wlabel, i);
                 else
                     appendToroWrap(path, c0, c1, toroBend, wrapDepthOds(i) * od, wlabel, i,
+                                   opts.toroidMitreCorners,
                                    toroCornerDir(i, true), toroCornerDir(i, false),
                                    &allRimTubes);
             }
@@ -10133,46 +12008,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // RECT columns: the terminal attach can sit on a dragback-DISPLACED face (rectRideFor),
         // so the common tip plane must clear the displaced attach too, or the tip lands INSIDE
         // the attach (17_cllc: exit attach ridden to 24.9 mm vs a 24.2 mm tip plane).
-        double maxRide = 0.0;
-        if (rectFamily)
-            for (int side2 = 0; side2 < 2; ++side2)
-                for (const auto& [lvlZ, diam] : rectRideLevels[side2])
-                    maxRide += diam;   // conservative: all reservation levels stacked
-        // The terminals must EMERGE FROM THE COMPONENT: the tip plane always clears the
-        // BOBBIN's own extent (Alf, 2026-08-08), never just the winding's. The bobbin's
-        // flange reaches columnWidth + windowWidth radially (BobbinBuilder), and the 2D
-        // radial coordinate maps to 3D depth with the same zoff the leads use, so the
-        // comparison is exact in this frame. Clearing it by one wire OD puts the tip face
-        // outside the flange rather than flush with it.
-        // ABT #871: measured in THIS conductor's frame. For a main-column conductor the frame
-        // axis is the origin and this is the bobbin's own outer edge, unchanged. For a lateral
-        // leg the bobbin describes no flange at all (its columnWidth/thickness are the main
-        // column's), so the reach that stands in for one is the far edge of the winding window
-        // the conductor is actually wound in, measured from the leg axis.
-        const double frameAxisX = conductorAxisX[ci];
-        double bobbinOuterX = 0.0;
-        for (const auto& ww : bobbinPd.get_winding_windows()) {
-            if (!ww.get_coordinates() || !ww.get_width()) continue;
-            const double windowLow = (*ww.get_coordinates())[0] - *ww.get_width() / 2.0;
-            const double windowHigh = (*ww.get_coordinates())[0] + *ww.get_width() / 2.0;
-            if (frameAxisX == 0.0) {
-                bobbinOuterX = std::max(bobbinOuterX, windowHigh);
-                continue;
-            }
-            const bool holdsThisConductor =
-                std::any_of(ct.turns.begin(), ct.turns.end(), [&](const MAS::Turn* t) {
-                    const double turnX = t->get_coordinates()[0];
-                    return turnX >= windowLow - 1e-9 && turnX <= windowHigh + 1e-9;
-                });
-            if (!holdsThisConductor) continue;
-            bobbinOuterX = std::max({bobbinOuterX, std::abs(windowHigh - frameAxisX),
-                                     std::abs(windowLow - frameAxisX)});
-        }
+        // maxRideAll / bobbinOuterXFor are the ONE implementation shared with the vertical fan
+        // (see their definitions above the fan): the fan models the emitted lead all the way to
+        // this tip plane, so the two must compute it identically.
         // commonTipBase / commonTipWireRadius are window-global (see above), and fanMaxRaise
-        // and maxRide are too, so every conductor lands on the SAME plane.
+        // and maxRideAll are too, so every conductor lands on the SAME plane.
         const double leadTipRadius =
-            std::max(commonTipBase + fanMaxRaise + maxRide,
-                     bobbinOuterX + 2.0 * commonTipWireRadius);
+            std::max(commonTipBase + fanMaxRaise + maxRideAll,
+                     bobbinOuterXFor(ci) + 2.0 * commonTipWireRadius);
 
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
                                  size_t ordinal, bool stationAtFront, double liftRaise = 0.0,
@@ -10183,7 +12026,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                  // the whole route -- the run stays exactly parallel to Z, it just
                                  // runs at its own x. Zero on round columns, where the fan's
                                  // azimuth already carries the slot.
-                                 double xShift = 0.0) {
+                                 double xShift = 0.0,
+                                 // The level attach leg's length, from the fan (leadLegIn /
+                                 // leadLegOut); NaN = the bare elbow leg.
+                                 std::pair<double, double> attachLeg = {
+                                     std::numeric_limits<double>::quiet_NaN(), 0.0}) {
             // Absorb intermediate waypoints closer than the wire radius to their
             // neighbour: a jog shorter than the wire's own radius lies entirely inside
             // the pipe body of the adjacent edge (and inside MKF's drawn rectangle,
@@ -10247,7 +12094,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // entrance rising 23.6 um across the exit layer's radius). So under the hard
             // anchor the row-hold applies to every column shape; the default (fan) mode keeps
             // the diagonal on round columns, where the fan models and funds it.
-            const bool planeAnchored = std::getenv("MVB_FAN_TERMINALS_ON_PLANE") != nullptr;
+            // MVB_LEAD_HOLD_ROW (experiment, 2026-09-02): the row-hold elbow on round columns in
+            // fan mode too -- with the fan now modelling EXACTLY this route (emittedRoute), the
+            // 2026-08-21 objection (the fan packed around a diagonal the emitter did not draw)
+            // no longer applies, and the pushpull shows the diagonal itself is what collides:
+            // Secondary 1 p1's exit dips into Secondary 2 p1's final wrap at every slot until
+            // the vertical outgrows the absorption bound at ~60 deg. The fan's holdRowElbow reads
+            // the SAME two switches, so plan and drawing agree in either mode.
+            // Row-hold is the default route (see holdRowElbow above); the fan reads the same
+            // switch, so plan and drawing agree.
+            const bool planeAnchored = std::getenv("MVB_LEAD_DIAGONAL_ROUTE") == nullptr;
             // ...applied to the ATTACH-ADJACENT SEGMENT, not only to two-point routes: a
             // border-tip waypoint (extendBorder) makes the route three points, and the ==2 gate
             // then let the absorbed diagonal through -- 13_current_sense's Primary entrance rose
@@ -10270,6 +12126,41 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     std::abs(nb.x - att.x) > 3.0 * absorbTol) {
                     kept.insert(kept.begin() + (stationAtFront ? 1 : kept.size() - 1),
                                 PlanePt{att.x + dir * 2.0 * absorbTol, nb.y});
+                }
+            }
+            // A LEAD LEAVES (JOINS) ITS TURN LEVEL (boost_inductor_complete, 2026-09-02). In fan
+            // mode on a round column the pitch-true attach sits advance*slot/2pi below the row and
+            // the sub-radius vertical that would take that offset is absorbed, so the whole run
+            // became one shallow diagonal climbing from the attach -- and the attach is the one
+            // place a climb is impossible. MKF stacks sibling parallels at EXACTLY od/cos(alpha),
+            // so the sibling's helix passes the attach at exactly the coated envelope, and every
+            // direction with a component toward it interpenetrates: the boost's Primary p0 exit
+            // (slope 0.0225 up, the sibling's tail curving away at only 0.0094) reached
+            // 0.9429198 mm against 0.943 -- 80 nm inside, 12 um along the lead, at EVERY slot
+            // (the two rates scale together with the slot angle; a straight climb clears only
+            // when the run is longer than the layer radius). The radial direction itself moves
+            // away, so the leg adjacent to the attach is drawn LEVEL at the attach height, one
+            // elbow leg (two absorb tolerances -- the corner machinery's leg, the row-hold elbow's
+            // own constant) long, and the row offset is taken after it, where the sibling's tail
+            // has curved 0.4 mm clear. MKF's row is still where the terminal finishes; only the
+            // place the climb happens moves out of the tangency zone. The fan's emittedRoute
+            // inserts the same elbow from the same inputs, so plan and drawing agree.
+            else if (!rectWire && kept.size() >= 2) {
+                const size_t attIdx = stationAtFront ? 0 : kept.size() - 1;
+                const size_t nbIdx = stationAtFront ? 1 : kept.size() - 2;
+                const PlanePt att = kept[attIdx];
+                const PlanePt nb = kept[nbIdx];
+                const double dir = nb.x > att.x ? 1.0 : -1.0;
+                if (std::abs(att.y - nb.y) > 1e-12 &&
+                    std::abs(nb.x - att.x) > 3.0 * absorbTol) {
+                    // The leg is the fan's (attachLegFor: in the helix's osculating plane at the
+                    // fillet's cut, the terminal fillet's tangent length plus the elbow leg),
+                    // handed over with the slot as the elbow's (dr, dy) offset from the attach.
+                    const bool handed = !std::isnan(attachLeg.first);
+                    const double dr = handed ? attachLeg.first : 2.0 * absorbTol;
+                    const double dy = handed ? attachLeg.second : 0.0;
+                    kept.insert(kept.begin() + (stationAtFront ? 1 : kept.size() - 1),
+                                PlanePt{att.x + dir * dr, att.y + dy});
                 }
             }
 
@@ -10549,6 +12440,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // The lead attaches THERE, not at the helix station the arc had to leave behind.
         auto stubTerminalOf = [&](size_t i, bool terminalAtStart,
                                   bool siblingIsTranslate) -> std::optional<PlanePt> {
+            // The exact-helix stub (pushStub) ends at the drawn pitch-true station, which is
+            // where the lead already attaches; only the osculating circle needed an override.
+            if (!std::getenv("MVB_OSCULATING_STUB")) return std::nullopt;
             if (!effectivelyRound || i + 1 >= nEmit) return std::nullopt;
             if (zDragbackAzimuth.count(i)) return std::nullopt;   // a dragback draws no stub
             PlanePt sw = station(turns[i]);
@@ -10666,9 +12560,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
                 if (!ret0e && !rectTangential.count({ci, 0})) {
                     const RectStation rsE =
-                        rectStation(first, rectHalfW, rectHalfD, minBend, path.name);
+                        rectStation(first, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
                     const RectStation rsE1 = rectStation(station(turns[1]), rectHalfW,
-                                                         rectHalfD, minBend, path.name);
+                                                         rectHalfD, minBend, formerCornerRadius,
+                                                         path.name);
                     const int sideE = windingFace.at(ct.winding);
                     const double leadSlotE = leadSlotOf.count(ci) ? leadSlotOf.at(ci) : 0.0;
                     const double begX0 = (rectWire ? rsE.cornerR : 0.0) + leadSlotE;
@@ -10731,7 +12626,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // reservation), so the lead attaches there too.
                 if (rectFamily) {
                     const RectStation rsF =
-                        rectStation(first, rectHalfW, rectHalfD, minBend, path.name);
+                        rectStation(first, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
                     const double rideF = rectRideFor(rsF.zPos, windingFace.at(ct.winding));
                     fLead.x += rideF;
                     // Corner only when the first transition is a rising turn that was
@@ -10783,7 +12678,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 pushPlaneSegs(wp, "entrance lead", 0, /*stationAtFront=*/false, entrRaise,
                               azEntrance,
                               [&](double r) { return tallestBumpColumn(bumpsForTurn(r)).first; },
-                              rectFamily && leadSlotOf.count(ci) ? -leadSlotOf.at(ci) : 0.0);
+                              rectFamily && leadSlotOf.count(ci) ? -leadSlotOf.at(ci) : 0.0,
+                              leadLegIn.count(ci) ? leadLegIn.at(ci)
+                                                  : std::pair<double, double>{
+                                                        std::numeric_limits<double>::quiet_NaN(), 0.0});
             }
             if (entranceCorner)
                 rectLeadCornerPrim(*entranceCorner, entranceCornerRide,
@@ -10910,8 +12808,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                                      : std::numeric_limits<double>::infinity());
             } else if (rectFamily) {
                 {
-                    const RectStation rs0 = rectStation(s, rectHalfW, rectHalfD, minBend, path.name);
-                    const RectStation rs1 = rectStation(nxt, rectHalfW, rectHalfD, minBend, path.name);
+                    const RectStation rs0 = rectStation(s, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
+                    const RectStation rs1 = rectStation(nxt, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
                     const int side = windingFace.at(ct.winding);
                     if (rectTangential.count({ci, i})) {
                         // Single-turn layer -> U-style tangential continuation (Alf).
@@ -11070,7 +12968,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     double chainEndY = std::numeric_limits<double>::quiet_NaN();
                     if (ret && xSlot < -1e-12 && i + 2 < nEmit) {
                         const RectStation rsN = rectStation(station(turns[i + 2]), rectHalfW,
-                                                            rectHalfD, minBend, path.name);
+                                                            rectHalfD, minBend, formerCornerRadius,
+                                                            path.name);
                         const double begXN = -xSlot;
                         // The destination wrap's own descent slot (if ITS next transition is a
                         // return) shortens its path exactly as stopX does for every wrap.
@@ -11114,7 +13013,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (lastDelivered) {
                 const RectStation rsL =
                     rectStation(station(turns[nEmit - 1]), rectHalfW, rectHalfD, minBend,
-                                path.name);
+                                formerCornerRadius, path.name);
                 const int side = windingFace.at(ct.winding);
                 const double kNaNr = std::numeric_limits<double>::quiet_NaN();
                 appendRectWrap(path, rsL, rsL, "'" + turns[nEmit - 1]->get_name() +
@@ -11165,7 +13064,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // Displaced -Z crossing, exactly like the entrance.
                 if (rectFamily) {
                     const RectStation rsL =
-                        rectStation(last, rectHalfW, rectHalfD, minBend, path.name);
+                        rectStation(last, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
                     const double rideL = rectRideFor(rsL.zPos, windingFace.at(ct.winding));
                     lLead.x += rideL;
                     bool retLast = false;
@@ -11264,7 +13163,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 pushPlaneSegs(wp, "exit lead", nEmit - 1, /*stationAtFront=*/true, exitRaise,
                               azExit,
                               [&](double r) { return tallestBumpColumn(bumpsForTurn(r)).first; },
-                              exitLane);
+                              exitLane,
+                              leadLegOut.count(ci) ? leadLegOut.at(ci)
+                                                   : std::pair<double, double>{
+                                                         std::numeric_limits<double>::quiet_NaN(), 0.0});
             }
         }
 
@@ -11455,6 +13357,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // PQ plate) and it makes the geometry far harder to read. Lead-lead clearance is the
         // layout's job; where the leads genuinely collide the gate now says so instead of the
         // spread hiding it.
+        // PHASE-LOCK THE FACETS (Alf, 2026-08-27). With a faceted wire on a faceted core the
+        // two n-gons only keep their radial gap if their vertices line up: rotated half a facet,
+        // a core-wall vertex meets the wire's inner flat and the 50 um conducting clearance
+        // collapses to 0..5 um (measured on 03_buck seg=16 lockstep: contacts at r=6.72 with
+        // gaps oscillating 0/4.9 um around the wall). The seam azimuth exists only to separate
+        // the windings' leads, so snapping it to a multiple of the facet angle costs nothing --
+        // the lead stagger survives (facets are 22.5 deg at n=16, staggers are larger) and the
+        // polygons stay vertex-on-vertex at every winding rotation.
+        if (opts.wirePolygonSegments > 0 && seamAngle != 0.0) {
+            const double facet = kTwoPi / opts.wirePolygonSegments;
+            seamAngle = std::round(seamAngle / facet) * facet;
+        }
         if (std::getenv("MVB_PATH_DUMP")) {
             std::fprintf(stderr, "[seam] %s seam=%.4f deg\n", path.name.c_str(),
                          seamAngle * 180 / kPi);
@@ -11522,6 +13436,23 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                       << " retrace primitive(s) (out-and-back spurs)\n";
     }
 
+    // TERMINAL CORNERS ARE FILLETS (TerminalFillet, 2026-09-02): on the conformal path the
+    // exact-helix stub meets its lead through a tangent biarc, so the assembler sees no corner
+    // there. Applied HERE, before the collision gate, so the gate certifies the centreline that
+    // is actually swept -- the two arcs, the shortened stub and the shortened lead -- and not the
+    // sharp corner they replace (boost_inductor_complete, 2026-09-02: the fillet was applied to a
+    // per-path copy inside the assembly loop, and the certified gate never saw an arc). In place
+    // on the path the solids are NAMED from, so the per-solid primitive indices the assembler
+    // returns stay one-to-one.
+    for (auto& p : paths) {
+        if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
+        const size_t filleted =
+            filletTerminalCorners(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name);
+        if (std::getenv("MVB_DIAG") && filleted)
+            std::cerr << "[buildAll] '" << p.name << "' filleted " << filleted
+                      << " terminal corner(s)\n";
+    }
+
     if (opts.diagnosticSkipCollisionCheck) {
         // Loud on purpose: a build that skipped this gate produces overlapping copper and
         // must not be mistaken for a valid part further downstream.
@@ -11530,6 +13461,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     }
     else {
         checkCollisions(paths);
+        checkWindowContainment(paths, windowBoundsPerPath);
     }
 
     // Polyline capture mode: everything above ran (assembly, seam aiming, end-run planning,
@@ -11573,7 +13505,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     std::vector<NamedShape> out;
     out.reserve(paths.size());
-    for (const auto& p : paths) {
+    for (const auto& p0 : paths) {
+        // The terminal fillets (TerminalFillet) are already on p0: they are applied before the
+        // collision gate, in place on the path the solids are NAMED from, so the per-solid
+        // primitive indices the assembler returns stay one-to-one (filleting a copy inside the
+        // emitter left the naming below indexing past the end: bad_alloc on 01, segfault on 21).
+        ConductorPath p = p0;
         // ABT #685: ask the assembler which centreline piece each solid came from, rather than
         // reconstructing it afterwards. Empty for the emission paths whose solids are not one
         // per primitive (single-body sweeps, rect fuses) — those keep the centroid match.

@@ -149,8 +149,10 @@ TopoDS_Shape ShapeUr::applyMachining(const TopoDS_Shape& piece,
         }
         if (radius <= 0.0) return piece;
 
+        // Gap-cutting tool: circumscribe so no faceted ridge is left in the gap.
         TopoDS_Shape toolZ = build_polygon_cylinder(gapLength, radius,
-                                                    m_corePolygonSegments);
+                                                    m_corePolygonSegments,
+                                                    /*circumscribed=*/true);
         if (toolZ.IsNull()) return piece;
         TopoDS_Shape toolY = rotate_shape(toolZ, -std::numbers::pi / 2.0, 0.0, 0.0);
         TopoDS_Shape tool  = translate_shape(toolY, 0.0,
