@@ -374,8 +374,92 @@ bool filletable(const Primitive& helixSide, const Primitive& straightSide) {
 
 }  // namespace
 
+// THE LAYER LINK IS A SMOOTH TRANSITION (Alf, 2026-09-02, option 2 on ABT #969). The approved
+// U/Z chunk drew the radial step as a STRAIGHT segment at one azimuth, so the wire turned 90 deg
+// at each of its ends: on 06_llc that link is 0.435 mm long while two bends of the wire's own
+// radius need 0.84 mm of tangent -- a corner real wire cannot make, and the sharp corner's true
+// curve-to-curve minimum dips a nanometre or two under the sibling's exact-touch envelope
+// (1.3 nm on 06, 0.5-22 nm on 23). A winder makes that step by leaning the wire out over a few
+// degrees of azimuth. So the link becomes a BIARC tangent to both wraps, taking the azimuth it
+// needs from each: stepping one coated OD with bends of the bend radius takes about 0.84 mm of
+// travel, which at an 11.5 mm radius is ~4 deg. The straight chunk is gone, not reshaped.
+// MVB_STRAIGHT_LINK=1 restores it (bisect switch).
+size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std::string& who) {
+    if (std::getenv("MVB_STRAIGHT_LINK") != nullptr) return 0;
+    size_t done = 0;
+    for (size_t i = 0; i + 2 < prims.size(); ++i) {
+        if (!isWrapSpiral(prims[i]) || !isLayerLink(prims[i + 1]) || !isWrapSpiral(prims[i + 2]))
+            continue;
+        Spiral& a = prims[i].spiral;
+        Spiral& b = prims[i + 2].spiral;
+        const double sgnA = a.az1 >= a.az0 ? 1.0 : -1.0;
+        const double sgnB = b.az1 >= b.az0 ? 1.0 : -1.0;
+        const double spanA = std::abs(a.az1 - a.az0), spanB = std::abs(b.az1 - b.az0);
+        const SpiralEval endA = evalSpiral(a, a.az1);
+        std::optional<Biarc> best;
+        double dA = 0.0, dB = 0.0;
+        // THE GENTLEST TRANSITION THAT FITS, not the tightest. A winder does not bend at the
+        // minimum radius unless the space forces it, and the tightest biarc leans hardest
+        // towards the sibling: on 23_illc the first fit left arc 2 grazing the neighbouring
+        // parallel by 0.89 nm at exact touch. So keep growing the azimuth taken from each wrap
+        // while the arcs keep getting rounder, and take the last fit before the wraps run out.
+        for (int it = 0; it < 40; ++it) {
+            const double L = minBend * std::tan(0.25 * kPi) * (0.5 + 0.15 * it);
+            const double dTry = L / std::max(endA.dsdaz, 1e-18);
+            if (dTry > 0.45 * spanA || dTry > 0.45 * spanB) break;
+            const double azA = a.az1 - sgnA * dTry, azB = b.az0 + sgnB * dTry;
+            const SpiralEval cutA = evalSpiral(a, azA), cutB = evalSpiral(b, azB);
+            const auto fit = biarc(cutA.p, cutA.t, cutB.p, cutB.t, prims[i + 1]);
+            if (!fit || fit->minRadius < minBend * (1.0 - 1e-9)) {
+                if (best) break;   // past the useful range; keep the roundest one found
+                continue;
+            }
+            if (best && fit->minRadius < best->minRadius) break;   // getting tighter again
+            best = fit;
+            dA = dB = dTry;
+        }
+        if (!best) {
+            std::ostringstream m;
+            m.precision(9);
+            m << "TerminalFillet: the layer link of " << who << " at '" << prims[i + 1].label
+              << "' cannot be made smooth: no biarc of radius >= " << minBend * 1e3
+              << " mm joins the two wraps within 60% of either's azimuth (" << spanA * 180.0 / kPi
+              << " and " << spanB * 180.0 / kPi << " deg available).";
+            throw std::runtime_error(m.str());
+        }
+        auto cut = [](Spiral& sp, double az, bool cutEnd) {
+            const double span = sp.az1 - sp.az0;
+            const double f = (az - sp.az0) / span;
+            const double r = sp.r0 + (sp.r1 - sp.r0) * f;
+            const double y = sp.y0 + (sp.y1 - sp.y0) * f;
+            if (cutEnd) { sp.az1 = az; sp.r1 = r; sp.y1 = y; }
+            else        { sp.az0 = az; sp.r0 = r; sp.y0 = y; }
+        };
+        cut(a, a.az1 - sgnA * dA, /*cutEnd=*/true);
+        cut(b, b.az0 + sgnB * dB, /*cutEnd=*/false);
+        Primitive a1 = best->a1.pr, a2 = best->a2.pr;
+        a1.label = prims[i + 1].label + " arc 1";
+        a2.label = prims[i + 1].label + " arc 2";
+        a1.isConnection = a2.isConnection = true;
+        a1.turnOrdinal = a2.turnOrdinal = prims[i + 1].turnOrdinal;
+        if (std::getenv("MVB_FILLET_DIAG")) {
+            std::fprintf(stderr,
+                         "[link] '%s' smoothed: %.4f deg taken from each wrap, arc radii %.6f mm "
+                         "(bend %.6f)\n",
+                         prims[i + 1].label.c_str(), dA * 180.0 / kPi, best->minRadius * 1e3,
+                         minBend * 1e3);
+        }
+        prims.erase(prims.begin() + static_cast<long>(i + 1));
+        prims.insert(prims.begin() + static_cast<long>(i + 1), {a1, a2});
+        i += 2;
+        ++done;
+    }
+    return done;
+}
+
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                              const std::string& who) {
+    smoothLayerLinks(prims, minBend, who);
     size_t done = 0;
     for (size_t i = 0; i + 1 < prims.size(); ++i) {
         const bool exitCorner = filletable(prims[i], prims[i + 1]);
