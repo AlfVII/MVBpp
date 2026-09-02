@@ -336,8 +336,40 @@ bool isStub(const Primitive& p) {
     return p.kind == Primitive::SPIRAL && !p.spiral.blend &&
            p.label.find("(terminal stub)") != std::string::npos;
 }
+
+bool isLayerLink(const Primitive& p) {
+    return p.kind == Primitive::SEG && p.label.find("(layer link)") != std::string::npos;
+}
+
+bool isWrapSpiral(const Primitive& p) {
+    return p.kind == Primitive::SPIRAL && !p.spiral.blend && !p.isConnection;
+}
+
 bool isLeadSeg(const Primitive& p) {
-    return p.kind == Primitive::SEG && p.label.find("lead seg") != std::string::npos;
+    if (p.kind != Primitive::SEG) return false;
+    // The lead's own segments, and -- Alf, 2026-09-02 -- the RADIAL LAYER LINK, which meets the
+    // wrap at the same kind of corner. The link's chunk is untouched (still the approved straight
+    // segment at one azimuth); only the corner where it leaves the wrap is filleted, exactly as
+    // the terminal corner is. At stations placed one coated OD apart the sharp corner's true
+    // curve-to-curve minimum dips a nanometre or two under the touch value (06_llc 1.3 nm at
+    // 13 um along the link, 23_illc 0.5-22 nm); a tangent departure cannot.
+    return p.label.find("lead seg") != std::string::npos;
+}
+
+// The two corners this pass owns: a terminal stub meeting its lead, and a wrap meeting the
+// radial layer link that leaves it. Both are a helix against a straight, and both were sharp.
+bool filletable(const Primitive& helixSide, const Primitive& straightSide) {
+    if (isStub(helixSide) && isLeadSeg(straightSide)) return true;
+    // MVB_LINK_FILLET=1: fillet the wrap-to-layer-link corner too (Alf, 2026-09-02). OFF by
+    // default because the corner does not admit one on the designs that need it: 06_llc's link
+    // is 0.435 mm long against a 0.42 mm bend radius, so no arc of the wire's own radius fits
+    // between the two wraps it joins -- REAL WIRE CANNOT MAKE THAT CORNER EITHER. Either the
+    // whole link becomes one smooth arc (a redefinition of the approved U/Z chunk), or MKF
+    // gives the radial step room. Recorded on ABT #969; the switch keeps the machinery live.
+    if (std::getenv("MVB_LINK_FILLET") != nullptr && isWrapSpiral(helixSide) &&
+        isLayerLink(straightSide))
+        return true;
+    return false;
 }
 
 }  // namespace
@@ -346,8 +378,8 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                              const std::string& who) {
     size_t done = 0;
     for (size_t i = 0; i + 1 < prims.size(); ++i) {
-        const bool exitCorner = isStub(prims[i]) && isLeadSeg(prims[i + 1]);
-        const bool entranceCorner = isLeadSeg(prims[i]) && isStub(prims[i + 1]);
+        const bool exitCorner = filletable(prims[i], prims[i + 1]);
+        const bool entranceCorner = filletable(prims[i + 1], prims[i]);
         if (!exitCorner && !entranceCorner) continue;
         const size_t stubIdx = exitCorner ? i : i + 1;
         size_t leadIdx = exitCorner ? i + 1 : i;

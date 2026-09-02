@@ -745,6 +745,15 @@ void checkWindowContainment(const std::vector<ConductorPath>& paths,
         const WindowBounds& wb = *windows[ci];
         const double env = p.isRectangular ? 0.5 * p.wireHeight : p.wireRadius;
         for (const Primitive& pr : p.prims) {
+            // THE WINDING STAYS IN THE WINDOW; A TERMINAL LEAD DOES NOT. A lead's whole purpose
+            // is to reach a pin below the bobbin, so it crosses the flange by construction --
+            // and it carves its own notch there, because buildAllNamed cuts the bobbin with
+            // every conductor (cut_bobbin). Judging leads by the window refused designs whose
+            // leads simply went to their terminals (03_buck: the entrance run 152 um below the
+            // face; 14_dab likewise). What this gate is for is the WINDING sinking into the
+            // flange -- a dipped wrap, stub, fillet or connection -- which no other check sees.
+            // Copper left inside the bobbin AFTER the cut is the overlap audit's business.
+            if (pr.label.find("lead") != std::string::npos) continue;
             double lo, hi;
             if (pr.kind == Primitive::BLEND) {
                 lo = std::numeric_limits<double>::max();
@@ -9022,7 +9031,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // MKF's stations do; a dip below a first turn that sits on the flange is not
             // available -- the slot has to be where the wrap's true height is inside the window.
             if (const auto& wb = windowBoundsPerPath[L.ci]) {
-                std::vector<Primitive> all = *prims;
+                // Only the WINDING is judged by the window: a lead crosses the flange on its way
+                // to its pin and carves its notch in the cut bobbin (see checkWindowContainment).
+                // What the slot must fund is the wrap's own pitch-true height at this slot.
+                std::vector<Primitive> all;
                 if (const auto helix = ownHelixOf(L, c)) all.push_back(*helix);
                 for (const auto& pr : all) {
                     double lo, hi;
