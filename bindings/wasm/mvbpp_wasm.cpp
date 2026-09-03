@@ -308,6 +308,32 @@ std::vector<mvb::NamedShape> build_core(const std::string& json_str, int polygon
         j = std::move(wrap);
     }
 
+    // Drawing a CORE needs no coil. Going through parseEnriched sends a core-only request
+    // into magnetic_autocomplete, which throws "Cannot compute proportion for zero windings"
+    // on the dummy coil above and falls back to a path that emits a TWO-HALF-SET layout
+    // regardless of the core's stated type — so a closedShape moulded body came out as two
+    // mirrored halves, 22.8 mm against its stated 11.4, with its effective magnetic path
+    // doubled to match.
+    //
+    // OpenMagnetics::Core computes the geometricalDescription from the core alone and honours
+    // the type, so build it directly and only fall back for a genuine Magnetic that needs the
+    // coil-aware pipeline.
+    const nlohmann::json& coreJson = j.at("core");
+    if (!coreJson.contains("geometricalDescription") ||
+        coreJson.at("geometricalDescription").is_null()) {
+        try {
+            OpenMagnetics::Core coreOnly(coreJson);
+            if (coreOnly.get_geometrical_description().has_value() &&
+                !coreOnly.get_geometrical_description()->empty()) {
+                mvb::MagneticBuilder coreBuilder;
+                return coreBuilder.buildCoreNamed(coreOnly, polygonSegments);
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[mvbpp] build_core: core-only path failed (%s); "
+                                 "falling back to the full pipeline\n", e.what());
+        }
+    }
+
     auto enriched = parseEnriched(j.dump());
     const auto& core = enriched.get_core();
     mvb::MagneticBuilder b;
@@ -394,8 +420,7 @@ std::vector<mvb::NamedShape> build_core_shell(const std::string& json_str, int p
     const auto& shapeJson = fd["shape"];
 
     auto shape = shapeJson.get<MAS::CoreShape>();
-    if (!shape.get_family().has_value() ||
-        shape.get_family().value() != MAS::CoreShapeFamily::DRUM_SEMISHIELDED) {
+    if (shape.get_family() != MAS::CoreShapeFamily::DRUM_SEMISHIELDED) {
         return {};
     }
     auto dimsOpt = shape.get_dimensions();
@@ -405,7 +430,7 @@ std::vector<mvb::NamedShape> build_core_shell(const std::string& json_str, int p
     // Carve the shell against the SAME drum solid drawCore delivers, so the two products
     // meet exactly instead of interpenetrating by a faceting error.
     auto builder = mvb::shapes::createShapeBuilder(MAS::CoreShapeFamily::DRUM_SEMISHIELDED,
-                                                   polygonSegments);
+                                                   /*subtype=*/"", polygonSegments);
     TopoDS_Shape drum = builder ? builder->buildPiece(shape) : TopoDS_Shape();
     TopoDS_Shape shell = mvb::shapes::buildSemishieldedShell(dims, drum, polygonSegments);
     if (shell.IsNull()) return {};
