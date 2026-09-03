@@ -699,7 +699,12 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                 // Spread the candidates across the whole admissible range rather than in 1 deg
                 // steps: six neighbouring angles are six almost identical fillets, and the fan
                 // needs genuinely different ones to choose from (14_dab).
-                static const double kPhiDeg[] = {1, 2, 3, 5, 8, 12, 18, 27, 40, 55, 70, 85};
+                // VARIANT 0 IS THE HISTORICAL FILLET: the first fit walking 5 degrees at a time,
+                // which is what the corpus was verified on. The finer and wider angles are extra
+                // CHOICES for the fan, never a change of default -- moving variant 0 to a 1 degree
+                // first step silently re-cornered every terminal in the corpus and broke two
+                // designs that had been clean (24_margin_interleaved_flyback, complete_flyback).
+                static const double kPhiDeg[] = {5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 85};
                 for (double phiDeg : kPhiDeg) {
                     const double phi = phiDeg * kPi / 180.0;
                     auto f = triarcHelixPlane(P1, t1, P2, t2, /*helixAtP2=*/!exitCorner, nH,

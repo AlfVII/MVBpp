@@ -8892,7 +8892,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             return out;
         };
         leadPairDist3D = [&](const Vert& A, double cA, const Vert& B, double cB) {
-            const auto pa = leadPrims3D(A, cA), pb = leadPrims3D(B, cB);
+            // Each member is compared with the fillet IT WILL BE EMITTED WITH, not with the
+            // default one: variants are assigned greedily, so a pair checked against a
+            // neighbour's default and then emitted against its chosen variant was never really
+            // checked (complete_flyback: 4.75 um between two terminal fillets the gate caught).
+            auto assignedVariant = [&](const Vert& V) {
+                const auto& m = V.entrance ? leadFilletIn : leadFilletOut;
+                auto it = m.find(V.ci);
+                return it == m.end() ? 0 : it->second;
+            };
+            const auto pa = leadPrims3D(A, cA, assignedVariant(A));
+            const auto pb = leadPrims3D(B, cB, assignedVariant(B));
             if (!pa || !pb) return 0.0;   // no fillet fits: the slot is infeasible
             // Proven at the coated envelope by the certified engine (the arcs are ARC3s, the
             // runs SEGs -- both exact there); the distance itself is only reported.
@@ -9076,7 +9086,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // A slot is feasible if ANY of the corner's admissible fillets clears (the fan picks the
         // winner at commit time, below, and hands it to the emitter). Without this the search
         // judged every slot by the tightest fillet alone and 14_dab had no anchor at all.
+        // VARIANTS ARE A LAST RESORT, not a first choice. A slot that only works with a
+        // non-default fillet is a worse slot than one that works with the fillet every other
+        // design was verified on: reaching for variants during the first anchor search moved
+        // complete_flyback onto a slot where two sibling fillets ended 4.2 um into each other.
+        // So the whole fan runs once with the default fillet, and only a winding that finds no
+        // anchor at all re-runs with the variants unlocked (14_dab is the design that needs it).
+        bool filletVariantsUnlocked = false;
         auto leadRowsClearAnyFillet = [&](const Vert& L, double c, std::string* why = nullptr) {
+            if (!filletVariantsUnlocked) return leadRowsClear(L, c, why, 0);
             for (int v = 0; v < 24; ++v)
                 if (leadRowsClear(L, c, v == 0 ? why : nullptr, v)) return true;
             return false;
@@ -9284,7 +9302,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                              verts[k].kind, verts[k].wname.c_str(), (int)verts[k].entrance,
                              (size_t)verts[k].ci, verts[k].r * 1e3, verts[k].rw * 1e3);
         }
-        for (size_t k = 0; k < verts.size(); ++k) {
+        for (size_t k = 0; k + 1 != 0; ++k) {   // k = SIZE_MAX restarts the pass (see below)
+            if (k >= verts.size()) break;
             if (azAssigned[k]) {
                 continue;
             }
@@ -9863,6 +9882,20 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // into the emitted spine, or quietly hand back a slot the caller believes is
                 // clear. Say what is wrong.
                 double spread = xoff.empty() ? 0.0 : xoff.back();
+                // LAST RESORT: no anchor with the default fillet. Unlock the fillet variants and
+                // let this block try again -- 14_dab's Primary bundle exists only on a corner
+                // that escapes in the helix's other natural plane. Once unlocked they stay so;
+                // every block already placed keeps the slot it found with the default fillet.
+                if (!filletVariantsUnlocked) {
+                    filletVariantsUnlocked = true;
+                    if (std::getenv("MVB_LEAD_DIAG"))
+                        std::fprintf(stderr,
+                                     "[fan-fillet] wname='%s' entrance=%d: no anchor with the "
+                                     "default fillet -- unlocking the variants\n",
+                                     verts[group[0]].wname.c_str(), (int)verts[group[0]].entrance);
+                    k = SIZE_MAX;   // restart the placement pass with the variants available
+                    continue;
+                }
                 if (std::getenv("MVB_LEAD_DIAG")) {
                     std::fprintf(stderr,
                                  "[fan-noslot] wname='%s' entrance=%d: no feasible anchor. At the "
@@ -10267,17 +10300,24 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // the corner. The fan tries them here, at the slot it has settled on, and hands the
         // winner to the emitter -- exactly as it hands over the attach leg.
         auto bestFilletVariant = [&](const Vert& L, double c) {
+            if (!filletVariantsUnlocked) return 0;
             for (int v = 0; v < 24; ++v)
                 if (leadRowsClear(L, c, nullptr, v)) return v;
             return 0;
         };
+        // Iterated to a fixpoint: assigning greedily lets a later member's choice invalidate a
+        // pair an earlier one was checked on (complete_flyback: two sibling terminal fillets
+        // 4.2 um into each other, each fine against the other's default). Three passes settle it.
+        for (int pass = 0; pass < 3; ++pass)
         for (size_t k = 0; k < verts.size(); ++k) {
             if (verts[k].kind != 0 || !azAssigned[k]) continue;
             const int v = bestFilletVariant(verts[k], az[k]);
-            if (v == 0) continue;
+            // Record even variant 0, so a later member sees THIS one's decision rather than a
+            // default it will not be built with (the assignment is greedy, in vertical order).
             for (size_t m : verts[k].cis)
                 (verts[k].entrance ? leadFilletIn : leadFilletOut)[m] = v;
-            if (std::getenv("MVB_LEAD_DIAG"))
+            if (v == 0) continue;
+            if (std::getenv("MVB_LEAD_DIAG") && pass == 2)
                 std::fprintf(stderr, "[fan-fillet] ci=%zu %s: fillet variant %d clears\n",
                              (size_t)verts[k].ci, verts[k].entrance ? "entrance" : "exit", v);
         }
