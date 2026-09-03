@@ -8637,9 +8637,79 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             pr.spiral.y1 = R.y + R.adv * hi / kTwoPi;
             return pr;
         };
+        // THE WHOLE WRAP, AS THE EMITTER DRAWS IT (2026-09-03). wrapHelixOf above models the
+        // wrap as ONE spiral translated bodily by the ride-over raise -- which is what
+        // appendBumpedSweep does to the -Z HALF ONLY (Alf's rule). Over the +Z half the emitted
+        // wrap sits on its own circle, cz = 0. Using the raised model for the far half puts the
+        // wrap `raise` closer to the axis than it really is, and on complete_flyback that is
+        // 1.9016 mm: the certifier read the Secondary's outer wrap at radius 7.87 instead of
+        // 9.78, called it 76 um inside the Primary, and every terminal slot was refused.
+        // Clearance callers must see the emitted pieces: raised head, level +Z half, raised
+        // tail, and the two risers that bridge them at the XY-plane crossings. The single-piece
+        // model above stays for the TERMINAL-SLOT callers (fillet corner, attach leg, roll):
+        // their slot lives in the fan, a few degrees off the plane, which is always inside the
+        // raised region.
+        auto wrapPiecesOf = [&](const WireRow& R, std::optional<double> loOverride = std::nullopt,
+                                std::optional<double> hiOverride = std::nullopt) {
+            std::vector<Primitive> out;
+            const Primitive base = wrapHelixOf(R, loOverride, hiOverride);
+            const double raise = -base.spiral.cz;       // wrapHelixOf stores cz = -raise
+            const double azStart = base.spiral.az0, azEnd = base.spiral.az1;
+            const double rr = base.spiral.r0;
+            auto yAt = [&](double az) {
+                return base.spiral.y0 + (base.spiral.y1 - base.spiral.y0) *
+                                            (az - azStart) / (azEnd - azStart);
+            };
+            auto piece = [&](double a0, double a1, double cz) {
+                if (a1 - a0 < 1e-12) return;
+                Primitive pr = base;
+                pr.spiral.cz = cz;
+                pr.spiral.az0 = a0;  pr.spiral.az1 = a1;
+                pr.spiral.y0 = yAt(a0); pr.spiral.y1 = yAt(a1);
+                out.push_back(pr);
+            };
+            auto riser = [&](double az) {
+                Primitive pr = base;
+                pr.kind = Primitive::SEG;
+                pr.spiral = {};
+                pr.seg.a = azPointC(0.0, -raise, rr, yAt(az), az);
+                pr.seg.b = azPointC(0.0, 0.0, rr, yAt(az), az);
+                out.push_back(pr);
+            };
+            if (raise <= 0.0 || azEnd - azStart <= kPi + 1e-9) { out.push_back(base); return out; }
+            double aHead = kPlaneAz + kPi / 2.0;            // z = 0, x = -r
+            double aTail = kPlaneAz + kTwoPi - kPi / 2.0;   // z = 0, x = +r
+            while (aHead <= azStart + 1e-9) aHead += kTwoPi;
+            while (aTail >= azEnd - 1e-9) aTail -= kTwoPi;
+            if (!(aHead < aTail)) { out.push_back(base); return out; }   // emitter throws here
+            piece(azStart, aHead, -raise);
+            riser(aHead);
+            piece(aHead, aTail, 0.0);
+            riser(aTail);
+            piece(aTail, azEnd, -raise);
+            return out;
+        };
         // The helix of lead L's OWN wrap -- the one leaving station 0 (entrance) or the one
         // leaving the station before the attach (exit) -- ending (starting) at slot c, labelled
         // as the terminal stub the emitter draws so TerminalFillet recognises it.
+        // The EMITTED pieces of lead L's own wrap (see wrapPiecesOf): what a clearance check
+        // must measure. ownHelixOf below returns only the raised model, which is right at the
+        // terminal slot and wrong over the +Z half.
+        auto ownPiecesOf = [&](const Vert& L, double c) -> std::vector<Primitive> {
+            std::vector<Primitive> out;
+            if (L.rectWire || L.kind != 0) return out;
+            for (const auto& R : rows) {
+                if (R.ci != L.ci || R.cHi < 1e29) continue;
+                if (L.entrance ? R.station == 0
+                               : (L.attachStation >= 1 && R.station + 1 == L.attachStation)) {
+                    out = L.entrance ? wrapPiecesOf(R, c, std::nullopt)
+                                     : wrapPiecesOf(R, std::nullopt, c);
+                    for (auto& pr : out) pr.label = "wrap (terminal stub)";
+                    return out;
+                }
+            }
+            return out;
+        };
         auto ownHelixOf = [&](const Vert& L, double c) -> std::optional<Primitive> {
             if (L.rectWire || L.kind != 0) return std::nullopt;
             for (const auto& R : rows) {
@@ -8940,7 +9010,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         auto leadWrapClear = [&](const WireRow& R, const Vert& L, double c, double clr,
                                  const std::vector<Primitive>& leadPrims, std::string* why) {
             if (R.r + R.rwCoat < L.r - L.rw - 1e-12) return true;   // inside the attach: never crossed
-            const Primitive helix = wrapHelixOf(R);
+            // Every EMITTED piece of the wrap, not one raised model of it (see wrapPiecesOf):
+            // the +Z half sits on the wrap's own circle, `raise` further out than the raised
+            // model says, and the risers between them are copper too.
+            for (const Primitive& helix : wrapPiecesOf(R)) {
             if (L.rectWire || R.rect) {
                 // RECTANGULAR WIRE (03_buck_inductor_pq3230_n95, 2026-09-02): the round capsule at
                 // the coated envelope is the wrong criterion -- a flat 3.1 x 0.6 wire's siblings
@@ -8977,10 +9050,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                       << " mm, in-plane " << inPlaneSep * 1e3 << " mm)";
                     *why = w.str();
                 }
-                return !overlap;
+                if (overlap) return false;
+                continue;
             }
-            const double hLo = std::min(helix.spiral.y0, helix.spiral.y1) - clr;
-            const double hHi = std::max(helix.spiral.y0, helix.spiral.y1) + clr;
+            // A riser is a SEG, not a spiral: take its axial span from its endpoints.
+            const double pLo = helix.kind == Primitive::SEG
+                                   ? std::min(helix.seg.a.Y(), helix.seg.b.Y())
+                                   : std::min(helix.spiral.y0, helix.spiral.y1);
+            const double pHi = helix.kind == Primitive::SEG
+                                   ? std::max(helix.seg.a.Y(), helix.seg.b.Y())
+                                   : std::max(helix.spiral.y0, helix.spiral.y1);
+            const double hLo = pLo - clr;
+            const double hHi = pHi + clr;
             for (const auto& sg : leadPrims) {
                 double sLo, sHi;
                 if (sg.kind == Primitive::SEG) {
@@ -9012,6 +9093,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     *why = w.str();
                 }
                 return false;
+            }
             }
             return true;
         };
@@ -9060,7 +9142,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // to its pin and carves its notch in the cut bobbin (see checkWindowContainment).
                 // What the slot must fund is the wrap's own pitch-true height at this slot.
                 std::vector<Primitive> all;
-                if (const auto helix = ownHelixOf(L, c)) all.push_back(*helix);
+                for (auto& pr : ownPiecesOf(L, c)) all.push_back(pr);
                 for (const auto& pr : all) {
                     double lo, hi;
                     if (!cert::primAxialExtentInReach(pr, wb->axisX, wb->outerR, lo, hi)) continue;
@@ -9092,17 +9174,46 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // parallels of the same winding are packed at exactly one coated diameter by MKF and
             // are expected to touch; two DIFFERENT windings are separated by insulation and may
             // not.
-            if (const auto ownWrap = ownHelixOf(L, c)) {
+            if (const auto ownWrapPieces = ownPiecesOf(L, c); !ownWrapPieces.empty()) {
                 for (const auto& R : rows) {
                     if (R.cHi < 1e29 || R.ci == L.ci) continue;
                     if (conductors[R.ci].winding == conductors[L.ci].winding) continue;
-                    const Primitive other = wrapHelixOf(R);
-                    if (!cert::provePairClears(*ownWrap, other,
-                                               L.rw + R.rwCoat - cert::kCoordinateGridHalf)
-                             .clears) {
-                        if (why != nullptr)
-                            *why = "this conductor's own wrap does not clear " +
-                                   conductors[R.ci].winding + " at this slot";
+                    const double envelope = L.rw + R.rwCoat - cert::kCoordinateGridHalf;
+                    cert::Verdict v;
+                    const Primitive* ownWrap = nullptr;
+                    const Primitive* otherP = nullptr;
+                    const auto otherPieces = wrapPiecesOf(R);
+                    for (const auto& a : ownWrapPieces) {
+                        for (const auto& b : otherPieces) {
+                            const cert::Verdict w = cert::provePairClears(a, b, envelope);
+                            if (w.clears) continue;
+                            v = w; ownWrap = &a; otherP = &b;
+                            break;
+                        }
+                        if (otherP != nullptr) break;
+                    }
+                    if (otherP != nullptr) {
+                        if (why != nullptr) {
+                            // Say BY HOW MUCH, and against which turn. A shortfall here is not a
+                            // property of the slot -- the radial separation between two windings
+                            // is MKF's layout -- so the number is what tells a reader whether to
+                            // look at the fan at all (2026-09-03: complete_flyback refused every
+                            // slot on this line while the message blamed the lead layout).
+                            std::ostringstream w;
+                            w.precision(9);
+                            const auto pA = cert::evalPrim(*ownWrap, v.tA);
+                            const auto pB = cert::evalPrim(*otherP, v.tB);
+                            w << "this conductor's own wrap comes within "
+                              << v.violationUB * 1e6 << " um of " << conductors[R.ci].winding
+                              << " (ci=" << (size_t)R.ci << "), and two windings need "
+                              << envelope * 1e6 << " um between centrelines"
+                              << " [witness '" << ownWrap->label << "' at ("
+                              << pA.X() * 1e3 << "," << pA.Y() * 1e3 << "," << pA.Z() * 1e3
+                              << ") mm vs '" << otherP->label << "' at ("
+                              << pB.X() * 1e3 << "," << pB.Y() * 1e3 << "," << pB.Z() * 1e3
+                              << ") mm]";
+                            *why = w.str();
+                        }
                         return false;
                     }
                 }
@@ -9169,14 +9280,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             gp_Vec toNeighbour(0, 0, 0);
             for (const auto& R : rows) {
                 if (R.ci == L.ci || R.cHi < 1e29) continue;
-                const Primitive other = wrapHelixOf(R);
-                const cert::Bounds b = cert::boundedMinDist(*helix, other, 0.25 * kCertEpsilon, 20000);
-                if (b.lb >= best) continue;
-                const gp_Pnt q = cert::evalPrim(other, b.tb);
-                gp_Vec d(P, q);
-                if (d.Magnitude() > 6.0 * L.rw) continue;
-                best = b.lb;
-                toNeighbour = d;
+                // The emitted pieces: the roll must escape the copper that is really there.
+                for (const Primitive& other : wrapPiecesOf(R)) {
+                    const cert::Bounds b =
+                        cert::boundedMinDist(*helix, other, 0.25 * kCertEpsilon, 20000);
+                    if (b.lb >= best) continue;
+                    const gp_Pnt q = cert::evalPrim(other, b.tb);
+                    gp_Vec d(P, q);
+                    if (d.Magnitude() > 6.0 * L.rw) continue;
+                    best = b.lb;
+                    toNeighbour = d;
+                }
             }
             if (toNeighbour.Magnitude() < 1e-12) return none;   // nothing near: keep the default
             toNeighbour -= T * toNeighbour.Dot(T);
@@ -10022,14 +10136,31 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         explainBlockAt(cx);
                     }
                 }
+                // NAME THE CONSTRAINT THAT BINDS. The old text always blamed the side-by-side
+                // run, and on complete_flyback that number is 0.000 mm: the four parallels need
+                // no lateral run at all, and what refused every slot was the Secondary's own
+                // wrap against the Primary -- a separation MKF's layout fixes, which no lead
+                // slot can change. Ask the block why, at the plane, and quote it (2026-09-03).
+                setBlockCand(cMax);
+                std::string bindingWhy;
+                for (size_t g = 0; g < group.size() && bindingWhy.empty(); ++g) {
+                    const double cg = azMember(g, cMax);
+                    if (std::isnan(cg)) { bindingWhy = "does not fit on its radius"; break; }
+                    std::string w;
+                    if (!leadRowsClearAnyFillet(verts[group[g]], cg, &w)) bindingWhy = w;
+                }
+                clearBlockCand();
                 throw std::runtime_error(
                     "ConductorBuilder: the terminal leads of '" + verts[group[0]].wname +
                     "' (" + std::to_string(group.size()) + " parallel" +
                     (group.size() == 1 ? "" : "s") + ", " +
                     std::to_string(spread * 1e3) + " mm of side-by-side run needed on a " +
                     std::to_string(verts[group[0]].r * 1e3) + " mm radius) cannot all be laid "
-                    "out clear of the window's other verticals. Fix the winding data or the "
-                    "MKF blocking -- the leads are never moved into each other.");
+                    "out clear of the window's other verticals. At the plane the binding "
+                    "constraint is: " + (bindingWhy.empty() ? std::string("(none reported)")
+                                                            : bindingWhy) +
+                    ". Fix the winding data or the MKF blocking -- the leads are never moved "
+                    "into each other.");
             }
             // ABT #685 (Alf): "why are Primary parallels not starting with the first parallel
             // centre in x=0?" -- a block that does NOT land on the plane owes an explanation, so
