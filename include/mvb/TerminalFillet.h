@@ -11,6 +11,7 @@
 // tangent, so nothing is mitred and nothing is bridged.
 #include <mvb/WireAssembler.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,15 @@ namespace mvb {
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                              const std::string& who, int entranceVariant = 0,
                              int exitVariant = 0);
+
+// Replaces each straight radial LAYER LINK by a biarc tangent to the two wraps it joins, taking
+// the azimuth it needs from each (ABT #969, Alf's option 2). `clears` decides between the
+// candidate transitions: the roundest one is the kindest to the wire, but a long transition
+// sweeps azimuth and can reach a neighbouring parallel (14_dab: 11.7 um), so the caller -- which
+// is the only place that can see the other conductors -- vetoes. Candidates run from the roundest
+// down to the tightest that still respects the bend radius; without a predicate the roundest wins.
+size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std::string& who,
+                        const std::function<bool(const Primitive&, const Primitive&)>& clears = {});
 // Bend radius = kRoundCornerBendFactor * wire radius (the corner rule everywhere else).
 inline size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend,
                                     const std::string& who, int entranceVariant = 0,

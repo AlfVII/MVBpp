@@ -384,7 +384,8 @@ bool filletable(const Primitive& helixSide, const Primitive& straightSide) {
 // needs from each: stepping one coated OD with bends of the bend radius takes about 0.84 mm of
 // travel, which at an 11.5 mm radius is ~4 deg. The straight chunk is gone, not reshaped.
 // MVB_STRAIGHT_LINK=1 restores it (bisect switch).
-size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std::string& who) {
+size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std::string& who,
+                        const std::function<bool(const Primitive&, const Primitive&)>& clears) {
     if (std::getenv("MVB_STRAIGHT_LINK") != nullptr) return 0;
     size_t done = 0;
     for (size_t i = 0; i + 2 < prims.size(); ++i) {
@@ -397,6 +398,7 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
         const double spanA = std::abs(a.az1 - a.az0), spanB = std::abs(b.az1 - b.az0);
         const SpiralEval endA = evalSpiral(a, a.az1);
         std::optional<Biarc> best;
+        std::vector<std::pair<Biarc, double>> candidates;   // (transition, azimuth taken per wrap)
         double dA = 0.0, dB = 0.0;
         // THE GENTLEST TRANSITION THAT FITS, not the tightest. A winder does not bend at the
         // minimum radius unless the space forces it, and the tightest biarc leans hardest
@@ -417,6 +419,22 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
             if (best && fit->minRadius < best->minRadius) break;   // getting tighter again
             best = fit;
             dA = dB = dTry;
+            candidates.push_back({*fit, dTry});
+        }
+        // Roundest first, then progressively tighter, until the caller stops vetoing.
+        if (clears) {
+            bool accepted = false;
+            for (size_t ci = candidates.size(); ci-- > 0;) {
+                if (!clears(candidates[ci].first.a1.pr, candidates[ci].first.a2.pr)) continue;
+                best = candidates[ci].first;
+                dA = dB = candidates[ci].second;
+                accepted = true;
+                break;
+            }
+            if (!accepted && !candidates.empty()) {
+                best = candidates.front().first;   // nothing clears: the tightest, and the gate speaks
+                dA = dB = candidates.front().second;
+            }
         }
         if (!best) {
             std::ostringstream m;
@@ -459,7 +477,6 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
 
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                              const std::string& who, int entranceVariant, int exitVariant) {
-    smoothLayerLinks(prims, minBend, who);
     size_t done = 0;
     for (size_t i = 0; i + 1 < prims.size(); ++i) {
         const bool exitCorner = filletable(prims[i], prims[i + 1]);
@@ -590,6 +607,13 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                 // excursion into the next layer -- a bend in the osculating plane there swung
                 // 150 um outward on pushpull/06 and 20-100 um into the neighbouring layer).
                 gp_Vec nH = spiralPrincipalNormal(cutSp, azCut);
+                // The variant's high digit picks the PLANE the helix-side bend turns in: 0 is the
+                // one nearest the lead (below), 1 is the other of the helix's two natural planes.
+                // Angle alone is not enough of a choice when the neighbour is a steep wrap that
+                // sweeps the whole window -- it is one coated OD away at every height, so the
+                // escape has to point somewhere else, not merely turn less (14_dab).
+                const int variantIn = std::max(0, exitCorner ? exitVariant : entranceVariant);
+                const bool otherPlane = (variantIn / 12) % 2 == 1;
                 {
                     // Snap the bend direction to one of the helix's two natural planes: the
                     // osculating plane (T, N) when the lead lies radially, the rectifying plane
@@ -607,8 +631,8 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                         gp_Vec B = tHx.Crossed(nH);
                         B.Normalize();
                         const double cN = toLead.Dot(nH), cB = toLead.Dot(B);
-                        nH = (std::abs(cN) >= std::abs(cB)) ? nH * (cN >= 0 ? 1.0 : -1.0)
-                                                            : B * (cB >= 0 ? 1.0 : -1.0);
+                        const bool useN = (std::abs(cN) >= std::abs(cB)) != otherPlane;
+                        nH = useN ? nH * (cN >= 0 ? 1.0 : -1.0) : B * (cB >= 0 ? 1.0 : -1.0);
                     }
                 }
                 best.reset();
@@ -669,7 +693,7 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                 // way round on 14_dab: forcing the GENTLEST fit instead of the tightest took the
                 // intrusion from 4 nm to 551 nm.) 1 deg steps, so a 5 deg corner is not rounded
                 // to 5 deg of excursion when 1 deg would do.
-                const int wantVariant = std::max(0, exitCorner ? exitVariant : entranceVariant);
+                const int wantVariant = variantIn % 12;
                 int seen = 0;
                 std::optional<Fillet> lastFit;
                 // Spread the candidates across the whole admissible range rather than in 1 deg

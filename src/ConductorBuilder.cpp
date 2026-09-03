@@ -9077,7 +9077,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // winner at commit time, below, and hands it to the emitter). Without this the search
         // judged every slot by the tightest fillet alone and 14_dab had no anchor at all.
         auto leadRowsClearAnyFillet = [&](const Vert& L, double c, std::string* why = nullptr) {
-            for (int v = 0; v < 12; ++v)
+            for (int v = 0; v < 24; ++v)
                 if (leadRowsClear(L, c, v == 0 ? why : nullptr, v)) return true;
             return false;
         };
@@ -10267,7 +10267,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // the corner. The fan tries them here, at the slot it has settled on, and hands the
         // winner to the emitter -- exactly as it hands over the attach leg.
         auto bestFilletVariant = [&](const Vert& L, double c) {
-            for (int v = 0; v < 12; ++v)
+            for (int v = 0; v < 24; ++v)
                 if (leadRowsClear(L, c, nullptr, v)) return v;
             return 0;
         };
@@ -13493,6 +13493,34 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
         // WHICH fillet at each terminal corner is the fan's decision (it is the only model that
         // can see the neighbouring parallel); 0 where it had nothing to say.
+        // THE LINK IS SMOOTHED WITH THE NEIGHBOURS IN VIEW. Every path exists by now, so the
+        // transition can be vetoed when it would sweep into another conductor: the roundest one
+        // is kindest to the wire, but on 14_dab it reached 11.7 um into a sibling parallel. The
+        // veto walks down to tighter transitions; if none clears, the tightest is kept and the
+        // certified gate below has the last word (no silent acceptance).
+        smoothLayerLinks(
+            p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
+            [&](const Primitive& a1, const Primitive& a2) {
+                for (size_t qi = 0; qi < paths.size(); ++qi) {
+                    if (qi == pi) continue;
+                    const double envelope = p.wireRadius + paths[qi].wireRadius;
+                    for (const auto& other : paths[qi].prims) {
+                        for (const Primitive* arc : {&a1, &a2}) {
+                            const auto ends = primEndpoints(*arc);
+                            const auto oends = primEndpoints(other);
+                            // cheap reject: nothing within reach of either end
+                            const double reach = 4.0 * envelope + ends.first.Distance(ends.second);
+                            if (ends.first.Distance(oends.first) > reach &&
+                                ends.first.Distance(oends.second) > reach &&
+                                ends.second.Distance(oends.first) > reach &&
+                                ends.second.Distance(oends.second) > reach)
+                                continue;
+                            if (!cert::provePairClears(*arc, other, envelope).clears) return false;
+                        }
+                    }
+                }
+                return true;
+            });
         const size_t filleted = filletTerminalCorners(
             p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
             leadFilletIn.count(pi) ? leadFilletIn.at(pi) : 0,
