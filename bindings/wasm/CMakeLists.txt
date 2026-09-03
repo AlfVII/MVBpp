@@ -188,6 +188,7 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/Utils.cpp
     ${REPO_ROOT}/src/TurnBuilder.cpp
     ${REPO_ROOT}/src/ConductorBuilder.cpp
+    ${REPO_ROOT}/src/TerminalFillet.cpp
     ${REPO_ROOT}/src/WireAssembler.cpp
     ${REPO_ROOT}/src/BobbinBuilder.cpp
     ${REPO_ROOT}/src/shapes/ShapeBuilder.cpp
@@ -210,18 +211,25 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/shapes/Factory.cpp
 )
 
-# This source list DUPLICATES the native build's, and it has now drifted TWICE -- once missing
-# ConductorBuilder.cpp (the wasm was unbuildable from main since June) and once missing
-# ShapeDrum.cpp (wasm-ld: "undefined symbol: vtable for mvb::shapes::ShapeDrum"). Both surfaced
-# only at LINK time, long after the source landed. Fail at CONFIGURE instead: every
-# src/shapes/*.cpp on disk must be listed above.
+# This source list DUPLICATES the native build's, and it has now drifted THREE times -- missing
+# ConductorBuilder.cpp (the wasm was unbuildable from main since June), then ShapeDrum.cpp
+# (wasm-ld: "undefined symbol: vtable for mvb::shapes::ShapeDrum"), then TerminalFillet.cpp
+# (undefined smoothLayerLinks / filletTerminalCorners). Every one surfaced only at LINK time,
+# long after the source landed.
+#
+# The third one got through a guard written to prevent exactly this, because that guard globbed
+# only src/shapes/*.cpp -- and TerminalFillet.cpp lives in src/. A guard narrower than the list
+# it protects gives false confidence: the configure passed, so the omission looked impossible.
+# So the glob is now RECURSIVE over every source the native build compiles.
 get_target_property(_mvb_wasm_srcs mvb++ SOURCES)
-file(GLOB _mvb_shape_srcs "${REPO_ROOT}/src/shapes/*.cpp")
-foreach(_s ${_mvb_shape_srcs})
+file(GLOB_RECURSE _mvb_all_srcs "${REPO_ROOT}/src/*.cpp")
+foreach(_s ${_mvb_all_srcs})
     if(NOT "${_s}" IN_LIST _mvb_wasm_srcs)
         message(FATAL_ERROR
-            "bindings/wasm/CMakeLists.txt does not list ${_s}. Every src/shapes/*.cpp must appear "
-            "in the wasm mvb++ source list or the link fails with an undefined vtable.")
+            "bindings/wasm/CMakeLists.txt does not list ${_s}. Every src/**/*.cpp must appear in "
+            "the wasm mvb++ source list, or the link fails with an undefined symbol or vtable. "
+            "If a source is deliberately native-only, exclude it here explicitly rather than by "
+            "omission, so the intent is visible.")
     endif()
 endforeach()
 
