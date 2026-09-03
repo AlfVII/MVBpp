@@ -7814,7 +7814,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // conductor -> the length of the LEVEL leg its lead keeps at the attach before climbing to
     // MKF's row (the fan's answer, from the terminal fillet it derives; see emittedRoute)
     std::map<size_t, std::pair<double, double>> leadLegIn, leadLegOut;   // (dr, dy)
-    std::map<size_t, int> leadFilletIn, leadFilletOut;   // which terminal fillet the fan chose
+    // The ROLL the fan solved for at each terminal corner (radians about the helix tangent);
+    // absent = the historical corner.
+    std::map<size_t, double> leadFilletIn, leadFilletOut;
     // ABT #839 mechanism C: per (conductor, side), the stub sweep cap -- half the azimuth gap
     // to the nearest ROTATED same-winding sibling lane on the stub's own sweep side. Filled at
     // the fan tail, consumed by the emission (see appendRoundWrap's cappedStub).
@@ -8822,8 +8824,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // is the centreline that is swept: the two arcs, the shortened lead, the rest of the run.
         // The wrap helix itself is the lead's own copper and is not returned. Empty when no
         // fillet fits at this slot: the emitter would refuse the corner, so the slot is infeasible.
+        // STRICT MODE. The fan and the gate prove the same pairs, but the fan allows itself the
+        // half-nanometre coordinate grid and stops at a coarser bound budget -- so it can accept
+        // a slot the gate then refuses by hundredths of a nanometre (11_pushpull: 0.51 nm against
+        // a 0.50 nm allowance). When choosing the corner's roll the fan therefore proves with NO
+        // allowance first, and only falls back to the relaxed proof if nothing clears that way.
+        bool filletStrict = false;
+        const auto gridSlack = [&]() { return filletStrict ? 0.0 : cert::kCoordinateGridHalf; };
         auto leadPrims3D = [&](const Vert& L, double c,
-                               int filletVariant = 0) -> std::optional<std::vector<Primitive>> {
+                               double filletRoll = std::numeric_limits<double>::quiet_NaN())
+            -> std::optional<std::vector<Primitive>> {
             const std::vector<PlanePt> wp = emittedRoute(L, c);
             const double zo = conductorZoff[L.ci];
             const double azL = kPlaneAz + c;
@@ -8864,8 +8874,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             try {
                 filletTerminalCorners(chain, kRoundCornerBendFactor * L.rwEmit, L.rwEmit,
                                       conductors[L.ci].winding + " (fan)",
-                                      L.entrance ? filletVariant : 0,
-                                      L.entrance ? 0 : filletVariant);
+                                      L.entrance ? filletRoll : std::numeric_limits<double>::quiet_NaN(),
+                                      L.entrance ? std::numeric_limits<double>::quiet_NaN() : filletRoll);
             }
             catch (const std::runtime_error& e) {
                 if (std::getenv("MVB_LEAD_DIAG")) {
@@ -8899,7 +8909,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             auto assignedVariant = [&](const Vert& V) {
                 const auto& m = V.entrance ? leadFilletIn : leadFilletOut;
                 auto it = m.find(V.ci);
-                return it == m.end() ? 0 : it->second;
+                return it == m.end() ? std::numeric_limits<double>::quiet_NaN() : it->second;
             };
             const auto pa = leadPrims3D(A, cA, assignedVariant(A));
             const auto pb = leadPrims3D(B, cB, assignedVariant(B));
@@ -8910,7 +8920,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (const auto& a : *pa)
                 for (const auto& b : *pb) {
                     const cert::Verdict v =
-                        cert::provePairClears(a, b, clr - cert::kCoordinateGridHalf);
+                        cert::provePairClears(a, b, clr - gridSlack());
                     if (!v.clears) {
                         if (std::getenv("MVB_LEAD_DIAG") && azCandSet.size() && explainPairs) {
                             const gp_Pnt qa = cert::evalPrim(a, v.tA), qb = cert::evalPrim(b, v.tB);
@@ -8984,7 +8994,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
                 if (sHi < hLo || sLo > hHi) continue;
                 const cert::Verdict v =
-                    cert::provePairClears(sg, helix, clr - cert::kCoordinateGridHalf);
+                    cert::provePairClears(sg, helix, clr - gridSlack());
                 if (v.clears) continue;
                 if (why != nullptr) {
                     const gp_Pnt qa = cert::evalPrim(sg, v.tA), qb = cert::evalPrim(helix, v.tB);
@@ -9006,7 +9016,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             return true;
         };
         auto leadRowsClear = [&](const Vert& L, double c, std::string* why = nullptr,
-                                 int filletVariant = 0) {
+                                 double filletRoll = std::numeric_limits<double>::quiet_NaN()) {
             if (L.kind == 1) return true;   // dragbacks keep the drift-window model
             if (L.kind == 2) {
                 // ABT #831: a LINK is scoped the OPPOSITE way to a lead. On the plane it is safe
@@ -9035,7 +9045,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // exactly the coated envelope, and the fan never measured it. Primary p0's exit lead
             // was 80 nm inside p1's terminal stub at the slot the fan handed it. Only the lead's
             // OWN conductor keeps the soft, station-exempt check (leadOwnRowsSoft).
-            const auto prims = leadPrims3D(L, c, filletVariant);
+            const auto prims = leadPrims3D(L, c, filletRoll);
             if (!prims) {
                 if (why != nullptr) *why = "no terminal fillet fits the corner at this slot";
                 return false;
@@ -9092,11 +9102,88 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // complete_flyback onto a slot where two sibling fillets ended 4.2 um into each other.
         // So the whole fan runs once with the default fillet, and only a winding that finds no
         // anchor at all re-runs with the variants unlocked (14_dab is the design that needs it).
-        bool filletVariantsUnlocked = false;
+        // THE ROLL IS SOLVED, NOT SEARCHED. A corner escapes the helix in some direction about
+        // its own tangent. MKF places conductors at EXACTLY one coated diameter, so the rule is
+        // simply that the escape may not point at a neighbour: the admissible rolls are the
+        // half-circle facing away from the nearest copper, and the answer is the one closest to
+        // where the lead has to go. Measuring the nearest neighbour costs one scan; there is
+        // nothing to walk down.
+        auto solveFilletRoll = [&](const Vert& L, double c) {
+            const double none = std::numeric_limits<double>::quiet_NaN();
+            const auto helix = ownHelixOf(L, c);
+            if (!helix || L.kind != 0) return none;
+            // The corner: where the lead meets the helix, with the helix's own frame there.
+            const double azCorner = L.entrance ? helix->spiral.az0 : helix->spiral.az1;
+            const double tCorner = L.entrance ? 0.0 : 1.0;
+            const gp_Pnt P = cert::evalPrim(*helix, tCorner);
+            const double h = 1e-4;
+            const gp_Pnt Pn = cert::evalPrim(*helix, L.entrance ? h : 1.0 - h);
+            gp_Vec T = L.entrance ? gp_Vec(P, Pn) : gp_Vec(Pn, P);
+            if (T.Magnitude() < 1e-15) return none;
+            T.Normalize();
+            (void)azCorner;
+            // Principal normal of a helix points at its axis; the binormal completes the frame.
+            gp_Vec N(-(P.X() - helix->spiral.cx), 0.0, -(P.Z() - helix->spiral.cz));
+            N -= T * N.Dot(T);
+            if (N.Magnitude() < 1e-12) return none;
+            N.Normalize();
+            gp_Vec B = T.Crossed(N);
+            B.Normalize();
+            // Where the lead needs to go, in that frame.
+            gp_Vec toLead(P, L.entrance ? gp_Pnt(0, 0, 0) : gp_Pnt(0, 0, 0));
+            {
+                const auto prims = leadPrims3D(L, c);
+                if (!prims || prims->empty()) return none;
+                const Primitive& seg = L.entrance ? prims->front() : prims->back();
+                const gp_Pnt tip = L.entrance ? seg.seg.a : seg.seg.b;
+                toLead = gp_Vec(P, tip);
+            }
+            toLead -= T * toLead.Dot(T);
+            if (toLead.Magnitude() < 1e-12) return none;
+            toLead.Normalize();
+            const double rollLead = std::atan2(toLead.Dot(B), toLead.Dot(N));
+            // The nearest copper that is not this conductor's own, within a few diameters.
+            double best = std::numeric_limits<double>::max();
+            gp_Vec toNeighbour(0, 0, 0);
+            for (const auto& R : rows) {
+                if (R.ci == L.ci || R.cHi < 1e29) continue;
+                const Primitive other = wrapHelixOf(R);
+                const cert::Bounds b = cert::boundedMinDist(*helix, other, 0.25 * kCertEpsilon, 20000);
+                if (b.lb >= best) continue;
+                const gp_Pnt q = cert::evalPrim(other, b.tb);
+                gp_Vec d(P, q);
+                if (d.Magnitude() > 6.0 * L.rw) continue;
+                best = b.lb;
+                toNeighbour = d;
+            }
+            if (toNeighbour.Magnitude() < 1e-12) return none;   // nothing near: keep the default
+            toNeighbour -= T * toNeighbour.Dot(T);
+            if (toNeighbour.Magnitude() < 1e-12) return none;
+            toNeighbour.Normalize();
+            const double rollAway = std::atan2(toNeighbour.Dot(B), toNeighbour.Dot(N)) + kPi;
+            // Admissible: within a quarter turn of "away". Otherwise take the nearer boundary.
+            const double delta = std::remainder(rollLead - rollAway, kTwoPi);
+            if (std::abs(delta) <= 0.5 * kPi) return rollLead;
+            return rollAway + (delta > 0 ? 0.5 * kPi : -0.5 * kPi);
+        };
+        // ONE PARAMETER, SOLVED FIRST. The corner's roll is computed from where the neighbours
+        // are; only if that does not clear -- the scan sees the wrap rows, and a corner can be
+        // pinned by something else -- is the same parameter swept, sixteen ways round. There is
+        // no product of planes and angles to walk any more, and the default corner still comes
+        // first so a design that never needed this is untouched.
+        auto filletRollCandidates = [&](const Vert& L, double c) {
+            std::vector<double> out{std::numeric_limits<double>::quiet_NaN()};
+            const double solved = solveFilletRoll(L, c);
+            if (std::isfinite(solved)) out.push_back(solved);
+            for (int i = 0; i < 16; ++i) out.push_back(kTwoPi * i / 16.0);
+            return out;
+        };
         auto leadRowsClearAnyFillet = [&](const Vert& L, double c, std::string* why = nullptr) {
-            if (!filletVariantsUnlocked) return leadRowsClear(L, c, why, 0);
-            for (int v = 0; v < 24; ++v)
-                if (leadRowsClear(L, c, v == 0 ? why : nullptr, v)) return true;
+            bool first = true;
+            for (double roll : filletRollCandidates(L, c)) {
+                if (leadRowsClear(L, c, first ? why : nullptr, roll)) return true;
+                first = false;
+            }
             return false;
         };
         auto leadOwnRowsSoft = [&](const Vert& L, double c, std::string* why = nullptr) {
@@ -9882,21 +9969,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // into the emitted spine, or quietly hand back a slot the caller believes is
                 // clear. Say what is wrong.
                 double spread = xoff.empty() ? 0.0 : xoff.back();
-                // LAST RESORT: no anchor with the default fillet. Unlock the fillet variants and
-                // let this block try again -- 14_dab's Primary bundle exists only on a corner
-                // that escapes in the helix's other natural plane. Once unlocked they stay so;
-                // every block already placed keeps the slot it found with the default fillet.
-                if (!filletVariantsUnlocked) {
-                    filletVariantsUnlocked = true;
-                    if (std::getenv("MVB_LEAD_DIAG"))
-                        std::fprintf(stderr,
-                                     "[fan-fillet] wname='%s' entrance=%d: no anchor with the "
-                                     "default fillet -- unlocking the variants\n",
-                                     verts[group[0]].wname.c_str(), (int)verts[group[0]].entrance);
-                    k = SIZE_MAX;   // restart the placement pass with the variants available
-                    continue;
-                }
-                if (std::getenv("MVB_LEAD_DIAG")) {
+        if (std::getenv("MVB_LEAD_DIAG")) {
                     std::fprintf(stderr,
                                  "[fan-noslot] wname='%s' entrance=%d: no feasible anchor. At the "
                                  "plane:\n", verts[group[0]].wname.c_str(),
@@ -10300,10 +10373,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // the corner. The fan tries them here, at the slot it has settled on, and hands the
         // winner to the emitter -- exactly as it hands over the attach leg.
         auto bestFilletVariant = [&](const Vert& L, double c) {
-            if (!filletVariantsUnlocked) return 0;
-            for (int v = 0; v < 24; ++v)
-                if (leadRowsClear(L, c, nullptr, v)) return v;
-            return 0;
+            const auto candidates = filletRollCandidates(L, c);
+            for (int strict = 1; strict >= 0; --strict) {
+                filletStrict = strict != 0;
+                for (double roll : candidates) {
+                    if (leadRowsClear(L, c, nullptr, roll)) {
+                        filletStrict = false;
+                        return roll;
+                    }
+                }
+            }
+            filletStrict = false;
+            return std::numeric_limits<double>::quiet_NaN();
         };
         // Iterated to a fixpoint: assigning greedily lets a later member's choice invalidate a
         // pair an earlier one was checked on (complete_flyback: two sibling terminal fillets
@@ -10311,15 +10392,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         for (int pass = 0; pass < 3; ++pass)
         for (size_t k = 0; k < verts.size(); ++k) {
             if (verts[k].kind != 0 || !azAssigned[k]) continue;
-            const int v = bestFilletVariant(verts[k], az[k]);
-            // Record even variant 0, so a later member sees THIS one's decision rather than a
-            // default it will not be built with (the assignment is greedy, in vertical order).
+            const double v = bestFilletVariant(verts[k], az[k]);
+            if (!std::isfinite(v)) continue;
             for (size_t m : verts[k].cis)
                 (verts[k].entrance ? leadFilletIn : leadFilletOut)[m] = v;
-            if (v == 0) continue;
             if (std::getenv("MVB_LEAD_DIAG") && pass == 2)
-                std::fprintf(stderr, "[fan-fillet] ci=%zu %s: fillet variant %d clears\n",
-                             (size_t)verts[k].ci, verts[k].entrance ? "entrance" : "exit", v);
+                std::fprintf(stderr, "[fan-fillet] ci=%zu %s: corner rolled to %.3f deg\n",
+                             (size_t)verts[k].ci, verts[k].entrance ? "entrance" : "exit",
+                             v * 180.0 / kPi);
         }
         // CONSECUTIVE dragback transitions of one conductor (a single-turn layer) chain end to
         // start: force them onto one azimuth so the chain stays connected.
@@ -13528,6 +13608,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // per-path copy inside the assembly loop, and the certified gate never saw an arc). In place
     // on the path the solids are NAMED from, so the per-solid primitive indices the assembler
     // returns stay one-to-one.
+    // THE CORNER IS SETTLED WHERE THE TRUTH IS. The fan chooses a roll from its own model of
+    // the winding, and that model is a reconstruction: on 11_pushpull it differed from the drawn
+    // geometry by ten picometres, enough for the fan to accept a corner the gate then refused at
+    // 0.51 nm against its 0.50 nm grid allowance. So the roll the fan picked is a HINT, and after
+    // the pieces are actually filleted the terminal arcs are proven against every other
+    // conductor; a corner that does not clear is re-rolled and redrawn, up to a full turn's worth
+    // of candidates. Nothing is accepted on a model any more.
+    std::vector<std::vector<Primitive>> preFilletPrims(paths.size());
+    for (size_t pi = 0; pi < paths.size(); ++pi) preFilletPrims[pi] = paths[pi].prims;
     for (size_t pi = 0; pi < paths.size(); ++pi) {
         auto& p = paths[pi];
         if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
@@ -13563,11 +13652,65 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             });
         const size_t filleted = filletTerminalCorners(
             p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
-            leadFilletIn.count(pi) ? leadFilletIn.at(pi) : 0,
-            leadFilletOut.count(pi) ? leadFilletOut.at(pi) : 0);
+            leadFilletIn.count(pi) ? leadFilletIn.at(pi) : std::numeric_limits<double>::quiet_NaN(),
+            leadFilletOut.count(pi) ? leadFilletOut.at(pi) : std::numeric_limits<double>::quiet_NaN());
         if (std::getenv("MVB_DIAG") && filleted)
             std::cerr << "[buildAll] '" << p.name << "' filleted " << filleted
                       << " terminal corner(s)\n";
+    }
+    // Re-roll any terminal corner whose DRAWN arcs do not clear another conductor.
+    {
+        auto arcsClear = [&](size_t pi) {
+            for (const auto& pr : paths[pi].prims) {
+                if (pr.label.find("fillet arc") == std::string::npos) continue;
+                for (size_t qi = 0; qi < paths.size(); ++qi) {
+                    if (qi == pi) continue;
+                    const double envelope = paths[pi].wireRadius + paths[qi].wireRadius;
+                    for (const auto& other : paths[qi].prims) {
+                        const auto a = primEndpoints(pr);
+                        const auto b = primEndpoints(other);
+                        const double reach = 4.0 * envelope + a.first.Distance(a.second);
+                        if (a.first.Distance(b.first) > reach && a.first.Distance(b.second) > reach &&
+                            a.second.Distance(b.first) > reach && a.second.Distance(b.second) > reach)
+                            continue;
+                        if (!cert::provePairClears(pr, other, envelope - cert::kCoordinateGridHalf)
+                                 .clears)
+                            return false;
+                    }
+                }
+            }
+            return true;
+        };
+        for (size_t pi = 0; pi < paths.size(); ++pi) {
+            auto& p = paths[pi];
+            if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
+            if (arcsClear(pi)) continue;
+            const double had = leadFilletIn.count(pi) ? leadFilletIn.at(pi)
+                                                      : std::numeric_limits<double>::quiet_NaN();
+            bool fixed = false;
+            for (int k = 0; k < 24 && !fixed; ++k) {
+                const double roll = kTwoPi * k / 24.0;
+                p.prims = preFilletPrims[pi];
+                smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name);
+                filletTerminalCorners(p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius,
+                                      p.name, roll, roll);
+                if (arcsClear(pi)) {
+                    fixed = true;
+                    if (std::getenv("MVB_DIAG"))
+                        std::cerr << "[buildAll] '" << p.name << "' terminal corners re-rolled to "
+                                  << roll * 180.0 / kPi << " deg (the fan's hint did not clear)\n";
+                }
+            }
+            if (!fixed) {
+                // Put back what the fan asked for and let the gate name the pair.
+                p.prims = preFilletPrims[pi];
+                smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name);
+                filletTerminalCorners(
+                    p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius, p.name, had,
+                    leadFilletOut.count(pi) ? leadFilletOut.at(pi)
+                                            : std::numeric_limits<double>::quiet_NaN());
+            }
+        }
     }
 
     if (opts.diagnosticSkipCollisionCheck) {

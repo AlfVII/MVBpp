@@ -12,6 +12,7 @@
 #include <mvb/WireAssembler.h>
 
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -20,17 +21,20 @@ namespace mvb {
 // Fillets every terminal corner in `prims` -- an exact-helix "(terminal stub)" SPIRAL adjacent to a
 // "lead seg" SEG, in either order -- in place. Returns how many corners were filleted. Throws,
 // naming the corner, when a fillet with radius >= minBend does not fit.
-// entranceVariant / exitVariant pick WHICH admissible fillet to use at that corner: the search
-// walks the helix-side bend angle from 1 degree up and 0 takes the first that closes, 1 the next,
-// and so on (clamped to the last available). The corner alone cannot tell which is best -- the
-// arcs leave the helix by a few nanometres to a few microns, and whether that matters depends on
-// where the NEIGHBOURING conductor is, which only the fan knows. So the fan tries variants when a
-// member does not clear, and hands the winner to the emitter (leadFilletIn / leadFilletOut), the
-// same way it hands over the attach leg. Measured on 14_dab: variant 0 leaves 4.16 nm and 2.30 nm
-// of interpenetration on two members; other variants clear them.
+// entranceRoll / exitRoll: the ROLL of the corner about the helix's own tangent, in radians from
+// the principal normal towards the binormal. NaN (the default) keeps the historical corner, which
+// snaps to whichever of the two natural planes the lead lies nearer.
+//
+// The corner alone cannot choose it. A fillet leaves the helix by a few nanometres to a few
+// microns, and MKF places conductors at EXACTLY one coated diameter, so whether that excursion
+// matters depends entirely on where the neighbour is -- which only the fan can see. What the fan
+// computes is not a search: at exact touch a wire may not bend TOWARDS a neighbour at all, so the
+// admissible rolls are a half-circle (those pointing away from it) and the answer is the one
+// nearest the direction the lead actually needs. One construction, every design.
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
-                             const std::string& who, int entranceVariant = 0,
-                             int exitVariant = 0);
+                             const std::string& who,
+                             double entranceRoll = std::numeric_limits<double>::quiet_NaN(),
+                             double exitRoll = std::numeric_limits<double>::quiet_NaN());
 
 // Replaces each straight radial LAYER LINK by a biarc tangent to the two wraps it joins, taking
 // the azimuth it needs from each (ABT #969, Alf's option 2). `clears` decides between the
@@ -42,10 +46,11 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
                         const std::function<bool(const Primitive&, const Primitive&)>& clears = {});
 // Bend radius = kRoundCornerBendFactor * wire radius (the corner rule everywhere else).
 inline size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend,
-                                    const std::string& who, int entranceVariant = 0,
-                                    int exitVariant = 0) {
+                                    const std::string& who,
+                                    double entranceRoll = std::numeric_limits<double>::quiet_NaN(),
+                                    double exitRoll = std::numeric_limits<double>::quiet_NaN()) {
     return filletTerminalCorners(prims, minBend, minBend / kRoundCornerBendFactor, who,
-                                 entranceVariant, exitVariant);
+                                 entranceRoll, exitRoll);
 }
 
 }  // namespace mvb

@@ -476,7 +476,7 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
 }
 
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
-                             const std::string& who, int entranceVariant, int exitVariant) {
+                             const std::string& who, double entranceRoll, double exitRoll) {
     size_t done = 0;
     for (size_t i = 0; i + 1 < prims.size(); ++i) {
         const bool exitCorner = filletable(prims[i], prims[i + 1]);
@@ -607,13 +607,10 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                 // excursion into the next layer -- a bend in the osculating plane there swung
                 // 150 um outward on pushpull/06 and 20-100 um into the neighbouring layer).
                 gp_Vec nH = spiralPrincipalNormal(cutSp, azCut);
-                // The variant's high digit picks the PLANE the helix-side bend turns in: 0 is the
-                // one nearest the lead (below), 1 is the other of the helix's two natural planes.
-                // Angle alone is not enough of a choice when the neighbour is a steep wrap that
-                // sweeps the whole window -- it is one coated OD away at every height, so the
-                // escape has to point somewhere else, not merely turn less (14_dab).
-                const int variantIn = std::max(0, exitCorner ? exitVariant : entranceVariant);
-                const bool otherPlane = (variantIn / 12) % 2 == 1;
+                // THE ROLL: which way, about the helix's own tangent, the corner escapes. The
+                // caller gives it when it can see the neighbours; NaN keeps the historical snap
+                // to the natural plane nearest the lead.
+                const double roll = exitCorner ? exitRoll : entranceRoll;
                 {
                     // Snap the bend direction to one of the helix's two natural planes: the
                     // osculating plane (T, N) when the lead lies radially, the rectifying plane
@@ -630,9 +627,15 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                         toLead.Normalize();
                         gp_Vec B = tHx.Crossed(nH);
                         B.Normalize();
-                        const double cN = toLead.Dot(nH), cB = toLead.Dot(B);
-                        const bool useN = (std::abs(cN) >= std::abs(cB)) != otherPlane;
-                        nH = useN ? nH * (cN >= 0 ? 1.0 : -1.0) : B * (cB >= 0 ? 1.0 : -1.0);
+                        if (std::isfinite(roll)) {
+                            // Exactly the direction the caller solved for.
+                            nH = nH * std::cos(roll) + B * std::sin(roll);
+                        }
+                        else {
+                            const double cN = toLead.Dot(nH), cB = toLead.Dot(B);
+                            nH = (std::abs(cN) >= std::abs(cB)) ? nH * (cN >= 0 ? 1.0 : -1.0)
+                                                                : B * (cB >= 0 ? 1.0 : -1.0);
+                        }
                     }
                 }
                 best.reset();
@@ -693,7 +696,7 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                 // way round on 14_dab: forcing the GENTLEST fit instead of the tightest took the
                 // intrusion from 4 nm to 551 nm.) 1 deg steps, so a 5 deg corner is not rounded
                 // to 5 deg of excursion when 1 deg would do.
-                const int wantVariant = variantIn % 12;
+                const int wantVariant = 0;
                 int seen = 0;
                 std::optional<Fillet> lastFit;
                 // Spread the candidates across the whole admissible range rather than in 1 deg
