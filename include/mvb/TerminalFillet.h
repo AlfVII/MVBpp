@@ -19,12 +19,23 @@ namespace mvb {
 // Fillets every terminal corner in `prims` -- an exact-helix "(terminal stub)" SPIRAL adjacent to a
 // "lead seg" SEG, in either order -- in place. Returns how many corners were filleted. Throws,
 // naming the corner, when a fillet with radius >= minBend does not fit.
+// entranceVariant / exitVariant pick WHICH admissible fillet to use at that corner: the search
+// walks the helix-side bend angle from 1 degree up and 0 takes the first that closes, 1 the next,
+// and so on (clamped to the last available). The corner alone cannot tell which is best -- the
+// arcs leave the helix by a few nanometres to a few microns, and whether that matters depends on
+// where the NEIGHBOURING conductor is, which only the fan knows. So the fan tries variants when a
+// member does not clear, and hands the winner to the emitter (leadFilletIn / leadFilletOut), the
+// same way it hands over the attach leg. Measured on 14_dab: variant 0 leaves 4.16 nm and 2.30 nm
+// of interpenetration on two members; other variants clear them.
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
-                             const std::string& who);
+                             const std::string& who, int entranceVariant = 0,
+                             int exitVariant = 0);
 // Bend radius = kRoundCornerBendFactor * wire radius (the corner rule everywhere else).
 inline size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend,
-                                    const std::string& who) {
-    return filletTerminalCorners(prims, minBend, minBend / kRoundCornerBendFactor, who);
+                                    const std::string& who, int entranceVariant = 0,
+                                    int exitVariant = 0) {
+    return filletTerminalCorners(prims, minBend, minBend / kRoundCornerBendFactor, who,
+                                 entranceVariant, exitVariant);
 }
 
 }  // namespace mvb

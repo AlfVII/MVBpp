@@ -458,7 +458,7 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
 }
 
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
-                             const std::string& who) {
+                             const std::string& who, int entranceVariant, int exitVariant) {
     smoothLayerLinks(prims, minBend, who);
     size_t done = 0;
     for (size_t i = 0; i + 1 < prims.size(); ++i) {
@@ -551,10 +551,10 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                          nbSpanAbs * 180.0 / kPi, segLen * 1e3, usable * 1e3,
                          consumeLeg ? " [short leg consumed, previous leg used]" : "");
         }
-        std::optional<Fillet> best;
-        gp_Pnt P1, P2;
-        bool intoNeighbour = false;
-        double azCut = azJoint;
+        std::optional<Fillet> best, gentle;
+        gp_Pnt P1, P2, gentleP1, gentleP2;
+        bool intoNeighbour = false, gentleNb = false;
+        double azCut = azJoint, gentleCut = azJoint;
         for (int it = 0; it < 24; ++it, L *= 1.2) {
             const double dAz = L / std::max(atJoint.dsdaz, 1e-18);
             if (L > 0.9 * usable) break;
@@ -662,21 +662,57 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                         }
                     }
                 }
-                // the planar helix-side bend: bend radius, turning angle from 5 deg up
-                for (int k = 1; k <= 18 && !best; ++k) {
-                    const double phi = 5.0 * k * kPi / 180.0;
+                // The planar helix-side bend, from a SHALLOW angle up: its excursion from the
+                // helix is R(1-cos phi), so the smallest phi that closes the biarc is the one
+                // that stays nearest the wire's own path -- and the neighbours, whichever side
+                // they are on, sit one coated OD away with nothing to spare. (Measured the other
+                // way round on 14_dab: forcing the GENTLEST fit instead of the tightest took the
+                // intrusion from 4 nm to 551 nm.) 1 deg steps, so a 5 deg corner is not rounded
+                // to 5 deg of excursion when 1 deg would do.
+                const int wantVariant = std::max(0, exitCorner ? exitVariant : entranceVariant);
+                int seen = 0;
+                std::optional<Fillet> lastFit;
+                // Spread the candidates across the whole admissible range rather than in 1 deg
+                // steps: six neighbouring angles are six almost identical fillets, and the fan
+                // needs genuinely different ones to choose from (14_dab).
+                static const double kPhiDeg[] = {1, 2, 3, 5, 8, 12, 18, 27, 40, 55, 70, 85};
+                for (double phiDeg : kPhiDeg) {
+                    const double phi = phiDeg * kPi / 180.0;
                     auto f = triarcHelixPlane(P1, t1, P2, t2, /*helixAtP2=*/!exitCorner, nH,
                                               minBend, phi, sp);
-                    if (f && f->minRadius >= minBend * (1.0 - 1e-9)) best = std::move(f);
+                    if (!(f && f->minRadius >= minBend * (1.0 - 1e-9))) continue;
+                    lastFit = f;
+                    if (seen++ == wantVariant) { best = std::move(f); break; }
                 }
+                if (!best && lastFit) best = std::move(lastFit);   // fewer variants than asked
             }
             if (std::getenv("MVB_FILLET_DIAG")) {
                 std::fprintf(stderr, "[fillet] '%s' it=%d L=%.6f mm dAz=%.4f deg %s%s minR=%.6f mm (need %.6f)\n",
                              sp.label.c_str(), it, L * 1e3, dAz * 180.0 / kPi, best ? "biarc" : "NO-BIARC",
                              useNb ? " [into neighbour]" : "", best ? best->minRadius * 1e3 : -1.0, minBend * 1e3);
             }
-            if (best && best->minRadius >= minBend * (1.0 - 1e-9)) { intoNeighbour = useNb; break; }
+            if (best && best->minRadius >= minBend * (1.0 - 1e-9)) {
+                intoNeighbour = useNb;
+                // MVB_FILLET_GENTLE=1: keep growing, and take the LAST fit rather than the
+                // first. The tightest fillet leans hardest towards whatever the corner turns
+                // past -- the same effect the layer link showed against an exact-touch sibling.
+                if (std::getenv("MVB_FILLET_GENTLE") == nullptr) break;
+                gentle = best;
+                gentleCut = azCut;
+                gentleP1 = P1;
+                gentleP2 = P2;
+                gentleNb = useNb;
+                best.reset();
+                continue;
+            }
             best.reset();
+        }
+        if (!best && gentle) {   // the loop ran past the last fit: take it
+            best = gentle;
+            azCut = gentleCut;
+            P1 = gentleP1;
+            P2 = gentleP2;
+            intoNeighbour = gentleNb;
         }
         if (!best) {
             std::ostringstream m;

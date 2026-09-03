@@ -7814,6 +7814,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // conductor -> the length of the LEVEL leg its lead keeps at the attach before climbing to
     // MKF's row (the fan's answer, from the terminal fillet it derives; see emittedRoute)
     std::map<size_t, std::pair<double, double>> leadLegIn, leadLegOut;   // (dr, dy)
+    std::map<size_t, int> leadFilletIn, leadFilletOut;   // which terminal fillet the fan chose
     // ABT #839 mechanism C: per (conductor, side), the stub sweep cap -- half the azimuth gap
     // to the nearest ROTATED same-winding sibling lane on the stub's own sweep side. Filled at
     // the fan tail, consumed by the emission (see appendRoundWrap's cappedStub).
@@ -8821,7 +8822,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // is the centreline that is swept: the two arcs, the shortened lead, the rest of the run.
         // The wrap helix itself is the lead's own copper and is not returned. Empty when no
         // fillet fits at this slot: the emitter would refuse the corner, so the slot is infeasible.
-        auto leadPrims3D = [&](const Vert& L, double c) -> std::optional<std::vector<Primitive>> {
+        auto leadPrims3D = [&](const Vert& L, double c,
+                               int filletVariant = 0) -> std::optional<std::vector<Primitive>> {
             const std::vector<PlanePt> wp = emittedRoute(L, c);
             const double zo = conductorZoff[L.ci];
             const double azL = kPlaneAz + c;
@@ -8861,7 +8863,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             try {
                 filletTerminalCorners(chain, kRoundCornerBendFactor * L.rwEmit, L.rwEmit,
-                                      conductors[L.ci].winding + " (fan)");
+                                      conductors[L.ci].winding + " (fan)",
+                                      L.entrance ? filletVariant : 0,
+                                      L.entrance ? 0 : filletVariant);
             }
             catch (const std::runtime_error& e) {
                 if (std::getenv("MVB_LEAD_DIAG")) {
@@ -8991,7 +8995,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             return true;
         };
-        auto leadRowsClear = [&](const Vert& L, double c, std::string* why = nullptr) {
+        auto leadRowsClear = [&](const Vert& L, double c, std::string* why = nullptr,
+                                 int filletVariant = 0) {
             if (L.kind == 1) return true;   // dragbacks keep the drift-window model
             if (L.kind == 2) {
                 // ABT #831: a LINK is scoped the OPPOSITE way to a lead. On the plane it is safe
@@ -9020,7 +9025,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // exactly the coated envelope, and the fan never measured it. Primary p0's exit lead
             // was 80 nm inside p1's terminal stub at the slot the fan handed it. Only the lead's
             // OWN conductor keeps the soft, station-exempt check (leadOwnRowsSoft).
-            const auto prims = leadPrims3D(L, c);
+            const auto prims = leadPrims3D(L, c, filletVariant);
             if (!prims) {
                 if (why != nullptr) *why = "no terminal fillet fits the corner at this slot";
                 return false;
@@ -9068,6 +9073,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // design with no coated-clear slot packs exactly as today and the gate keeps the final
         // word (widening to the whole winding was tried under ABT #830 and left 06_llc with no
         // feasible slot at all).
+        // A slot is feasible if ANY of the corner's admissible fillets clears (the fan picks the
+        // winner at commit time, below, and hands it to the emitter). Without this the search
+        // judged every slot by the tightest fillet alone and 14_dab had no anchor at all.
+        auto leadRowsClearAnyFillet = [&](const Vert& L, double c, std::string* why = nullptr) {
+            for (int v = 0; v < 12; ++v)
+                if (leadRowsClear(L, c, v == 0 ? why : nullptr, v)) return true;
+            return false;
+        };
         auto leadOwnRowsSoft = [&](const Vert& L, double c, std::string* why = nullptr) {
             if (L.kind != 0) return true;
             const auto prims = leadPrims3D(L, c);
@@ -9584,7 +9597,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 for (size_t g = 0; g < group.size() && ok; ++g) {
                     const double cg = azMember(g, c);
                     if (std::isnan(cg)) { ok = false; break; }
-                    if (!leadRowsClear(verts[group[g]], cg)) { ok = false; break; }
+                    if (!leadRowsClearAnyFillet(verts[group[g]], cg)) { ok = false; break; }
                     for (size_t j = 0; j < verts.size(); ++j)
                         if (azAssigned[j] && !clears(verts[j], az[j], verts[group[g]], cg)) {
                             ok = false;
@@ -9789,7 +9802,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         continue;
                     }
                     std::string why;
-                    if (!leadRowsClear(verts[group[g]], cg, &why))
+                    if (!leadRowsClearAnyFillet(verts[group[g]], cg, &why))
                         std::fprintf(stderr, "   member ci=%zu: %s\n",
                                      (size_t)verts[group[g]].ci, why.c_str());
                     // ABT #839: NAME THE SOFT CONSTRAINTS TOO. This diagnostic exists to say what
@@ -10095,7 +10108,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             for (size_t j = 0; j + 1 < verts.size() && !dipViolated; ++j) {
                 if (verts[j].kind == 2) continue;
-                if (!leadRowsClear(verts[j], az[j])) {
+                if (!leadRowsClearAnyFillet(verts[j], az[j])) {
                     dipViolated = true;
                     break;
                 }
@@ -10159,7 +10172,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         for (size_t j = 0; j < verts.size(); ++j) {
             if (verts[j].kind == 2) continue;
             std::string why;
-            if (!leadRowsClear(verts[j], az[j], &why))
+            if (!leadRowsClearAnyFillet(verts[j], az[j], &why))
                 std::fprintf(stderr,
                              "[fan] UNRESOLVED at the final slots: %s %s (ci=%zu) at %.4f deg: "
                              "%s\n",
@@ -10248,6 +10261,25 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     if (leg) (verts[k].entrance ? leadLegIn : leadLegOut)[m] = {leg->dr, leg->dy};
                 }
             }
+        }
+        // WHICH FILLET (14_dab, 2026-09-03). The corner admits several tangent fillets; they
+        // differ by microns, and which one clears the neighbouring parallel is not knowable at
+        // the corner. The fan tries them here, at the slot it has settled on, and hands the
+        // winner to the emitter -- exactly as it hands over the attach leg.
+        auto bestFilletVariant = [&](const Vert& L, double c) {
+            for (int v = 0; v < 12; ++v)
+                if (leadRowsClear(L, c, nullptr, v)) return v;
+            return 0;
+        };
+        for (size_t k = 0; k < verts.size(); ++k) {
+            if (verts[k].kind != 0 || !azAssigned[k]) continue;
+            const int v = bestFilletVariant(verts[k], az[k]);
+            if (v == 0) continue;
+            for (size_t m : verts[k].cis)
+                (verts[k].entrance ? leadFilletIn : leadFilletOut)[m] = v;
+            if (std::getenv("MVB_LEAD_DIAG"))
+                std::fprintf(stderr, "[fan-fillet] ci=%zu %s: fillet variant %d clears\n",
+                             (size_t)verts[k].ci, verts[k].entrance ? "entrance" : "exit", v);
         }
         // CONSECUTIVE dragback transitions of one conductor (a single-turn layer) chain end to
         // start: force them onto one azimuth so the chain stays connected.
@@ -13456,10 +13488,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // per-path copy inside the assembly loop, and the certified gate never saw an arc). In place
     // on the path the solids are NAMED from, so the per-solid primitive indices the assembler
     // returns stay one-to-one.
-    for (auto& p : paths) {
+    for (size_t pi = 0; pi < paths.size(); ++pi) {
+        auto& p = paths[pi];
         if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
-        const size_t filleted =
-            filletTerminalCorners(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name);
+        // WHICH fillet at each terminal corner is the fan's decision (it is the only model that
+        // can see the neighbouring parallel); 0 where it had nothing to say.
+        const size_t filleted = filletTerminalCorners(
+            p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
+            leadFilletIn.count(pi) ? leadFilletIn.at(pi) : 0,
+            leadFilletOut.count(pi) ? leadFilletOut.at(pi) : 0);
         if (std::getenv("MVB_DIAG") && filleted)
             std::cerr << "[buildAll] '" << p.name << "' filleted " << filleted
                       << " terminal corner(s)\n";
