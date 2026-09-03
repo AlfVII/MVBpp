@@ -9085,6 +9085,28 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (R.ci == L.ci) continue;
                 if (!leadWrapClear(R, L, c, L.rw + R.rwCoat, *prims, why)) return false;
             }
+            // THE SLOT MOVES THE WRAP, TOO. A candidate slot decides where this conductor's own
+            // wrap ends, and a wrap that ends in the wrong place is not the lead's problem to
+            // notice -- complete_pushpull's Primary 2 ended 40 um inside a Secondary wrap at a
+            // slot the fan was happy with, because the fan only ever measured the LEAD. Sibling
+            // parallels of the same winding are packed at exactly one coated diameter by MKF and
+            // are expected to touch; two DIFFERENT windings are separated by insulation and may
+            // not.
+            if (const auto ownWrap = ownHelixOf(L, c)) {
+                for (const auto& R : rows) {
+                    if (R.cHi < 1e29 || R.ci == L.ci) continue;
+                    if (conductors[R.ci].winding == conductors[L.ci].winding) continue;
+                    const Primitive other = wrapHelixOf(R);
+                    if (!cert::provePairClears(*ownWrap, other,
+                                               L.rw + R.rwCoat - cert::kCoordinateGridHalf)
+                             .clears) {
+                        if (why != nullptr)
+                            *why = "this conductor's own wrap does not clear " +
+                                   conductors[R.ci].winding + " at this slot";
+                        return false;
+                    }
+                }
+            }
             return true;
         };
         // ABT #830/#839: A LEAD AGAINST ITS OWN CONDUCTOR'S WRAPS, AT THE ENAMEL CRITERION.
@@ -9178,7 +9200,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (int i = 0; i < 16; ++i) out.push_back(kTwoPi * i / 16.0);
             return out;
         };
+        // A ROLL FIXES A CORNER; IT DOES NOT BUY A SLOT. Letting the roll widen what the anchor
+        // search accepts moved complete_pushpull's Primary 2 onto a slot where its own final wrap
+        // ended 40 um inside a Secondary. Placement therefore uses the default corner, exactly as
+        // the corpus was verified with, and the rolls open only for a block that finds no anchor
+        // at all -- 14_dab's Primary bundle exists on no other terms.
+        bool filletRollsUnlocked = false;
         auto leadRowsClearAnyFillet = [&](const Vert& L, double c, std::string* why = nullptr) {
+            if (!filletRollsUnlocked) return leadRowsClear(L, c, why);
             bool first = true;
             for (double roll : filletRollCandidates(L, c)) {
                 if (leadRowsClear(L, c, first ? why : nullptr, roll)) return true;
@@ -9969,6 +9998,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // into the emitted spine, or quietly hand back a slot the caller believes is
                 // clear. Say what is wrong.
                 double spread = xoff.empty() ? 0.0 : xoff.back();
+                // No anchor with the default corner: open the roll and place this pass again.
+                if (!filletRollsUnlocked) {
+                    filletRollsUnlocked = true;
+                    if (std::getenv("MVB_LEAD_DIAG"))
+                        std::fprintf(stderr,
+                                     "[fan-fillet] wname='%s' entrance=%d: no anchor with the "
+                                     "default corner -- opening the roll\n",
+                                     verts[group[0]].wname.c_str(), (int)verts[group[0]].entrance);
+                    k = SIZE_MAX;
+                    continue;
+                }
         if (std::getenv("MVB_LEAD_DIAG")) {
                     std::fprintf(stderr,
                                  "[fan-noslot] wname='%s' entrance=%d: no feasible anchor. At the "
@@ -10373,6 +10413,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // the corner. The fan tries them here, at the slot it has settled on, and hands the
         // winner to the emitter -- exactly as it hands over the attach leg.
         auto bestFilletVariant = [&](const Vert& L, double c) {
+            if (std::getenv("MVB_NO_CORNER_ROLL")) return std::numeric_limits<double>::quiet_NaN();
             const auto candidates = filletRollCandidates(L, c);
             for (int strict = 1; strict >= 0; --strict) {
                 filletStrict = strict != 0;
@@ -13615,6 +13656,32 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // the pieces are actually filleted the terminal arcs are proven against every other
     // conductor; a corner that does not clear is re-rolled and redrawn, up to a full turn's worth
     // of candidates. Nothing is accepted on a model any more.
+    // The one veto used wherever a link is smoothed: the transition may not sweep into another
+    // conductor. Named so the post-emission repair below cannot smooth without it -- doing that
+    // let the roundest transition through and put complete_pushpull's Primary 2 wrap 40 um inside
+    // a Secondary wrap.
+    auto linkVetoFor = [&](size_t pi) {
+        return [&, pi](const Primitive& a1, const Primitive& a2) {
+            for (size_t qi = 0; qi < paths.size(); ++qi) {
+                if (qi == pi) continue;
+                const double envelope = paths[pi].wireRadius + paths[qi].wireRadius;
+                for (const auto& other : paths[qi].prims) {
+                    for (const Primitive* arc : {&a1, &a2}) {
+                        const auto ends = primEndpoints(*arc);
+                        const auto oends = primEndpoints(other);
+                        const double reach = 4.0 * envelope + ends.first.Distance(ends.second);
+                        if (ends.first.Distance(oends.first) > reach &&
+                            ends.first.Distance(oends.second) > reach &&
+                            ends.second.Distance(oends.first) > reach &&
+                            ends.second.Distance(oends.second) > reach)
+                            continue;
+                        if (!cert::provePairClears(*arc, other, envelope).clears) return false;
+                    }
+                }
+            }
+            return true;
+        };
+    };
     std::vector<std::vector<Primitive>> preFilletPrims(paths.size());
     for (size_t pi = 0; pi < paths.size(); ++pi) preFilletPrims[pi] = paths[pi].prims;
     for (size_t pi = 0; pi < paths.size(); ++pi) {
@@ -13627,29 +13694,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // is kindest to the wire, but on 14_dab it reached 11.7 um into a sibling parallel. The
         // veto walks down to tighter transitions; if none clears, the tightest is kept and the
         // certified gate below has the last word (no silent acceptance).
-        smoothLayerLinks(
-            p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
-            [&](const Primitive& a1, const Primitive& a2) {
-                for (size_t qi = 0; qi < paths.size(); ++qi) {
-                    if (qi == pi) continue;
-                    const double envelope = p.wireRadius + paths[qi].wireRadius;
-                    for (const auto& other : paths[qi].prims) {
-                        for (const Primitive* arc : {&a1, &a2}) {
-                            const auto ends = primEndpoints(*arc);
-                            const auto oends = primEndpoints(other);
-                            // cheap reject: nothing within reach of either end
-                            const double reach = 4.0 * envelope + ends.first.Distance(ends.second);
-                            if (ends.first.Distance(oends.first) > reach &&
-                                ends.first.Distance(oends.second) > reach &&
-                                ends.second.Distance(oends.first) > reach &&
-                                ends.second.Distance(oends.second) > reach)
-                                continue;
-                            if (!cert::provePairClears(*arc, other, envelope).clears) return false;
-                        }
-                    }
-                }
-                return true;
-            });
+        smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
+                         linkVetoFor(pi));
         const size_t filleted = filletTerminalCorners(
             p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
             leadFilletIn.count(pi) ? leadFilletIn.at(pi) : std::numeric_limits<double>::quiet_NaN(),
@@ -13660,9 +13706,27 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     }
     // Re-roll any terminal corner whose DRAWN arcs do not clear another conductor.
     {
+        // The corner is not only the arcs: filleting SHORTENS the stub and the wrap it leaves,
+        // and how much it removes depends on the roll. complete_pushpull's Primary 2 cleared a
+        // Secondary only because the default corner happened to consume the last 40 um of its
+        // wrap -- a different roll left that copper standing. So the pieces the fillet touched
+        // are proven too, not just the arcs it inserted.
+        auto touchedByFillet = [&](size_t pi) {
+            std::vector<size_t> out;
+            const auto& prims = paths[pi].prims;
+            for (size_t i = 0; i < prims.size(); ++i) {
+                if (prims[i].label.find("fillet arc") == std::string::npos) continue;
+                if (i > 0) out.push_back(i - 1);
+                out.push_back(i);
+                if (i + 1 < prims.size()) out.push_back(i + 1);
+            }
+            std::sort(out.begin(), out.end());
+            out.erase(std::unique(out.begin(), out.end()), out.end());
+            return out;
+        };
         auto arcsClear = [&](size_t pi) {
-            for (const auto& pr : paths[pi].prims) {
-                if (pr.label.find("fillet arc") == std::string::npos) continue;
+            for (size_t idx : touchedByFillet(pi)) {
+                const auto& pr = paths[pi].prims[idx];
                 for (size_t qi = 0; qi < paths.size(); ++qi) {
                     if (qi == pi) continue;
                     const double envelope = paths[pi].wireRadius + paths[qi].wireRadius;
@@ -13683,15 +13747,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         };
         for (size_t pi = 0; pi < paths.size(); ++pi) {
             auto& p = paths[pi];
+            if (std::getenv("MVB_NO_CORNER_REPAIR")) break;   // bisect switch
             if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
             if (arcsClear(pi)) continue;
             const double had = leadFilletIn.count(pi) ? leadFilletIn.at(pi)
                                                       : std::numeric_limits<double>::quiet_NaN();
             bool fixed = false;
-            for (int k = 0; k < 24 && !fixed; ++k) {
-                const double roll = kTwoPi * k / 24.0;
+            // The DEFAULT corner is a candidate too -- it is the one the corpus was verified on,
+            // and on complete_pushpull it is the only one that clears (the fan asked for a roll
+            // its own model preferred, and the drawn geometry disagrees).
+            for (int k = -1; k < 24 && !fixed; ++k) {
+                const double roll = k < 0 ? std::numeric_limits<double>::quiet_NaN()
+                                          : kTwoPi * k / 24.0;
                 p.prims = preFilletPrims[pi];
-                smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name);
+                smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
+                                 linkVetoFor(pi));
                 filletTerminalCorners(p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius,
                                       p.name, roll, roll);
                 if (arcsClear(pi)) {
@@ -13704,7 +13774,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (!fixed) {
                 // Put back what the fan asked for and let the gate name the pair.
                 p.prims = preFilletPrims[pi];
-                smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name);
+                smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
+                                 linkVetoFor(pi));
                 filletTerminalCorners(
                     p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius, p.name, had,
                     leadFilletOut.count(pi) ? leadFilletOut.at(pi)
