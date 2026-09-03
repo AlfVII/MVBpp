@@ -2,6 +2,8 @@
 #include "mvb/shapes/ShapeC.h"
 #include "mvb/shapes/ShapeDrum.h"
 #include "mvb/shapes/ShapeDrumRing.h"
+#include "mvb/shapes/ShapeMolded.h"
+#include "mvb/shapes/ShapeDrumSemishielded.h"
 #include "mvb/shapes/ShapeE.h"
 #include "mvb/shapes/ShapeEp.h"
 #include "mvb/shapes/ShapeLp.h"
@@ -41,6 +43,12 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
         case MAS::CoreShapeFamily::EER:  // ABT #265: ER-type with round centre leg
         case MAS::CoreShapeFamily::PLANAR_ER:
             builder = std::make_unique<ShapeEr>(); break;
+        case MAS::CoreShapeFamily::DRUM_SEMISHIELDED:  // ABT #362: drum; the epoxy shell is a coating
+            builder = std::make_unique<ShapeDrumSemishielded>();
+            break;
+        case MAS::CoreShapeFamily::MOLDED:  // ABT #357: SMC block moulded around the coil
+            builder = std::make_unique<ShapeMolded>();
+            break;
         case MAS::CoreShapeFamily::T:
             builder = std::make_unique<ShapeT>(); break;
         case MAS::CoreShapeFamily::DRUM:

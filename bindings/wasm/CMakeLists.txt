@@ -194,6 +194,8 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/shapes/ShapeBuilder.cpp
     ${REPO_ROOT}/src/shapes/ShapeDrum.cpp
     ${REPO_ROOT}/src/shapes/ShapeDrumRing.cpp
+    ${REPO_ROOT}/src/shapes/ShapeMolded.cpp
+    ${REPO_ROOT}/src/shapes/ShapeDrumSemishielded.cpp
     ${REPO_ROOT}/src/shapes/ShapeE.cpp
     ${REPO_ROOT}/src/shapes/ShapeEp.cpp
     ${REPO_ROOT}/src/shapes/ShapeEpx.cpp

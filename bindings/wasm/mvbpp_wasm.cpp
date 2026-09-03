@@ -2,6 +2,8 @@
 #include <emscripten/val.h>
 #include <emscripten/emscripten.h>
 
+#include "mvb/shapes/ShapeBuilder.h"
+#include "mvb/shapes/ShapeDrumSemishielded.h"
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Symmetry.h"
 #include "mvb/StepExporter.h"
@@ -374,6 +376,42 @@ std::vector<mvb::NamedShape> build_core_piece(const std::string& json_str, int p
     return {b.buildCorePieceNamed(shape, polygonSegments)};
 }
 
+// The magnetic-epoxy shell of a semi-shielded drum, as its own product.
+//
+// It is NOT part of drawCore: MAS models the shell as a coating, not a core piece, and a
+// semi-shielded part exists to have a winding inside a low-permeability return path. Fusing
+// the shell into the core would hide that winding permanently, so the two are delivered
+// separately and the viewer renders the shell translucent over an opaque drum — the same
+// arrangement already used for the FR4 board of a planar part.
+//
+// Returns an empty product list for every other family, so a caller can ask unconditionally.
+std::vector<mvb::NamedShape> build_core_shell(const std::string& json_str, int polygonSegments) {
+    auto j = json::parse(json_str);
+    const auto& coreJson = j.contains("core") ? j["core"] : j;
+    if (!coreJson.contains("functionalDescription")) return {};
+    const auto& fd = coreJson["functionalDescription"];
+    if (!fd.contains("shape") || !fd["shape"].is_object()) return {};
+    const auto& shapeJson = fd["shape"];
+
+    auto shape = shapeJson.get<MAS::CoreShape>();
+    if (!shape.get_family().has_value() ||
+        shape.get_family().value() != MAS::CoreShapeFamily::DRUM_SEMISHIELDED) {
+        return {};
+    }
+    auto dimsOpt = shape.get_dimensions();
+    if (!dimsOpt) return {};
+    auto dims = mvb::flatten_dimensions(*dimsOpt);
+
+    // Carve the shell against the SAME drum solid drawCore delivers, so the two products
+    // meet exactly instead of interpenetrating by a faceting error.
+    auto builder = mvb::shapes::createShapeBuilder(MAS::CoreShapeFamily::DRUM_SEMISHIELDED,
+                                                   polygonSegments);
+    TopoDS_Shape drum = builder ? builder->buildPiece(shape) : TopoDS_Shape();
+    TopoDS_Shape shell = mvb::shapes::buildSemishieldedShell(dims, drum, polygonSegments);
+    if (shell.IsNull()) return {};
+    return {mvb::NamedShape(shell, "Shield shell")};
+}
+
 std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int polygonSegments) {
     auto j = json::parse(json_str);
     auto bobbin = j.get<MAS::Bobbin>();
@@ -585,6 +623,22 @@ std::string _drawCoreToPath(const std::string& json_str,
 }
 
 // drawCorePiece
+val _drawCoreShell(const std::string& json_str,
+                   const std::string& mode,
+                   const std::string& plane,
+                   double offset,
+                   const std::string& format,
+                   double scale,
+                   int polygonSegments,
+                   const std::string& symmetry,
+                   const std::string& side) {
+    auto named = build_core_shell(json_str, polygonSegments);
+    if (named.empty()) return val::null();
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    return makeUint8Array(data);
+}
+
 val _drawCorePiece(const std::string& json_str,
                    const std::string& mode,
                    const std::string& plane,
@@ -933,6 +987,7 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
     // 7-function unified API
     function("drawCore",            &guard<&_drawCore>::call);
     function("drawCoreToPath",      &guard<&_drawCoreToPath>::call);
+    function("drawCoreShell",       &guard<&_drawCoreShell>::call);
     function("drawCorePiece",       &guard<&_drawCorePiece>::call);
     function("drawCorePieceToPath", &guard<&_drawCorePieceToPath>::call);
     function("drawBobbin",          &guard<&_drawBobbin>::call);
