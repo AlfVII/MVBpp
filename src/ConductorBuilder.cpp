@@ -162,9 +162,14 @@ inline gp_Pnt evalPrim(const Primitive& pr, double t) {
             return gp_Pnt(pr.arc.c.XYZ() + v);
         }
         case Primitive::SPIRAL: {
+            // A BLENDED spiral carries its r/y on the cosine ramp the assembler sweeps
+            // (WireAssembler: f = (1 - cos(pi t))/2), not linearly. The certifier must evaluate
+            // the curve the emitter draws; a linear read of a blend is off by up to 0.18 of the
+            // ramp (0.29 mm on a foil's 1.6 mm corner ramp, ABT #970, 2026-09-04).
             const double az = pr.spiral.az0 + (pr.spiral.az1 - pr.spiral.az0) * t;
-            const double r = pr.spiral.r0 + (pr.spiral.r1 - pr.spiral.r0) * t;
-            const double y = pr.spiral.y0 + (pr.spiral.y1 - pr.spiral.y0) * t;
+            const double f = pr.spiral.blend ? 0.5 * (1.0 - std::cos(kPi * t)) : t;
+            const double r = pr.spiral.r0 + (pr.spiral.r1 - pr.spiral.r0) * f;
+            const double y = pr.spiral.y0 + (pr.spiral.y1 - pr.spiral.y0) * f;
             return gp_Pnt(pr.spiral.cx + r * std::cos(az), y, pr.spiral.cz - r * std::sin(az));
         }
         default:
@@ -268,6 +273,13 @@ inline double maxSecondDerivative(const Primitive& pr) {
             const double S = pr.spiral.az1 - pr.spiral.az0;
             const double dr = pr.spiral.r1 - pr.spiral.r0;
             const double rMax = std::max(std::abs(pr.spiral.r0), std::abs(pr.spiral.r1));
+            if (pr.spiral.blend) {
+                // Cosine ramp: |f'| <= pi/2, |f''| <= pi^2/2. Radial: r'' + 2 r' az'; axial: y''.
+                const double dy = std::abs(pr.spiral.y1 - pr.spiral.y0);
+                const double radial = std::abs(dr) * (0.5 * kPi * kPi + kPi * S);
+                return std::sqrt(radial * radial + rMax * rMax * S * S * S * S) +
+                       dy * 0.5 * kPi * kPi;
+            }
             return std::sqrt(4.0 * dr * dr * S * S + rMax * rMax * S * S * S * S);
         }
         default:
@@ -8179,12 +8191,20 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               tp = station(ct.turns[nEmitP - 2]);
                 if (std::abs(tl.x - tp.x) <= rwEmit) advOut = tl.y - tp.y;
             }
+            // A FOIL HAS NO WIRE LEADS (ABT #970, 2026-09-04). Its terminals are full-height
+            // TABS -- the sheet continuing tangentially off the former's face and out the open
+            // window (West Coast Magnetics / Dartmouth; US5895026; US6087922) -- built by the
+            // foil branch of the emission loop, not laid out by this fan. Giving the fan a
+            // 25.9 mm tall "lead" packed one coated OD per lane is what put six of eight exits
+            // a sheet-height outside the window (ABT #1000).
+            if (foilRadialV <= 0.0) {
             routeVert(terminalWaypoints(egrp, pf, whoV + " entrance", foilRadialV), true, pf, advIn, 0);
             if (!xgrp.empty())
                 routeVert(terminalWaypoints(xgrp, pl, whoV + " exit", foilRadialV), false, pl, advOut,
                           nEmitP - 1);
             else   // one drawn lead: synthesized straight-out exit (see splitTerminalGroups)
                 routeVert({{pl.x, pl.y}, {pl.x + 1.0, pl.y}}, false, pl, advOut, nEmitP - 1);
+            }
             // ABT #831: ONE ROW PER WRAP END, carrying THAT WRAP'S OWN ADVANCE.
             //
             // A station used to contribute a single row whose drift was the conductor's MEDIAN
@@ -10923,6 +10943,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
         const auto& turns = ct.turns;
 
+
         // This conductor's drawn terminal rects, in MKF emission order (verified in
         // get_connection_reserved_spaces): the ENTRANCE lead's rects first, then the
         // EXIT lead's. Non-terminal (blue) link rects stay 2D documentation: the wrap
@@ -12716,6 +12737,210 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             return out;
         };
+        // ==================================================================================
+        // FOIL: THE SHEET WRAP (ABT #970, Alf approved 2026-09-04; built from how foil windings
+        // are actually made, not from the wire lead model).
+        //
+        // A foil turn is a rectangular section -- thickness radially, MKF's cut height axially
+        // -- laid FLAT on the former and on the layer beneath it. What the round-wire machinery
+        // gets wrong for it is the TERMINAL: a foil has no lead in a lane, it has a TAB -- the
+        // sheet itself continuing straight off a face of the former, at full height, out through
+        // the open side of the window (West Coast Magnetics / Dartmouth APEC: all parallel
+        // layers "soldered together across the entire width" at ONE line; US5895026, US6087922).
+        // Parallels are CO-WOUND: they start together as a stack, wrap together, and leave
+        // together, which is why their tabs form one block and never fan.
+        //
+        // GEOMETRY, per parallel k of N, turn j (MKF station o_j, all at the station's y):
+        //   seam       the middle of the +X face (the face that looks at the outer leg), so the
+        //              tangent runs along Z -- out of the OPEN faces of the window. Entrance
+        //              from +Z, exit to -Z: opposite open faces, the separation real windings
+        //              use for the two terminals.
+        //   entrance   full-height SEG along the +X face from the lead tip plane to the seam,
+        //              at offset o_0 (it lies on the former).
+        //   turn j     first half of the +X face flat at o_j; corner 1, the -Z face, corner 2,
+        //              the -X face, corner 3, the +Z face all flat at o_j (a sheet on a flat
+        //              face IS flat); corner 4 is the RAMP: a cosine-blended SPIRAL about the
+        //              corner centre growing from o_j to o_{j+1} = o_j + N*p with purely
+        //              azimuthal end tangents, so every joint is exactly G1. That ramp is where
+        //              a real foil rides up over the entrance tab block; the last half of the
+        //              +X face is then flat at o_{j+1}, lying ON the entrance tabs.
+        //   exit       full-height SEG along the +X face from the seam to the tip plane at the
+        //              final offset, lying ON the first straights of the stack.
+        // Every contact is face-to-face (entrance tabs under the last straights, exit tabs on
+        // the first straights, parallel k against parallel k+1) -- touching, never
+        // interpenetrating, exactly as round parallels packed at one OD touch.
+        //
+        // THE RIDE (Alf's rule, as appendRectWrap): the -Z face and its corners sit `ride0`
+        // further out for the lanes on this winding's side, the +Z face `rideBack0` for the
+        // other side's; the lateral faces extend to reach them.
+        // ==================================================================================
+        if (foilWire) {
+            if (turns.empty()) {
+                throw std::runtime_error("ConductorBuilder: foil conductor '" + path.name +
+                                         "' has no turns");
+            }
+            // The parallel pitch p: from MKF's own stations of this winding's parallels (the
+            // radial distance between consecutive parallels' first turns), never assumed.
+            std::vector<double> firstX;
+            for (const auto& other : conductors)
+                if (other.winding == ct.winding && !other.turns.empty())
+                    firstX.push_back(station(other.turns.front()).x);
+            std::sort(firstX.begin(), firstX.end());
+            double parallelPitch = 0.0;
+            for (size_t q = 1; q < firstX.size(); ++q) {
+                const double d = firstX[q] - firstX[q - 1];
+                if (d > 1e-9 && (parallelPitch <= 0.0 || d < parallelPitch)) parallelPitch = d;
+            }
+            const int numParallels = std::max(1, nParallels[ct.winding]);
+            if (parallelPitch <= 0.0) {
+                if (numParallels > 1) {
+                    throw std::runtime_error(
+                        "ConductorBuilder: foil winding '" + ct.winding + "' declares " +
+                        std::to_string(numParallels) +
+                        " parallels but MKF placed them at one radius -- no layer pitch to build "
+                        "the co-wound stack from");
+                }
+                parallelPitch = wireW;   // one sheet: its own thickness
+            }
+            const double stackPitch = numParallels * parallelPitch;   // growth per turn
+            const int foilSide = windingFace.at(ct.winding);
+            const double leadTipRadiusFoil = leadTipRadius;   // the same tip plane every lead uses
+
+            auto pushSegF = [&](const gp_Pnt& a, const gp_Pnt& b, const std::string& lbl,
+                                size_t ordinal, bool lead) {
+                if (a.Distance(b) < 1e-12) return;
+                Primitive pr;
+                pr.kind = Primitive::SEG;
+                pr.seg = {a, b};
+                pr.label = lbl;
+                pr.turnOrdinal = ordinal;
+                pr.isLead = lead;
+                path.prims.push_back(std::move(pr));
+            };
+            auto pushCornerF = [&](double cxx, double czz, double R, double azStart, double yNow,
+                                   const std::string& lbl, size_t ordinal) {
+                Primitive pr;
+                pr.kind = Primitive::ARC3;
+                pr.arc.c = gp_Pnt(cxx, yNow, czz);
+                pr.arc.axis = gp_XYZ(0, 1, 0);
+                pr.arc.v0 = gp_XYZ(R * std::cos(azStart), 0, -R * std::sin(azStart));
+                pr.arc.sweep = kPi / 2.0;
+                pr.label = lbl;
+                pr.turnOrdinal = ordinal;
+                path.prims.push_back(std::move(pr));
+            };
+
+            for (size_t j = 0; j < turns.size(); ++j) {
+                const PlanePt st = station(turns[j]);
+                // Where this turn ENDS radially: MKF's next station of this parallel when there
+                // is one (the wrap connects station to station, as every wrap does), else one
+                // stack pitch out -- the layer where the next parallel's station sits.
+                double xEnd = st.x + stackPitch;
+                double yEnd = st.y;
+                if (j + 1 < turns.size()) {
+                    const PlanePt nx = station(turns[j + 1]);
+                    xEnd = nx.x;
+                    yEnd = nx.y;
+                }
+                const RectStation rs0 = rectStation(st, rectHalfW, rectHalfD, minBend,
+                                                    formerCornerRadius, path.name);
+                const RectStation rs1 = rectStation(PlanePt{xEnd, yEnd}, rectHalfW, rectHalfD,
+                                                    minBend, formerCornerRadius, path.name);
+                // THE FOIL RIDES OVER THE LEADS BENEATH IT. Two ride models meet here. The
+                // rect family's rectRideLevels know only rect DRAGBACK returns (per face: 0 is
+                // the -Z face, where the primary's leads leave; 1 the +Z face). The inner
+                // ROUND winding's terminal leads are the fan's LANES, and a round wrap rides
+                // them by the tallest bump column at its radius (appendBumpedSweep, -Z half
+                // translated by `raise`). A rect sheet wound OVER that winding must ride the
+                // same lanes by the same amount, or the primary -- already sitting 1.64 mm
+                // further out on its -Z half -- pokes through the foil's -Z corner (measured:
+                // 93 um of in-plane interpenetration at the -X/-Z corner, first build).
+                const double fanRaise = tallestBumpColumn(bumpsForTurn(st.x)).first;
+                const double ride0 = rectRideFor(rs0.zPos, 0) + fanRaise;
+                const double rideBack0 = rectRideFor(rs0.zPos, 1);
+                (void)foilSide;
+                const double y = st.y;
+                const double xPos = rs0.xPos, xPos1 = rs1.xPos;
+                const double zN = rs0.zPos + ride0, cZ = rs0.segZ + ride0;
+                const double zP = rs0.zPos + rideBack0, cP = rs0.segZ + rideBack0;
+                const double segX = rs0.segX;
+                const double R = rs0.cornerR;
+                (void)rs1;
+                const std::string tn = "'" + turns[j]->get_name() + "'";
+                const std::string wl = "wrap " + tn + " (foil sheet)";
+
+                // THE ENTRANCE TAB CANNOT BE A STRAIGHT SHEET (measured and then proven, 2026-09-04).
+                // An inner parallel's tab lying along the +X face out through +Z is crossed by
+                // every outer parallel's +Z/+X corner: the corner arc of parallel j (radius R_j
+                // about (segX, cP)) meets the line x = o_k at z = cP + sqrt(R_j^2 - (o_k-segX)^2),
+                // and that z lies inside the tab's run for every j > k (first build: parallel 0's
+                // tab against parallel 3's ramp, 30 um). Nor can the tab be moved: exiting axially
+                // meets the E core's yoke, exiting radially crosses the outer layers, and any tab
+                // that ends below the outer corners never leaves the coil. Real foil windings
+                // start with a WIRE (soldered or welded to the sheet) or an internal bar -- a
+                // joint model this code does not have yet. MVB_FOIL_NO_ENTRANCE=1 builds the
+                // sheet with its exit tab only, so the rest can be gated while that is decided.
+                const bool noEntrance = std::getenv("MVB_FOIL_NO_ENTRANCE") != nullptr;
+                if (j == 0 && !noEntrance) {
+                    // Entrance tab: from the tip plane (+Z) along the +X face to the seam.
+                    const double zTip = std::sqrt(std::max(
+                        0.0, leadTipRadiusFoil * leadTipRadiusFoil - xPos * xPos));
+                    pushSegF(gp_Pnt(xPos, y, zTip), gp_Pnt(xPos, y, 0.0),
+                             "entrance lead seg 0 (foil tab)", 0, true);
+                }
+                // +X face, first half: seam -> -Z corner, flat at o_j.
+                pushSegF(gp_Pnt(xPos, y, 0.0), gp_Pnt(xPos, y, -cZ), wl + " +X face (seam side)", j,
+                         false);
+                pushCornerF(segX, -cZ, R, 0.0, y, wl + " corner -Z/+X", j);
+                pushSegF(gp_Pnt(segX, y, -zN), gp_Pnt(-segX, y, -zN), wl + " -Z face", j, false);
+                pushCornerF(-segX, -cZ, R, kPi / 2.0, y, wl + " corner -X/-Z", j);
+                pushSegF(gp_Pnt(-xPos, y, -cZ), gp_Pnt(-xPos, y, cP), wl + " -X face", j, false);
+                pushCornerF(-segX, cP, R, kPi, y, wl + " corner +Z/-X", j);
+                // THE STEP UP IS A SHIFT OF THE CORNER, NOT A SPIRAL (2026-09-04). A cosine ramp
+                // was tried first: parallels stacked at radial pitch p on a ramp tilted by theta
+                // are only p*cos(theta) apart along their normals -- 10-20 um of interpenetration
+                // at the steepest point, and the collision gate said so (parallel 1 vs 2, 0 m).
+                // Concentric ARCS are exact offset curves of each other, so the ride-up onto the
+                // next layer is built as the +Z/+X corner moved OUT by the step G along +X: the +Z
+                // face runs G longer, the corner keeps this parallel's own radius R about
+                // (segX + G, cP), and lands on the +X face at o_j + G. Every parallel's corner is
+                // concentric with its neighbours', every joint is tangent, and nothing tilts.
+                // Physically it is a stack riding over the block of its own starts: the sheets
+                // travel G further along the face before turning down onto it.
+                const double G = xEnd - st.x;
+                pushSegF(gp_Pnt(-segX, y, zP), gp_Pnt(segX + G, y, zP), wl + " +Z face", j, false);
+                pushCornerF(segX + G, cP, R, 1.5 * kPi, y, wl + " corner +X/+Z (stepped out " +
+                            std::to_string(G * 1e3) + " mm)", j);
+                if (std::abs(yEnd - y) > 1e-12) {
+                    throw std::runtime_error(
+                        "ConductorBuilder: foil conductor '" + path.name + "' turn " +
+                        std::to_string(j) + " changes height between stations (" +
+                        std::to_string(y * 1e3) + " -> " + std::to_string(yEnd * 1e3) +
+                        " mm); a co-wound sheet stack has no axial advance -- check the MKF layout");
+                }
+                // +X face, last half: +Z corner -> seam, flat at o_{j+1}, ON the entrance tabs.
+                pushSegF(gp_Pnt(xPos1, yEnd, cP), gp_Pnt(xPos1, yEnd, 0.0),
+                         wl + " +X face (return to seam)", j, false);
+                if (j + 1 == turns.size()) {
+                    // Exit tab: from the seam along the +X face to the tip plane (-Z).
+                    // The tab ends on the tip PLANE z = -leadTipRadius, beyond the coil; on
+                    // the tip RADIUS a tab at x = 11.6 mm would end at z = 10.75 mm, inside the
+                    // outer corners' zone.
+                    const double zTip = leadTipRadiusFoil;
+                    pushSegF(gp_Pnt(xPos1, yEnd, 0.0), gp_Pnt(xPos1, yEnd, -zTip),
+                             "exit lead seg 0 (foil tab)", j, true);
+                }
+            }
+            if (std::getenv("MVB_FOIL_DIAG")) {
+                std::fprintf(stderr,
+                             "[foil] %s: %zu turn(s), parallels=%d pitch=%.4f mm stack=%.4f mm "
+                             "tip=%.4f mm prims=%zu\n",
+                             path.name.c_str(), turns.size(), numParallels, parallelPitch * 1e3,
+                             stackPitch * 1e3, leadTipRadiusFoil * 1e3, path.prims.size());
+            }
+            paths.push_back(std::move(path));
+            continue;
+        }
         // Crossing azimuths: kPlaneAz normally; the fan slot where the crossing belongs to a
         // dragback (both its ends) or to a terminal lead (the first/last crossing).
         std::vector<double> crossAz(nEmit, kPlaneAz);
