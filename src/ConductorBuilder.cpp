@@ -12859,9 +12859,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // meshes; named "... solder" so the mesher can give it solder's conductivity. Film
             // and fillet-foot width are stated choices (IPC-A-610 speaks of wetting, not
             // millimetres): MVB_FOIL_SOLDER_FILM (mm, default 0.05), foot = half the wire radius.
-            const double foilSolderFilm = std::getenv("MVB_FOIL_SOLDER_FILM")
-                                              ? std::atof(std::getenv("MVB_FOIL_SOLDER_FILM")) * 1e-3
-                                              : 0.05e-3;
+            // THE WIRE TOUCHES THE FOIL (Alf, 2026-09-04): tangent on its OUTER diameter, not
+            // stood off by the solder, so the bump the next turn rides is exactly one OD and the
+            // wire cannot reach the turn above. The solder is then two FILLETS, one each side of
+            // the tangent line -- which is what solder on a wire lying on a pad actually is. Each
+            // is built out from where the wedge between wire and sheet is still thick enough to
+            // wet and to mesh; inboard of that the two metals are simply in contact.
+            const double foilSolderGap = std::getenv("MVB_FOIL_SOLDER_GAP")
+                                             ? std::atof(std::getenv("MVB_FOIL_SOLDER_GAP")) * 1e-3
+                                             : 0.02e-3;
             // THE FILLET STAYS INSIDE THE WIRE'S FOOTPRINT (Alf, 2026-09-04: "make the welding
             // not spread farther than the diameter -- it goes out of the wire"). The solder is
             // bounded by |x| <= r, so a joint is never wider than the wire it joins; it rises to
@@ -12902,8 +12908,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // turn 0's first straight sits where MKF put it; the return of turn 0 and every
                 // later turn ride over the wires by one OD -- the same bump for every parallel.
                 const double rideBase = rectRideFor(rs0.zPos, foilSide) + (foilSide == 0 ? fanRaise : 0.0);
-                const double rideFirst = rideBase + (j == 0 ? 0.0 : foilLeadOD + foilSolderFilm);
-                const double rideRet   = rideBase + foilLeadOD + foilSolderFilm;
+                const double rideFirst = rideBase + (j == 0 ? 0.0 : foilLeadOD);
+                const double rideRet   = rideBase + foilLeadOD;
                 const double xPos = rs0.xPos;
                 const double zF = rs0.zPos + rideFirst, cF = rs0.segZ + rideFirst;   // connection face, first half
                 const double zR = rs0.zPos + rideRet,   cR = rs0.segZ + rideRet;     // connection face, return
@@ -12995,8 +13001,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             const double slot = double(ct.parallel) * foilSlotPitch + 0.5 * leadOD;   // this sheet's own slot
             // On the sheet's OUTER face, on the solder film: input at the first layer's own
             // (unlifted) height, output on the last return.
-            const double zWireIn  = zFaceStart + 0.5 * wireW + foilSolderFilm + leadRw;
-            const double zWireOut = zFaceEnd + 0.5 * wireW + foilSolderFilm + leadRw;
+            const double zWireIn  = zFaceStart + 0.5 * wireW + leadRw;
+            const double zWireOut = zFaceEnd + 0.5 * wireW + leadRw;
             // The tip plane every lead ends on is set by the ROUND windings' outer turn plus four
             // ODs; a foil stack with its step-outs and rides reaches past it (this design: stack
             // to z = 16.97 mm against a 15.84 mm plane). The foil's leads end beyond the whole
@@ -13006,7 +13012,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                       + double(turns.size()) * double(numParallels) * parallelPitch;
                 const RectStation rsO = rectStation(PlanePt{xOuter, y}, rectHalfW, rectHalfD,
                                                     minBend, formerCornerRadius, path.name);
-                return std::max(leadTipRadius, rsO.zPos + rideBaseForLeads + leadOD + foilSolderFilm + 0.5 * wireW + foilSolderFilm + leadOD + 2.0 * leadOD);
+                return std::max(leadTipRadius, rsO.zPos + rideBaseForLeads + leadOD + 0.5 * wireW + leadOD + 2.0 * leadOD);
             }();
             auto makeLead = [&](bool entrance, double zWire, double slotX, double yElbow,
                                 double yJointEnd, const std::string& nm) {
@@ -13039,29 +13045,38 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // width r), extruded along the soldered run, minus the wire. Local z is the
                 // face's outward normal; P3 applies the connection face's sign.
                 {
-                    const double zFace = zWire - leadRw - foilSolderFilm;   // the sheet's outer face
-                    const double zTop  = zWire - foilSolderRise;            // the fillet's top
+                    const double zFace = zWire - leadRw;         // the sheet's face: the wire sits ON it
+                    const double zTop  = zWire - foilSolderRise; // the fillet's top, below the equator
                     // Solder exists only where there is sheet under the wire: the joint runs the
                     // sheet's height, never into the margin the wire elbows through.
                     const double yLo = sheetBot, yHi = sheetTop;
-                    BRepBuilderAPI_MakePolygon poly;
-                    poly.Add(P3(slotX - leadRw, yLo, zFace));
-                    poly.Add(P3(slotX + leadRw, yLo, zFace));
-                    poly.Add(P3(slotX + leadRw, yLo, zTop));
-                    poly.Add(P3(slotX - leadRw, yLo, zTop));
-                    poly.Close();
-                    TopoDS_Shape block = BRepPrimAPI_MakePrism(BRepBuilderAPI_MakeFace(poly.Wire(), Standard_True).Face(),
-                                                               gp_Vec(0, yHi - yLo, 0)).Shape();
-                    TopoDS_Shape bore = BRepPrimAPI_MakeCylinder(gp_Ax2(P3(slotX, yLo - 1e-6, zWire), gp_Dir(0, 1, 0)),
-                                                                 leadRw, yHi - yLo + 2e-6).Shape();
-                    BRepAlgoAPI_Cut cut(block, bore);
-                    if (!cut.IsDone()) {
-                        throw std::runtime_error("ConductorBuilder: solder body for '" + nm + "' failed to build");
+                    // Where the wedge between the cylinder and the face is foilSolderGap thick:
+                    // g(d) = r - sqrt(r^2 - d^2), so d = sqrt(g (2r - g)).
+                    const double dMin = std::sqrt(foilSolderGap * (2.0 * leadRw - foilSolderGap));
+                    if (!(dMin < leadRw)) {
+                        throw std::runtime_error("ConductorBuilder: solder gap too large for the lead wire of '" + nm + "'");
                     }
-                    NamedShape sd;
-                    sd.shape = cut.Shape();
-                    sd.name = nm + " solder";
-                    solderShapes.push_back(std::move(sd));
+                    for (int sgn = -1; sgn <= 1; sgn += 2) {
+                        const double xa = slotX + double(sgn) * dMin, xb = slotX + double(sgn) * leadRw;
+                        BRepBuilderAPI_MakePolygon poly;
+                        poly.Add(P3(xa, yLo, zFace));
+                        poly.Add(P3(xb, yLo, zFace));
+                        poly.Add(P3(xb, yLo, zTop));
+                        poly.Add(P3(xa, yLo, zTop));
+                        poly.Close();
+                        TopoDS_Shape block = BRepPrimAPI_MakePrism(BRepBuilderAPI_MakeFace(poly.Wire(), Standard_True).Face(),
+                                                                   gp_Vec(0, yHi - yLo, 0)).Shape();
+                        TopoDS_Shape bore = BRepPrimAPI_MakeCylinder(gp_Ax2(P3(slotX, yLo - 1e-6, zWire), gp_Dir(0, 1, 0)),
+                                                                     leadRw, yHi - yLo + 2e-6).Shape();
+                        BRepAlgoAPI_Cut cut(block, bore);
+                        if (!cut.IsDone()) {
+                            throw std::runtime_error("ConductorBuilder: solder fillet for '" + nm + "' failed to build");
+                        }
+                        NamedShape sd;
+                        sd.shape = cut.Shape();
+                        sd.name = nm + (sgn < 0 ? " solder fillet -" : " solder fillet +");
+                        solderShapes.push_back(std::move(sd));
+                    }
                 }
             };
             makeLead(true,  zWireIn,  +slot, sheetTop + leadRw, sheetBot,
