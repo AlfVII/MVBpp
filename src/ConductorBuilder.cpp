@@ -12862,9 +12862,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             const double foilSolderFilm = std::getenv("MVB_FOIL_SOLDER_FILM")
                                               ? std::atof(std::getenv("MVB_FOIL_SOLDER_FILM")) * 1e-3
                                               : 0.05e-3;
-            const double foilSolderFoot = 0.25 * foilLeadOD;
-            // Staircase pitch: wire, fillet foot, a hair of clearance, then the next sheet begins.
-            const double foilSlotPitch = foilLeadOD + 2.0 * foilSolderFoot + 0.1 * foilLeadOD;
+            // THE FILLET STAYS INSIDE THE WIRE'S FOOTPRINT (Alf, 2026-09-04: "make the welding
+            // not spread farther than the diameter -- it goes out of the wire"). The solder is
+            // bounded by |x| <= r, so a joint is never wider than the wire it joins; it rises to
+            // half a radius below the equator, which leaves a real 36 um-wide top face instead of
+            // the zero-angle cusp a fillet carried all the way to the equator would make (the
+            // rectangle would meet the cylinder tangentially there -- unmeshable).
+            const double foilSolderRise = 0.5 * (0.5 * foilLeadOD);   // below the equator
+            // Staircase pitch: the wire (solder included, it spreads no further) plus a hair.
+            const double foilSlotPitch = 1.1 * foilLeadOD;
             // Where the sheet starts and ends on its connection face, for the terminal wires.
             double zFaceStart = 0.0, zFaceEnd = 0.0;
             double seamGapForLeads = 0.0;
@@ -13034,15 +13040,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // face's outward normal; P3 applies the connection face's sign.
                 {
                     const double zFace = zWire - leadRw - foilSolderFilm;   // the sheet's outer face
-                    const double zEq   = zWire;                             // the wire's equator
+                    const double zTop  = zWire - foilSolderRise;            // the fillet's top
                     // Solder exists only where there is sheet under the wire: the joint runs the
                     // sheet's height, never into the margin the wire elbows through.
                     const double yLo = sheetBot, yHi = sheetTop;
                     BRepBuilderAPI_MakePolygon poly;
-                    poly.Add(P3(slotX - leadRw - foilSolderFoot, yLo, zFace));
-                    poly.Add(P3(slotX + leadRw + foilSolderFoot, yLo, zFace));
-                    poly.Add(P3(slotX + leadRw, yLo, zEq));
-                    poly.Add(P3(slotX - leadRw, yLo, zEq));
+                    poly.Add(P3(slotX - leadRw, yLo, zFace));
+                    poly.Add(P3(slotX + leadRw, yLo, zFace));
+                    poly.Add(P3(slotX + leadRw, yLo, zTop));
+                    poly.Add(P3(slotX - leadRw, yLo, zTop));
                     poly.Close();
                     TopoDS_Shape block = BRepPrimAPI_MakePrism(BRepBuilderAPI_MakeFace(poly.Wire(), Standard_True).Face(),
                                                                gp_Vec(0, yHi - yLo, 0)).Shape();
