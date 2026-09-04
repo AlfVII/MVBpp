@@ -321,6 +321,10 @@ target_link_libraries(mvbpp_section PRIVATE mvb++)
 add_executable(mvbpp_fitprobe tools/mvbpp_fitprobe.cpp)
 target_link_libraries(mvbpp_fitprobe PRIVATE mvb++)
 
+# ABT #970 step 1: the foil meshing spike (bands only, no primitive in the product path).
+add_executable(mvbpp_foilspike tools/mvbpp_foilspike.cpp)
+target_link_libraries(mvbpp_foilspike PRIVATE mvb++)
+
 add_executable(mvbpp_pathprobe tools/mvbpp_pathprobe.cpp)
 target_link_libraries(mvbpp_pathprobe PRIVATE mvb++)
 
