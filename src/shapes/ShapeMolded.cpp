@@ -63,5 +63,24 @@ TopoDS_Shape ShapeMolded::buildWindingWindow(const std::map<std::string, double>
     return annulus.IsDone() ? annulus.Shape() : TopoDS_Shape();
 }
 
+TopoDS_Shape ShapeMolded::applyExtras(const std::map<std::string, double>& dims,
+                                      const TopoDS_Shape& piece) const {
+    // Centre the body on the origin, the same closing move ShapeDrum makes.
+    //
+    // ShapeBuilder::buildPiece extrudes the profile from z = 0 to B, so a piece that does not
+    // translate is left sitting entirely on one side of the plane. MKF places the winding
+    // window at y = 0 (CorePieceMolded sets the window coordinates with no vertical offset),
+    // so an uncentred body renders half a body-height away from its own coil — the block
+    // floating above the winding rather than moulded around it.
+    //
+    // Every other family here ends with this translation; ShapeMolded originally had no
+    // applyExtras at all, which is how it was missed.
+    double b = dims.count("B") ? dims.at("B") : 0.0;
+    if (b <= 0.0) {
+        return piece;
+    }
+    return translate_shape(piece, 0.0, 0.0, -b / 2.0);
+}
+
 } // namespace shapes
 } // namespace mvb
