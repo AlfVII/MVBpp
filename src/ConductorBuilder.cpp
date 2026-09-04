@@ -7367,6 +7367,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     std::vector<ConductorPath> paths;
     paths.reserve(conductors.size());
+    // Solder bodies (foil terminals, ABT #970): raw solids emitted beside the conductors.
+    std::vector<NamedShape> solderShapes;
     // ABT #885 (Alf): "can you simply keep track of the height of each layer and just use that
     // for the next ones?" — LAYER-HEIGHT BOOKKEEPING for toroidal terminals, replacing the
     // ray-geometry pricing outright. Two accumulators, one per core face, each starting at the
@@ -12848,6 +12850,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                          "' has no outer diameter");
             }
             const double foilLeadOD = OpenMagnetics::resolve_dimensional_values(leadWire.get_outer_diameter().value());
+            // THE SOLDER JOINT (Alf, 2026-09-04: "think of a proper way to emulate that soldered
+            // connection"). Not an overlap -- the audit exists to catch those and a fused body
+            // made from one self-intersects. What is physically there: the wire sits on a thin
+            // solder FILM (it never touches bare copper), and solder fillets rise on both sides
+            // to the wire's equator. One U-shaped solid per joint, sharing a flat face with the
+            // sheet and a cylindrical face with the wire, minimum thickness = the film, so it
+            // meshes; named "... solder" so the mesher can give it solder's conductivity. Film
+            // and fillet-foot width are stated choices (IPC-A-610 speaks of wetting, not
+            // millimetres): MVB_FOIL_SOLDER_FILM (mm, default 0.05), foot = half the wire radius.
+            const double foilSolderFilm = std::getenv("MVB_FOIL_SOLDER_FILM")
+                                              ? std::atof(std::getenv("MVB_FOIL_SOLDER_FILM")) * 1e-3
+                                              : 0.05e-3;
+            const double foilSolderFoot = 0.25 * foilLeadOD;
+            // Staircase pitch: wire, fillet foot, a hair of clearance, then the next sheet begins.
+            const double foilSlotPitch = foilLeadOD + 2.0 * foilSolderFoot + 0.1 * foilLeadOD;
             // Where the sheet starts and ends on its connection face, for the terminal wires.
             double zFaceStart = 0.0, zFaceEnd = 0.0;
             double seamGapForLeads = 0.0;
@@ -12879,8 +12896,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // turn 0's first straight sits where MKF put it; the return of turn 0 and every
                 // later turn ride over the wires by one OD -- the same bump for every parallel.
                 const double rideBase = rectRideFor(rs0.zPos, foilSide) + (foilSide == 0 ? fanRaise : 0.0);
-                const double rideFirst = rideBase + (j == 0 ? 0.0 : foilLeadOD);
-                const double rideRet   = rideBase + foilLeadOD;
+                const double rideFirst = rideBase + (j == 0 ? 0.0 : foilLeadOD + foilSolderFilm);
+                const double rideRet   = rideBase + foilLeadOD + foilSolderFilm;
                 const double xPos = rs0.xPos;
                 const double zF = rs0.zPos + rideFirst, cF = rs0.segZ + rideFirst;   // connection face, first half
                 const double zR = rs0.zPos + rideRet,   cR = rs0.segZ + rideRet;     // connection face, return
@@ -12903,7 +12920,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // gate models a sheet as a capsule, so a sheet's flat leading edge reads as a
                 // rounded one 0.1 mm beyond it; at exactly one OD a wire that truly clears the
                 // next sheet's edge by 8 um read as 35 um inside. The lane stays one OD THICK.
-                const double slotPitch = 1.1 * foilLeadOD;
+                const double slotPitch = foilSlotPitch;
                 const double xStart = (j == 0) ? double(ct.parallel) * slotPitch : 0.0;
                 pushSegF(path, P3(xStart, y, zF), P3(segX, y, zF), wl + " connection face (seam side)", j, false);
                 pushCornerF(segX, cF, R, 1.5 * kPi, y, wl + " corner +X", j);
@@ -12961,7 +12978,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     throw std::runtime_error(w.str());
                 }
             }
-            if (double(numParallels) * 1.1 * leadOD > rs0ForLeads.segX) {
+            if (double(numParallels) * foilSlotPitch > rs0ForLeads.segX) {
                 std::ostringstream w;
                 w.precision(4);
                 w << "ConductorBuilder: " << numParallels << " foil lead wires of '" << leadWireName
@@ -12969,11 +12986,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                   << ct.winding << "' (" << rs0ForLeads.segX * 1e3 << " mm from the seam to the corner)";
                 throw std::runtime_error(w.str());
             }
-            const double slot = double(ct.parallel) * 1.1 * leadOD + 0.5 * leadOD;   // this sheet's own slot
-            // On the sheet's OUTER face: input at the first layer's own (unlifted) height, output
-            // on the last return.
-            const double zWireIn  = zFaceStart + 0.5 * wireW + leadRw;
-            const double zWireOut = zFaceEnd + 0.5 * wireW + leadRw;
+            const double slot = double(ct.parallel) * foilSlotPitch + 0.5 * leadOD;   // this sheet's own slot
+            // On the sheet's OUTER face, on the solder film: input at the first layer's own
+            // (unlifted) height, output on the last return.
+            const double zWireIn  = zFaceStart + 0.5 * wireW + foilSolderFilm + leadRw;
+            const double zWireOut = zFaceEnd + 0.5 * wireW + foilSolderFilm + leadRw;
             // The tip plane every lead ends on is set by the ROUND windings' outer turn plus four
             // ODs; a foil stack with its step-outs and rides reaches past it (this design: stack
             // to z = 16.97 mm against a 15.84 mm plane). The foil's leads end beyond the whole
@@ -12983,7 +13000,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                       + double(turns.size()) * double(numParallels) * parallelPitch;
                 const RectStation rsO = rectStation(PlanePt{xOuter, y}, rectHalfW, rectHalfD,
                                                     minBend, formerCornerRadius, path.name);
-                return std::max(leadTipRadius, rsO.zPos + rideBaseForLeads + leadOD + 0.5 * wireW + leadOD + 2.0 * leadOD);
+                return std::max(leadTipRadius, rsO.zPos + rideBaseForLeads + leadOD + foilSolderFilm + 0.5 * wireW + foilSolderFilm + leadOD + 2.0 * leadOD);
             }();
             auto makeLead = [&](bool entrance, double zWire, double slotX, double yElbow,
                                 double yJointEnd, const std::string& nm) {
@@ -13011,6 +13028,35 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     pushSegF(L, elbow, tip, "exit lead seg 1 (radial, in the margin)", turns.size() - 1, true);
                 }
                 paths.push_back(std::move(L));
+                // The solder: cross-section in the (x, z) plane of the face -- a trapezoid from
+                // the sheet's outer face (half-width r + foot) up to the wire's equator (half-
+                // width r), extruded along the soldered run, minus the wire. Local z is the
+                // face's outward normal; P3 applies the connection face's sign.
+                {
+                    const double zFace = zWire - leadRw - foilSolderFilm;   // the sheet's outer face
+                    const double zEq   = zWire;                             // the wire's equator
+                    // Solder exists only where there is sheet under the wire: the joint runs the
+                    // sheet's height, never into the margin the wire elbows through.
+                    const double yLo = sheetBot, yHi = sheetTop;
+                    BRepBuilderAPI_MakePolygon poly;
+                    poly.Add(P3(slotX - leadRw - foilSolderFoot, yLo, zFace));
+                    poly.Add(P3(slotX + leadRw + foilSolderFoot, yLo, zFace));
+                    poly.Add(P3(slotX + leadRw, yLo, zEq));
+                    poly.Add(P3(slotX - leadRw, yLo, zEq));
+                    poly.Close();
+                    TopoDS_Shape block = BRepPrimAPI_MakePrism(BRepBuilderAPI_MakeFace(poly.Wire(), Standard_True).Face(),
+                                                               gp_Vec(0, yHi - yLo, 0)).Shape();
+                    TopoDS_Shape bore = BRepPrimAPI_MakeCylinder(gp_Ax2(P3(slotX, yLo - 1e-6, zWire), gp_Dir(0, 1, 0)),
+                                                                 leadRw, yHi - yLo + 2e-6).Shape();
+                    BRepAlgoAPI_Cut cut(block, bore);
+                    if (!cut.IsDone()) {
+                        throw std::runtime_error("ConductorBuilder: solder body for '" + nm + "' failed to build");
+                    }
+                    NamedShape sd;
+                    sd.shape = cut.Shape();
+                    sd.name = nm + " solder";
+                    solderShapes.push_back(std::move(sd));
+                }
             };
             makeLead(true,  zWireIn,  +slot, sheetTop + leadRw, sheetBot,
                      ct.winding + " parallel " + std::to_string(ct.parallel) + " entrance lead");
@@ -14496,6 +14542,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             out.push_back({bestFace, p.name + " terminal " + std::to_string(k)});
         }
     }
+    // The foil terminals' solder bodies, beside the copper they join.
+    for (auto& sd : solderShapes) out.push_back(std::move(sd));
     return out;
 }
 
