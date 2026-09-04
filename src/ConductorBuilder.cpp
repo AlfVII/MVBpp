@@ -12874,7 +12874,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // half a radius below the equator, which leaves a real 36 um-wide top face instead of
             // the zero-angle cusp a fillet carried all the way to the equator would make (the
             // rectangle would meet the cylinder tangentially there -- unmeshable).
-            const double foilSolderRise = 0.5 * (0.5 * foilLeadOD);   // below the equator
+            // (the fillet's rise is half the DRAWN radius -- see the terminal block below)
             // Staircase pitch: the wire (solder included, it spreads no further) plus a hair.
             const double foilSlotPitch = 1.1 * foilLeadOD;
             // Where the sheet starts and ends on its connection face, for the terminal wires.
@@ -12972,11 +12972,23 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // see rideOwn), and all N output wires side by side on the OUTER face of the stack's
             // end. Input wires on the +x half of the face and elbow into the top margin, output
             // wires on the -x half into the bottom margin.
-            const double leadOD = foilLeadOD;
-            const double leadRw = 0.5 * leadOD;
+            const double leadOD = foilLeadOD;          // the ENAMELLED envelope: the bump
             double leadBare = leadOD;
             if (leadWire.get_conducting_diameter())
                 leadBare = OpenMagnetics::resolve_dimensional_values(leadWire.get_conducting_diameter().value());
+            // WHAT IS DRAWN vs WHAT IS RESERVED (Alf, 2026-09-04: "is the terminal wire drawn
+            // using outer diameters instead of conducting diameter? the bump must be outer
+            // diameter, but the drawn terminal, which is the one that must touch the foil, must
+            // be conducting diameter"). Exactly so, and the terminal was the one conductor in
+            // the build not obeying it: every other solid follows opts.paintCoating (--copper
+            // draws the bare conducting footprint), while this wire was hardcoded to its outer
+            // diameter -- drawn 34 um too fat on a Round 0.5, and touching the sheet at its
+            // ENAMEL rather than its copper. The joint is soldered, so bare copper meets bare
+            // copper there; the enamel still has to fit between the wire and the turn riding
+            // over it, which is what the outer-diameter BUMP reserves: the next sheet's face
+            // sits OD above the foil while the wire's copper reaches only `conducting`, leaving
+            // OD - conducting of room for the coating.
+            const double leadRw = opts.paintCoating ? 0.5 * leadOD : 0.5 * leadBare;
             const double sheetTop = y + 0.5 * wireH, sheetBot = y - 0.5 * wireH;
             if (const auto& wb = windowBoundsPerPath[ci]) {
                 const double marginTop = wb->hi - sheetTop, marginBot = sheetBot - wb->lo;
@@ -12998,7 +13010,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                   << ct.winding << "' (" << rs0ForLeads.segX * 1e3 << " mm from the seam to the corner)";
                 throw std::runtime_error(w.str());
             }
-            const double slot = double(ct.parallel) * foilSlotPitch + 0.5 * leadOD;   // this sheet's own slot
+            const double slot = double(ct.parallel) * foilSlotPitch + 0.5 * leadOD;   // this sheet's own slot (enamel pitch)
             // On the sheet's OUTER face, on the solder film: input at the first layer's own
             // (unlifted) height, output on the last return.
             const double zWireIn  = zFaceStart + 0.5 * wireW + leadRw;
@@ -13046,7 +13058,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // face's outward normal; P3 applies the connection face's sign.
                 {
                     const double zFace = zWire - leadRw;         // the sheet's face: the wire sits ON it
-                    const double zTop  = zWire - foilSolderRise; // the fillet's top, below the equator
+                    const double zTop  = zWire - 0.5 * leadRw;   // the fillet's top, half a DRAWN radius below the equator
                     // Solder exists only where there is sheet under the wire: the joint runs the
                     // sheet's height, never into the margin the wire elbows through.
                     const double yLo = sheetBot, yHi = sheetTop;
