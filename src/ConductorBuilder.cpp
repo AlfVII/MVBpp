@@ -12785,7 +12785,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (parallelPitch <= 0.0) parallelPitch = wireW;   // one sheet, one turn: its own thickness
             const int foilSide = windingFace.at(ct.winding);
             const double zs = (foilSide == 1) ? 1.0 : -1.0;   // the connection face's sign in z
-            const double leadTipRadiusFoil = leadTipRadius;
 
             // ONE HEIGHT PER SHEET. A foil has no axial advance, so every station of a parallel
             // must sit at one y. MKF's foil layout does not (2 turns x 8 parallels: parallel 0's
@@ -12837,15 +12836,31 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             };
             auto P3 = [&](double x, double y, double z) { return gp_Pnt(x, y, zs * z); };
 
+            // The lead wire (its OD is the input lane's bump, so it is resolved first). Not in
+            // MAS (connection.diameter is a PIN diameter): MVB_FOIL_LEAD_WIRE, default
+            // "Round 0.5 - Grade 1" -- the 23 AWG class Power Integrations solders to a foil
+            // secondary, and the largest standard round wire that fits this design's margins.
+            const char* leadName = std::getenv("MVB_FOIL_LEAD_WIRE");
+            const std::string leadWireName = leadName ? leadName : "Round 0.5 - Grade 1";
+            OpenMagnetics::Wire leadWire = OpenMagnetics::find_wire_by_name(leadWireName);
+            if (!leadWire.get_outer_diameter()) {
+                throw std::runtime_error("ConductorBuilder: foil lead wire '" + leadWireName +
+                                         "' has no outer diameter");
+            }
+            const double foilLeadOD = OpenMagnetics::resolve_dimensional_values(leadWire.get_outer_diameter().value());
             // Where the sheet starts and ends on its connection face, for the terminal wires.
             double zFaceStart = 0.0, zFaceEnd = 0.0;
+            double zStackInner = 0.0;   // the innermost sheet's displaced start face (z), turn 0
             double seamGapForLeads = 0.0;
             RectStation rs0ForLeads;
             const double y = ySheet;
             for (size_t j = 0; j < turns.size(); ++j) {
                 const PlanePt st0 = station(turns[j]);
                 const PlanePt st{st0.x, y};
-                double xEnd = st.x + parallelPitch;
+                // N-FILAR (Alf, 2026-09-04): the N sheets are wound together, so a turn steps
+                // one whole stack out -- MKF's next station of this parallel, or N layer pitches
+                // for the last turn.
+                double xEnd = st.x + double(numParallels) * parallelPitch;
                 if (j + 1 < turns.size()) xEnd = station(turns[j + 1]).x;
                 const RectStation rs0 = rectStation(st, rectHalfW, rectHalfD, minBend,
                                                     formerCornerRadius, path.name);
@@ -12856,7 +12871,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // face as appendRectWrap.
                 const double fanRaise = tallestBumpColumn(bumpsForTurn(st.x)).first;
                 const double rideOpp = rectRideFor(rs0.zPos, 1 - foilSide) + (foilSide == 1 ? fanRaise : 0.0);
-                const double rideOwn = rectRideFor(rs0.zPos, foilSide) + (foilSide == 0 ? fanRaise : 0.0);
+                // THE INPUT TERMINAL IS A LANE (Alf, 2026-09-04): a wire soldered vertically to
+                // the foil at the seam, like a dragback. The parallels are wound together, so
+                // every parallel's input wire sits in the ONE lane, side by side, and the whole
+                // stack rides over it by exactly one wire OD -- the same bump for all of them.
+                const double rideOwn = rectRideFor(rs0.zPos, foilSide) + (foilSide == 0 ? fanRaise : 0.0)
+                                       + foilLeadOD;
                 const double xPos = rs0.xPos;
                 const double zF = rs0.zPos + rideOwn, cF = rs0.segZ + rideOwn;   // connection face
                 const double zO = rs0.zPos + rideOpp, cO = rs0.segZ + rideOpp;   // opposite face
@@ -12865,7 +12885,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const double G = xEnd - st.x;
                 (void)rs1;
                 const std::string wl = "wrap '" + turns[j]->get_name() + "' (foil sheet)";
-                if (j == 0) zFaceStart = zF;
+                if (j == 0) {
+                    zFaceStart = zF;
+                    // The stack's innermost start face: the winding's first station, displaced
+                    // like this one. The input wires lie just inside it, touching it.
+                    const RectStation rsInner = rectStation(PlanePt{firstX.empty() ? st.x : firstX.front(), y},
+                                                            rectHalfW, rectHalfD, minBend,
+                                                            formerCornerRadius, path.name);
+                    zStackInner = rsInner.zPos + rideOwn;
+                }
                 // Seam (0, zF) heading +x along the connection face; then the +X face, the
                 // opposite face, the -X face (G longer), the stepped corner, and back to the seam.
                 pushSegF(path, P3(0.0, y, zF), P3(segX, y, zF), wl + " connection face (seam side)", j, false);
@@ -12884,9 +12912,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // winding, and the collision gate said so (0 m). The last return therefore stops
                 // one sheet thickness short of the seam: MVB_FOIL_SEAM_GAP (mm) overrides; the
                 // literature names the gap and gives no number.
+                // With N-filar layers a parallel's last layer is never another's first, so no
+                // gap is needed at the seam; MVB_FOIL_SEAM_GAP (mm) still opens one.
                 const double seamGap = std::getenv("MVB_FOIL_SEAM_GAP")
                                            ? std::atof(std::getenv("MVB_FOIL_SEAM_GAP")) * 1e-3
-                                           : wireW;
+                                           : 0.0;
                 const double xReturnEnd = (j + 1 == turns.size()) ? -seamGap : 0.0;
                 seamGapForLeads = seamGap;
                 if (j == 0) rs0ForLeads = rs0;
@@ -12895,19 +12925,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             paths.push_back(std::move(path));
 
-            // ---- THE SOLDERED WIRE TERMINALS ----------------------------------------------
-            // The lead wire. Not in MAS (connection.diameter is a PIN diameter), so it is named
-            // here: MVB_FOIL_LEAD_WIRE, default "Round 0.5 - Grade 1" -- the 23 AWG class Power
-            // Integrations solders to a foil secondary, and the largest standard round wire that
-            // fits this design's 0.68 mm margins. A wire that does not fit the margin is refused.
-            const char* leadName = std::getenv("MVB_FOIL_LEAD_WIRE");
-            const std::string leadWireName = leadName ? leadName : "Round 0.5 - Grade 1";
-            OpenMagnetics::Wire leadWire = OpenMagnetics::find_wire_by_name(leadWireName);
-            if (!leadWire.get_outer_diameter()) {
-                throw std::runtime_error("ConductorBuilder: foil lead wire '" + leadWireName +
-                                         "' has no outer diameter");
-            }
-            const double leadOD = OpenMagnetics::resolve_dimensional_values(leadWire.get_outer_diameter().value());
+            // ---- THE SOLDERED WIRE TERMINALS (Alf, 2026-09-04) ------------------------------
+            // A wire soldered VERTICALLY to the foil at the seam -- the joint runs the sheet's
+            // full height -- then out through the margin to the tip, like every other lead's
+            // L-route. The parallels are wound together, so all N input wires sit side by side
+            // in ONE lane just inside the stack's start (the stack rides over them by one OD,
+            // see rideOwn), and all N output wires side by side on the OUTER face of the stack's
+            // end. Input wires on the +x half of the face and elbow into the top margin, output
+            // wires on the -x half into the bottom margin.
+            const double leadOD = foilLeadOD;
             const double leadRw = 0.5 * leadOD;
             double leadBare = leadOD;
             if (leadWire.get_conducting_diameter())
@@ -12925,35 +12951,34 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     throw std::runtime_error(w.str());
                 }
             }
-            // PACKING THE WIRES IN THE MARGINS. Consecutive parallels' faces are one sheet
-            // thickness apart (0.2 mm) and the wire is 0.53 mm, so two wires that share any x
-            // on neighbouring faces interpenetrate (measured: parallel 1's radial run over
-            // parallel 0's lap, 0.4 mm apart). Every wire therefore owns a disjoint x-range on
-            // the face: its radial run at its slot, its lap running outward from the slot.
-            // Entrances take the +x half of the face (their own sheet's start), exits the -x
-            // half (their own sheet's end), and each half is shared between the top and bottom
-            // margins by parity, four wires per half per margin. The lap is two wire diameters:
-            // no standard states a solder-lap length, and four (used first) does not fit eight
-            // wires on this face. Stated choices, not data.
-            const double lapLen = 2.0 * leadOD;
-            const double x0 = seamGapForLeads + leadRw;
-            const double pitchX = lapLen + leadOD;
-            auto slotFor = [&](int parallel) {
-                return x0 + double(parallel / 2) * pitchX;
-            };
-            if (slotFor(numParallels - 1) + lapLen + leadRw > rs0ForLeads.segX) {
+            if ((double(numParallels) + 0.5) * leadOD > rs0ForLeads.segX) {
                 std::ostringstream w;
                 w.precision(4);
                 w << "ConductorBuilder: " << numParallels << " foil lead wires of '" << leadWireName
-                  << "' (OD " << leadOD * 1e3 << " mm, lap " << lapLen * 1e3
-                  << " mm) do not fit along the connection face of '" << ct.winding << "' ("
-                  << rs0ForLeads.segX * 1e3 << " mm from the seam to the corner)";
+                  << "' (OD " << leadOD * 1e3 << " mm) side by side do not fit the connection face of '"
+                  << ct.winding << "' (" << rs0ForLeads.segX * 1e3 << " mm from the seam to the corner)";
                 throw std::runtime_error(w.str());
             }
-            const double slot = slotFor(ct.parallel);
-            const bool topMargin = (ct.parallel % 2) == 0;
-            auto makeLead = [&](bool entrance, double zFace, double slotX, double yWire,
-                                const std::string& nm) {
+            const double slot = (double(ct.parallel) + 0.5) * leadOD;   // one lane, wires touching
+            // The stack's outer face at its end: the outermost parallel's last return.
+            const double zStackOuter = [&]() {
+                const double xOuterEnd = (firstX.empty() ? station(turns.back()).x : firstX.back())
+                                         + double(turns.size() - 1) * double(numParallels) * parallelPitch
+                                         + double(numParallels) * parallelPitch;
+                const RectStation rsO = rectStation(PlanePt{xOuterEnd, y}, rectHalfW, rectHalfD,
+                                                    minBend, formerCornerRadius, path.name);
+                return rsO.zPos + (zFaceEnd - rectStation(PlanePt{station(turns.back()).x + double(numParallels) * parallelPitch, y},
+                                                          rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name).zPos);
+            }();
+            const double zWireIn  = zStackInner - 0.5 * wireW - leadRw;   // just inside the start
+            const double zWireOut = zStackOuter + 0.5 * wireW + leadRw;   // just outside the end
+            // The tip plane every lead ends on is set by the ROUND windings' outer turn plus four
+            // ODs; a foil stack with its step-outs and rides reaches past it (this design: stack
+            // to z = 16.97 mm against a 15.84 mm plane), and an output wire ending there would
+            // point back INTO the coil. The foil's leads end beyond its own stack.
+            const double leadTipRadiusFoil = std::max(leadTipRadius, zWireOut + 2.0 * leadOD);
+            auto makeLead = [&](bool entrance, double zWire, double slotX, double yElbow,
+                                double yJointEnd, const std::string& nm) {
                 ConductorPath L;
                 L.name = nm;
                 L.wireRadius = leadRw;
@@ -12967,24 +12992,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const bool rectColumnAnalytic = !isToroidal && columnShape == MAS::ColumnShape::RECTANGULAR;
                 L.useRectSolids = rectColumnAnalytic;
                 L.roundProfile = rectColumnAnalytic;
-                // The lap runs AWAY from the seam on its own half of the face.
-                const gp_Pnt lapFar = P3(slotX + std::copysign(lapLen, slotX), yWire, zFace);
-                const gp_Pnt elbow  = P3(slotX, yWire, zFace);
-                const gp_Pnt tip    = P3(slotX, yWire, leadTipRadiusFoil);
+                const gp_Pnt jointEnd = P3(slotX, yJointEnd, zWire);   // far end of the soldered run
+                const gp_Pnt elbow    = P3(slotX, yElbow, zWire);      // where it leaves the sheet
+                const gp_Pnt tip      = P3(slotX, yElbow, leadTipRadiusFoil);
                 if (entrance) {
                     pushSegF(L, tip, elbow, "entrance lead seg 0 (radial, in the margin)", 0, true);
-                    pushSegF(L, elbow, lapFar, "entrance lead seg 1 (solder lap on the sheet edge)", 0, true);
+                    pushSegF(L, elbow, jointEnd, "entrance lead seg 1 (soldered vertically on the foil)", 0, true);
                 } else {
-                    pushSegF(L, lapFar, elbow, "exit lead seg 0 (solder lap on the sheet edge)", turns.size() - 1, true);
+                    pushSegF(L, jointEnd, elbow, "exit lead seg 0 (soldered vertically on the foil)", turns.size() - 1, true);
                     pushSegF(L, elbow, tip, "exit lead seg 1 (radial, in the margin)", turns.size() - 1, true);
                 }
                 paths.push_back(std::move(L));
             };
-            const double yTop = sheetTop + leadRw, yBot = sheetBot - leadRw;
-            makeLead(true, zFaceStart, +slot, topMargin ? yTop : yBot, ct.winding + " parallel " +
-                     std::to_string(ct.parallel) + " entrance lead");
-            makeLead(false, zFaceEnd, -slot, topMargin ? yTop : yBot, ct.winding + " parallel " +
-                     std::to_string(ct.parallel) + " exit lead");
+            makeLead(true,  zWireIn,  +slot, sheetTop + leadRw, sheetBot,
+                     ct.winding + " parallel " + std::to_string(ct.parallel) + " entrance lead");
+            makeLead(false, zWireOut, -slot, sheetBot - leadRw, sheetTop,
+                     ct.winding + " parallel " + std::to_string(ct.parallel) + " exit lead");
             if (std::getenv("MVB_FOIL_DIAG")) {
                 std::fprintf(stderr,
                              "[foil] %s: %zu turn(s), parallels=%d pitch=%.4f mm y=%.4f mm face=%s "
