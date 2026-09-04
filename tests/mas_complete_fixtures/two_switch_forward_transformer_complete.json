@@ -127,7 +127,7 @@
                 },
                 {
                     "name": "Secondary",
-                    "numberTurns": 1,
+                    "numberTurns": 2,
                     "numberParallels": 8,
                     "isolationSide": "secondary",
                     "wire": "Foil 0.2"
