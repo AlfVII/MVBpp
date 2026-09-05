@@ -1,6 +1,7 @@
 // Real-winding geometry ([realwinding]): ONE continuous conductor per (winding, parallel)
 // replacing the per-turn closed loops, with every MKF turn position honoured exactly.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include <filesystem>
 #include <set>
 #include <functional>
@@ -37,6 +38,7 @@
 #include <cmath>
 #include <memory>
 #include <fstream>
+#include <sstream>
 #include <numbers>
 #include <variant>
 
@@ -58,6 +60,7 @@ std::string outputPath(const std::string& name) {
 json loadFixture(const std::string& name) {
     std::ifstream f("testData/" + name);
     if (!f.good()) f = std::ifstream("tests/realwinding_fixtures/" + name);
+    if (!f.good()) f = std::ifstream("tests/mas_complete_fixtures/" + name);
     REQUIRE(f.good());
     json j = json::parse(f);
     return j.contains("magnetic") ? j.at("magnetic") : j;
@@ -1428,4 +1431,114 @@ TEST_CASE("Real winding: the drum's connections stay out of the core flange (ABT
                  deepest * 1e3);
     CHECK(inFlange == 0);
     CHECK(inCore == 0);
+}
+
+// A SOLDERED WIRE TERMINAL NEVER TOUCHES THE FOIL (the mesher's veto on an exact tangency).
+//
+// The terminal was drawn tangent to its sheet -- bare copper on bare copper, no standoff -- so
+// that the bump the next turn rides is exactly one OD and the wire cannot reach the turn above
+// (Alf, 2026-09-04). The CAD gate liked it: WATERTIGHT, NO OVERLAPS, and the enamel rule
+// CERTIFIED at 0 nm. It is nevertheless unmeshable, and no element size fixes it: a cylinder
+// laid on a plane meets it at a ZERO dihedral angle, and every way of decomposing that corner --
+// two solids in contact, one fused body, fillets that stop short of the tangent line or run all
+// the way to it -- still contains a feature of zero thickness. tetgen said exactly that on
+// two_switch_forward:
+//     PLC Error: A segment and a facet intersect at point (-0.267, 5.183, 15.9845) mm
+// which is the bottom generatrix of 'Secondary parallel 0 exit lead' on the face of 'Secondary
+// parallel 0' -- the tangent line itself.
+//
+// The physics agrees with the mesher: a soldered wire floats on the joint, it never touches bare
+// copper. So the wire is lifted by a solder film and the solder fills its whole footprint. Alf's
+// reason for asking for tangency is kept exactly -- the LANE the stack rides over the terminals
+// grew by the film too, so the wire still cannot reach the turn above.
+//
+// This test pins the invariant that the tangency must not come back: a strictly positive gap
+// between the terminal and its sheet, of the film's size, BRIDGED by the solder. Revert the film
+// to zero and the first REQUIRE fails (the gap goes to 0).
+TEST_CASE("Real winding: a foil terminal floats on its solder film, never tangent to the sheet",
+          "[realwinding][foil]") {
+    auto magneticJson = loadFixture("two_switch_forward_transformer_complete.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    // --copper: the terminal is drawn on its CONDUCTING diameter, which is the surface that is
+    // soldered. The outer diameter is what the bump RESERVES, not what is drawn.
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                       /*wirePolygonSegments=*/0,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+
+    auto find = [&](const std::string& n) {
+        for (const auto& ns : named)
+            if (ns.name == n) return ns.shape;
+        FAIL("no solid named '" << n << "' in the build");
+        return TopoDS_Shape{};
+    };
+    auto gap = [](const TopoDS_Shape& a, const TopoDS_Shape& b) {
+        BRepExtrema_DistShapeShape d(a, b);
+        REQUIRE(d.IsDone());
+        return d.Value();
+    };
+    // A failure here is a CONTACT, and the only useful thing to say about a contact is where it
+    // is: the point names the feature that is touching.
+    auto whereClosest = [](const TopoDS_Shape& a, const TopoDS_Shape& b) {
+        BRepExtrema_DistShapeShape d(a, b);
+        std::ostringstream o;
+        o.precision(6);
+        if (d.IsDone() && d.NbSolution() > 0) {
+            const gp_Pnt p1 = d.PointOnShape1(1), p2 = d.PointOnShape2(1);
+            o << "(" << p1.X() * 1e3 << ", " << p1.Y() * 1e3 << ", " << p1.Z() * 1e3 << ") mm"
+              << " <-> (" << p2.X() * 1e3 << ", " << p2.Y() * 1e3 << ", " << p2.Z() * 1e3 << ") mm";
+        }
+        return o.str();
+    };
+
+    int joints = 0;
+    for (const std::string& which : {std::string("entrance"), std::string("exit")}) {
+        const std::string lead = "Secondary parallel 0 " + which + " lead";
+        const TopoDS_Shape sheet = find("Secondary parallel 0");
+        const TopoDS_Shape joint = find(lead + " solder joint");
+        // The lead is an L: the SOLDERED RUN down the sheet's height, and a radial piece that
+        // elbows out through the margin to the tip. Only the soldered run is measured here. The
+        // radial piece grazes the sheet's top edge on its way out and that is not a defect --
+        // they are the same conductor, and the meshing fragment welds a same-region contact into
+        // one volume. What killed the mesher was the SOLDERED RUN lying on the face.
+        TopoDS_Shape wire;
+        {
+            double best = -1.0;
+            for (TopExp_Explorer e(find(lead), TopAbs_SOLID); e.More(); e.Next()) {
+                Bnd_Box b;
+                BRepBndLib::Add(e.Current(), b);
+                double x0, y0, z0, x1, y1, z1;
+                b.Get(x0, y0, z0, x1, y1, z1);
+                if (y1 - y0 > best) { best = y1 - y0; wire = e.Current(); }
+            }
+            REQUIRE(best > 0.0);
+        }
+
+        // The wire's drawn diameter, measured, so the check is independent of the unit the
+        // builder works in: the soldered run is a cylinder, its X extent is one diameter.
+        Bnd_Box wb;
+        BRepBndLib::Add(wire, wb);
+        double xlo, ylo, zlo, xhi, yhi, zhi;
+        wb.Get(xlo, ylo, zlo, xhi, yhi, zhi);
+        const double diameter = xhi - xlo;
+        REQUIRE(diameter > 0.0);
+
+        const double film = gap(sheet, wire);
+        INFO(lead << ": film " << film << ", diameter " << diameter
+                  << ", ratio " << film / diameter
+                  << ", closest " << whereClosest(sheet, wire));
+        // NOT TANGENT. This is the assertion the PLC error asked for; at tangency it is 0.
+        REQUIRE(film > 0.1 * diameter * 0.5);
+        // ...and it is the film, not an accidental drift: 0.05 mm under a 0.501 mm wire.
+        REQUIRE(film / diameter == Catch::Approx(0.05 / 0.501).epsilon(0.05));
+        // BRIDGED. A gap that nothing crosses would be an open circuit, not a joint.
+        REQUIRE(gap(joint, sheet) < 1e-9 * diameter + 1e-12);
+        REQUIRE(gap(joint, wire) < 1e-9 * diameter + 1e-12);
+        ++joints;
+    }
+    REQUIRE(joints == 2);
 }
